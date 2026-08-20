@@ -312,14 +312,20 @@ impl AssetStore {
     /// プレビュー画像を previews/ に書き、絶対パスを返す。命名は決定論的
     /// (source revision + recipe_hash 由来)で、同一キーなら再生成せず既存を返す。
     pub fn put_preview(&self, key: &str, ext: &str, bytes: &[u8]) -> Result<PathBuf> {
-        if key.is_empty()
-            || key.contains('/')
-            || key.contains('\\')
-            || key.contains("..")
-        {
+        // キー・拡張子は [A-Za-z0-9._-] のみ許可(".." は不可)。
+        // 呼び出し側のキーは常に内部生成(sha256 hex + スラッグ)なのでこれで十分であり、
+        // 任意 Unicode を許すとファイルシステム依存の失敗(macOS の EILSEQ 等)が
+        // 生の Io エラーとして漏れる。
+        fn safe_component(s: &str) -> bool {
+            !s.is_empty()
+                && !s.contains("..")
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        }
+        if !safe_component(key) {
             return Err(StoreError::InvalidPath(key.to_string()));
         }
-        if ext.is_empty() || ext.contains('/') || ext.contains('\\') || ext.contains("..") {
+        if !safe_component(ext) {
             return Err(StoreError::InvalidPath(ext.to_string()));
         }
         let previews_dir = self.root.join("previews");

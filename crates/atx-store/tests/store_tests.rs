@@ -265,3 +265,22 @@ fn reopening_store_finds_existing_revisions() {
     assert_eq!(found.revision_id, revision_id);
     assert_eq!(store.read_bytes(&revision_id).unwrap(), b"persisted bytes");
 }
+
+/// CI(macOS)の proptest が発見した反例の固定: BMP 外 Unicode キーは
+/// ファイルシステムへ渡す前に InvalidPath で拒否する(EILSEQ が Io で漏れない)。
+#[test]
+fn put_preview_rejects_non_ascii_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = atx_store::AssetStore::open(dir.path()).unwrap();
+    for key in ["𐶎", "日本語", "a b", "café"] {
+        assert!(
+            matches!(
+                store.put_preview(key, "bin", b"x"),
+                Err(atx_store::StoreError::InvalidPath(_))
+            ),
+            "key {key:?} must be rejected as InvalidPath"
+        );
+    }
+    // 内部生成形式(hex + スラッグ)は引き続き通る。
+    assert!(store.put_preview("0de5081e-grid", "jpg", b"x").is_ok());
+}
