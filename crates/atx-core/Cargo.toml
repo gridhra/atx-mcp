@@ -1,0 +1,28 @@
+[package]
+name = "atx-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+image.workspace = true
+imageproc.workspace = true
+fast_image_resize.workspace = true
+kamadak-exif.workspace = true
+little_exif.workspace = true
+jpeg-encoder.workspace = true
+webp.workspace = true
+ravif.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+image.workspace = true
+proptest = "1"

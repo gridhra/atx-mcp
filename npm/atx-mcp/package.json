@@ -1,0 +1,33 @@
+{
+  "name": "atx-mcp",
+  "version": "0.0.0-dev",
+  "description": "Deterministic (non-generative) asset transformation MCP server. Ships prebuilt native binaries.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "image",
+    "transform",
+    "resize",
+    "webp",
+    "avif"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gridhra/atx-mcp.git"
+  },
+  "bin": {
+    "atx-mcp": "bin/atx-mcp.js",
+    "atx-mcp": "bin/atx-mcp.js"
+  },
+  "files": [
+    "bin/atx-mcp.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {},
+  "preferUnplugged": true
+}

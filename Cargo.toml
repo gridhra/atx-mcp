@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/atx-core",
+    "crates/atx-geometry",
+    "crates/atx-store",
+    "crates/atx-mcp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+# NOTE: owner is a placeholder until the repo exists (see RELEASING.md step 0).
+repository = "https://github.com/gridhra/atx-mcp"
+keywords = ["mcp", "image", "transform", "deterministic", "assets"]
+categories = ["multimedia::images", "command-line-utilities"]
+
+[workspace.dependencies]
+atx-core = { path = "crates/atx-core" }
+atx-geometry = { path = "crates/atx-geometry" }
+atx-store = { path = "crates/atx-store" }
+
+image = "0.25.10"
+imageproc = "0.27"
+fast_image_resize = "6.1"
+kamadak-exif = "0.6"
+little_exif = "0.6"
+jpeg-encoder = "0.7"
+webp = "0.3"
+ravif = "0.13"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"
+anyhow = "1"
+ulid = "1"
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rmcp = { version = "3.1", features = ["server", "macros", "transport-io"] }
+
+[profile.release]
+lto = "thin"
