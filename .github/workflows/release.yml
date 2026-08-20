@@ -1,0 +1,221 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            npm_platform: darwin-arm64
+          - target: x86_64-apple-darwin
+            os: macos-14
+            npm_platform: darwin-x64
+            need_nasm: true
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            npm_platform: linux-x64
+            need_nasm: true
+            musl: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            npm_platform: linux-arm64
+            musl: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            npm_platform: win32-x64
+            need_nasm: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      # ravif -> rav1e assembles its x86_64 SIMD kernels with nasm. aarch64 uses
+      # gas through the `cc` crate and needs nothing extra.
+      - name: Install nasm (Linux)
+        if: matrix.need_nasm && runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Install nasm (macOS)
+        if: matrix.need_nasm && runner.os == 'macOS'
+        run: brew install nasm
+      - name: Install nasm (Windows)
+        if: matrix.need_nasm && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # musl-tools provides musl-gcc, which the `cc` crate auto-selects for
+      # *-linux-musl targets (needed by libwebp-sys' vendored C sources).
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools musl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --bin atx-mcp --target ${{ matrix.target }}
+
+      - name: Stage archive contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="atx-mcp-${VERSION}-${{ matrix.target }}"
+          echo "ARCHIVE_NAME=$NAME" >> "$GITHUB_ENV"
+          mkdir -p "staging/$NAME"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/atx-mcp.exe" "staging/$NAME/"
+          else
+            cp "target/${{ matrix.target }}/release/atx-mcp" "staging/$NAME/"
+          fi
+          cp LICENSE README.md "staging/$NAME/"
+
+      - name: Create archive (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: tar -C staging -czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
+
+      - name: Create archive (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "staging/$env:ARCHIVE_NAME" -DestinationPath "$env:ARCHIVE_NAME.zip"
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: |
+            ${{ env.ARCHIVE_NAME }}.tar.gz
+            ${{ env.ARCHIVE_NAME }}.zip
+          if-no-files-found: error
+
+      # Raw binary, consumed by the npm packaging job.
+      - name: Upload raw binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: npmbin-${{ matrix.npm_platform }}
+          path: staging/${{ env.ARCHIVE_NAME }}/atx-mcp*
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - id: meta
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          ls -la
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: artifacts/*
+
+  npm:
+    name: publish npm packages
+    needs: release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write # required for --provenance
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+
+      # `secrets` is not available in job-level `if`, so gate on a step output.
+      - id: gate
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "$NPM_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::NPM_TOKEN is not set; skipping npm publish."
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - uses: actions/download-artifact@v4
+        if: steps.gate.outputs.enabled == 'true'
+        with:
+          pattern: npmbin-*
+          path: npmbins
+
+      - name: Assemble npm packages
+        if: steps.gate.outputs.enabled == 'true'
+        run: node npm/scripts/build-packages.mjs --version "${{ needs.release.outputs.version }}" --bins npmbins
+
+      - name: Publish
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Platform packages first: the main package's optionalDependencies
+          # pin these exact versions.
+          for pkg in npm/dist/atx-mcp-*; do
+            echo "==> publishing $pkg"
+            npm publish --provenance --access public "$pkg"
+          done
+          echo "==> publishing npm/dist/atx-mcp"
+          npm publish --provenance --access public npm/dist/atx-mcp

@@ -1,0 +1,18 @@
+[package]
+name = "atx-geometry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+image.workspace = true
+imageproc.workspace = true
+serde.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+image.workspace = true
+imageproc.workspace = true
+serde_json.workspace = true
+proptest = "1"

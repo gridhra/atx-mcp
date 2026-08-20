@@ -1,0 +1,296 @@
+# asset-transform-mcp — 要件定義・設計書
+
+作成日: 2026-08-21 / ステータス: v1 実装済(M0+M1+M2 の大半)。実装で確定した差分は §9 を参照
+
+汎用 AI エージェント向けの、**決定論的(非生成)アセット変換 MCP サーバ**。Rust 製。
+編集意図(「水平にして 16:9 に整えて軽く明るく」)を、再現可能・監査可能な変換レシピとして実行する層を提供する。
+
+---
+
+## 1. プロダクト定義
+
+### 1.1 ゴール
+- コンテンツメディア制作における画像素材の非生成的加工(傾き補正・クロップ・リサイズ・フォーマット変換・明るさ調整等)を、MCP 経由で AI に安全に委譲できるようにする
+- LLM は画素を触らず、**意図 → 宣言的レシピ → 決定論的実行**というパイプラインに徹する
+- 原本は不変(immutable)。すべての変換は新しい revision を生成し、レシピとともに追跡可能
+
+### 1.2 非ゴール
+- 画像生成・インペインティング等の生成的処理(外部モデルの責務)
+- Photoshop 的な対話式編集 UI
+- 動画処理(将来拡張の余地は残すが v1 スコープ外)
+
+### 1.3 競合状況(2026-08 調査)
+既存の画像系 MCP サーバは (a) 生成 API のラッパー、(b) ファイルパス入出力のみの単機能変換、のいずれかに偏っており、
+**「ローカル決定論的変換 + アセットストア抽象 + トークン規律あるプレビュー返却 + structured output による連鎖可能性」を兼ね備えたものは存在しない**。ここが本プロダクトの差別化点。
+
+---
+
+## 2. 技術選定(調査結果に基づく)
+
+### 2.1 MCP SDK
+- **`rmcp`(公式 modelcontextprotocol/rust-sdk、v3.x)** を採用
+  - MCP spec 2026-07-28 対応(2025-11-25 以前へも自動バージョンネゴシエーション)
+  - `#[tool]` / `#[tool_router]` マクロ、`schemars` による JSON Schema 自動生成
+  - `outputSchema` / `structuredContent`、tool annotations、resource、cursor ページネーション対応
+  - tokio ベース
+- トランスポートは **stdio を第一**(Claude Code / Claude Desktop のローカル利用)。Streamable HTTP は後段(spec はステートレス化に向かっているため設計上はステートレス前提を維持)
+
+### 2.2 画像処理スタック(ポータビリティ優先)
+| 責務 | クレート | 備考 |
+|---|---|---|
+| デコード/エンコードハブ | `image` 0.25.x | 純 Rust |
+| リサイズ | `fast_image_resize` 6.x | SIMD、純 Rust、最速級 |
+| 幾何変換・フィルタ・CV | `imageproc` 0.27.x + `image::imageops` | 回転(任意角・補間指定)、Canny、Hough |
+| 傾き検出 | `imageproc::edges::canny` + `imageproc::hough` + 自前ヒューリスティック | 専用クレートは存在しない(自作が標準) |
+| EXIF 読み取り | `kamadak-exif` 0.6.x | 読み取り専用、成熟 |
+| EXIF 書き込み/剥離 | `little_exif` 0.6.x | 純 Rust で唯一の read+write |
+| JPEG エンコード | `jpeg-encoder`(デフォルト)/ `mozjpeg`(feature flag でオプトイン) | デフォルトビルドを C 依存最小に保つ |
+| WebP(lossy) | `webp` crate(libwebp FFI、ソース同梱ビルド) | 純 Rust の lossy WebP エンコーダは存在しない。C コンパイラのみ必要 |
+| AVIF エンコード | `ravif` 0.13.x | 純 Rust(rav1e)。CPU 重いがバッチ用途では許容 |
+| ICC | v1 では sRGB 前提 + プロファイル温存。必要になったら `lcms2`(軽量 C 依存)を feature flag で | |
+
+**ビルド時のシステム依存: C コンパイラのみ**(libwebp-sys 用)。OpenCV / libvips は不採用
+(ビルド・デプロイ負担が「cargo build で動く」という要件と矛盾。libvips は将来の性能エスケープハッチとして文書化のみ)。
+
+---
+
+## 3. アーキテクチャ
+
+### 3.1 Cargo workspace 構成
+```
+asset-transform-mcp/
+├── Cargo.toml                # workspace
+├── crates/
+│   ├── atx-core/             # レシピ型定義・正規化・ハッシュ・変換エンジン(MCP 非依存)
+│   ├── atx-geometry/         # 傾き検出(Canny + Hough + 角度ヒューリスティック)
+│   ├── atx-store/            # アセットストア(immutable revision、content-addressed)
+│   └── atx-mcp/              # rmcp サーバ本体(bin)。ツール定義・annotations・プレビュー生成
+└── docs/
+```
+`atx-core` を MCP から切り離すことで、CLI(`atx apply recipe.json in.jpg`)としても同じエンジンを公開できる(要件の「CLI との相性」)。
+
+### 3.2 アセットストア(local-first)
+- ワークスペースディレクトリは **起動時設定(CLI 引数 / env)で明示指定**(MCP Roots は 2026-07-28 RC で非推奨のため使わない)
+- 構造:
+```
+<workspace>/
+├── objects/<sha256[0..2]>/<sha256>.<ext>   # content-addressed、immutable
+├── assets.jsonl                            # asset / revision メタデータ台帳(追記型)
+└── previews/                               # 低解像度プレビュー(TTL 掃除対象)
+```
+- 原本の上書き・削除は API 上存在しない
+- `apply_transform` は `(inputRevisionId, canonicalRecipeHash)` で冪等: 同一入力 + 同一正規化レシピ → 既存 revision を返す
+- レシピは JSON 正規化(キー順序・数値表現の正規化)後に sha256 を取り、revision に永続化 → 再実行・監査・テンプレート化が可能
+
+### 3.3 コア型
+```rust
+struct AssetRevision {
+    asset_id: String,          // "ast_..." 論理アセット
+    revision_id: String,       // "rev_..." 不変スナップショット
+    source_revision_id: Option<String>,
+    width: u32, height: u32,
+    mime_type: String,
+    byte_size: u64,
+    sha256: String,
+    path: PathBuf,             // workspace 内
+    recipe: Option<TransformRecipe>,   // 由来レシピ
+    recipe_hash: Option<String>,
+    created_at: DateTime<Utc>,
+}
+```
+
+### 3.4 変換レシピ DSL(serde tagged enum)
+```json
+{
+  "input_revision_id": "rev_01J...",
+  "operations": [
+    { "op": "auto_orient" },
+    { "op": "rotate", "angle_degrees": -1.8, "crop": "largest_inscribed_rect" },
+    { "op": "crop", "aspect_ratio": "16:9", "anchor": "center" },
+    { "op": "resize", "width": 1600, "fit": "cover", "without_enlargement": true },
+    { "op": "adjust", "brightness": 0.05, "contrast": 0.0, "saturation": 0.0 },
+    { "op": "encode", "format": "webp", "quality": 82 }
+  ]
+}
+```
+v1 のオペレーション: `auto_orient` / `rotate` / `crop`(aspect_ratio or 矩形指定, pad 対応)/ `resize` / `adjust`(brightness, contrast, saturation, sharpness)/ `encode`(jpeg, png, webp, avif)/ `strip_metadata`(exif/gps 選択剥離)。
+
+パイプラインは検証 → 各 op を順次適用 → 単一パスでエンコード。失敗は op 単位でエラー位置を構造化返却。
+
+---
+
+## 4. MCP ツール仕様(v1)
+
+| ツール | 役割 | annotations |
+|---|---|---|
+| `import_asset` | ローカルパスからワークスペースへ取り込み、revision 発行 | readOnly:false, destructive:false, idempotent:true(同一 sha256 → 同一 revision) |
+| `inspect_image` | 寸法・フォーマット・EXIF 要約・色情報・容量 | readOnly:true |
+| `detect_tilt` | Canny+Hough による傾き角候補 + confidence + warnings | readOnly:true |
+| `apply_transform` | レシピを高解像度適用、新 revision 発行 | readOnly:false, destructive:false, idempotent:true |
+| `render_preview` | レシピを低解像度適用、サムネイルを inline 返却 | readOnly:false(preview 生成), destructive:false, idempotent:true |
+| `list_assets` / `get_asset` | 台帳参照(系譜・レシピ含む) | readOnly:true |
+| `export_asset` | revision をワークスペース外の指定パスへ書き出し | readOnly:false, destructive:false(既存ファイルは上書きせずエラー、`overwrite:true` 明示時のみ可) |
+
+全ツール共通で `openWorldHint: false`(ローカル完結。URL フェッチは v1 では提供しない = SSRF 面を最初から閉じる)。
+
+### 4.1 返却パターン(トークン規律)
+調査結果の要点: Claude 系クライアントは tool result の ImageContent を折りたたむ/端末では表示できないため、画像が「勝手に見える」前提にしない。
+
+- `structuredContent` + `outputSchema`: revision_id、寸法、容量、フォーマット、sha256、警告、適用レシピを機械可読で返す(連鎖呼び出しの主経路)
+- `content`:
+  - テキストで結果サマリ + ファイルパス(人間・非対応クライアント向け)
+  - `render_preview` のみ、長辺 ~768px の inline ImageContent(base64)を付与(モデルが見た目確認する用)
+  - フル解像度は `resource_link`(`file://` URI)で参照返却し、バイナリは往復させない
+
+### 4.2 detect_tilt の返却例
+```json
+{
+  "recommended_angle_degrees": -1.8,
+  "confidence": 0.87,
+  "method": "hough_projection_fused",
+  "alternatives": [ { "angle_degrees": -1.4, "score": 0.81 } ],
+  "horizontal_angle_degrees": -1.82,
+  "horizontal_confidence": 0.95,
+  "horizontal_support": 0.62,
+  "vertical_angle_degrees": -1.74,
+  "vertical_confidence": 0.71,
+  "vertical_support": 0.38,
+  "score_curve": [ { "angle_degrees": -15.0, "score": 0.02 }, { "angle_degrees": -1.8, "score": 1.0 } ],
+  "warnings": ["Rotation + crop will remove ~3.2% of pixels"]
+}
+```
+- 角度推定は Hough(長い直線の粗い候補)+ 投影プロファイル(短く途切れたエッジに強い細分)の合成。
+  Hough が直線を取れないシーンでは投影プロファイル単独(`method: "projection_profile"`)になる
+- `horizontal_*` / `vertical_*` は水平族・垂直族**それぞれ単独**の推定。両者が食い違う
+  (例: 水平 -0.5°、垂直 0°)場合はロールではなくカメラ位置・パースが原因であり、
+  回転補正が正解とは限らない。警告にも出す
+- `score_curve` は探索範囲全体の正規化スコア(補正角の昇順・最大 300 点)。ピークの鋭さ・
+  多峰性をクライアントが判断するために返す。最大値 1.0 の点が `recommended_angle_degrees`
+- confidence < 閾値(例 0.5)なら `recommended_angle_degrees: null` を返し「補正しない」を正解とする
+- 人物アップ・商品単体・抽象写真は「検出不能」を正しく返すことを品質要件とする
+- 自動適用はしない: 検出(read-only)と適用(apply_transform)を必ず分離し、判断はホスト AI 側に委ねる
+
+---
+
+## 5. 品質・安全要件
+
+- **決定論**: 同一入力 + 同一レシピ → バイト同一出力(エンコーダのバージョンを Cargo.lock で固定。出力に engine version を記録)
+- **原本保護**: objects/ は追記のみ。削除系ツールは v1 に存在しない
+- **入力ガード**: 最大画素数(例 100MP)・最大ファイルサイズ・MIME スニッフィング(拡張子ではなくマジックバイト)・デコード爆弾対策(`image` の limits API)
+- **パス検証**: import/export のパスはワークスペース設定・許可ディレクトリに対して正規化検証(traversal 防止)
+- **メタデータ**: 変換時は EXIF Orientation を正規化(タグ 1 化 or 剥離)。GPS 等の PII は `strip_metadata` で明示的に落とせる。デフォルトは「ICC 温存・EXIF 温存(Orientation のみ正規化)」
+- **エラー**: すべて構造化(op index、原因、リカバリ指針)。LLM が自己修復できる粒度で返す
+
+## 6. テスト戦略
+
+- ゴールデンテスト: 固定入力画像 + レシピ → 出力 sha256 一致(決定論の回帰検証)
+- 傾き検出: 既知角度で人工的に回転させた画像セットで誤差 ±0.1° 以内を検証(格子・地平線・破線 + ノイズ)。
+  検出不能ケース(単色・人物アップ)で null を返すことを検証。水平/垂直の分離とスコア曲線の健全性も検証
+- レシピ正規化: 意味的に同一なレシピの hash 一致
+- MCP 層: rmcp の in-process transport で tool call の統合テスト
+
+## 7. マイルストーン
+
+- **M0(基盤)**: workspace 雛形、atx-store(import/台帳/冪等)、inspect_image、MCP サーバ起動(stdio)
+- **M1(変換 MVP)**: レシピ DSL、auto_orient / rotate / crop / resize / encode(jpeg,png,webp)、apply_transform、render_preview、export_asset、ゴールデンテスト
+- **M2(知覚)**: detect_tilt(Canny+Hough)、adjust(明るさ等)、avif、strip_metadata、CLI バイナリ
+- **M3(拡張候補)**: saliency / 顔検出を避けるスマートクロップ、CMS 別バリアントプリセット、Streamable HTTP、lcms2 カラーマネジメント
+
+## 8. 既知のリスク・割り切り
+
+1. lossy WebP は libwebp FFI 必須(純 Rust 実装が存在しない)→ C コンパイラ 1 個の依存は許容
+2. AVIF エンコードは CPU 遅(rav1e)→ バッチ前提、preview は常に webp/jpeg
+3. ImageContent のクライアント表示は不安定 → パス + structuredContent を常に正とする
+4. 傾き検出は建築・風景に強く、被写体依存で不能ケースあり → confidence と「補正しない」規約でプロダクト信頼を守る
+5. MCP spec がステートレス化へ移行中(2026-07-28 RC)→ サーバ内セッション状態を持たない設計を維持
+
+## 9. 実装ノート(2026-08-21 実装時に確定した差分)
+
+設計からの意図的な変更・確定事項。コードのドキュメントコメントにも同内容を記載済み。
+
+1. **EXIF Orientation はデコード時に常に正規化**する(`auto_orient` op の有無に依らない)。
+   v1 は再エンコード時に EXIF を落とすため、条件付きにすると誤回転画像を無警告で出力しうる。
+   `auto_orient` は明示的な no-op として残置。
+2. **レシピ正規化は f64 を 1e-6 グリッドに量子化**してからハッシュする。
+   serde_json のテキスト往復で f64 が 1 ULP ずれる(約10%の値で発生、proptest により検出)ため、
+   量子化なしでは「クライアントが canonical JSON をエコーバックすると別ハッシュ」となり
+   冪等性保証が破れる。レシピの float フィールドは 1e-6 を意味精度と定義する。
+3. **アスペクト比クロップ/パッドの寸法計算は固定点反復**(最大8回、実測最悪2回で収束)。
+   丸めによる分岐反転で非冪等になるバグを proptest が検出したため。1回の適用で安定寸法に直行する。
+4. **ICC プロファイルの温存は v1 では JPEG 出力のみ**。PNG/WebP/AVIF 出力では警告付きで破棄。
+   `strip_metadata{gps}` は v1 では all と同挙動(EXIF ごと破棄、警告で明示)。
+5. **`render_preview` は単一パス**: レシピ末尾の encode を差し替え、
+   `resize(contain 768) + encode(jpeg q80)` を付加して原本から1回で生成する
+   (中間成果物の再デコード不要、幾何は apply_transform と同一)。
+   コストはフル解像度適用とほぼ同等である点に注意。
+6. **傾き検出は自前 Hough**(0.1° ビン・水平/垂直帯域限定・勾配方向で帯域振り分け)。
+   imageproc 標準の `detect_lines` は 1° 分解能固定で ±0.3° 要件を満たせないため。
+   人工画像での実測精度は最悪 0.014°。
+7. `ENGINE_VERSION = "atx-core/1"` を維持(クロップ固定点化は挙動変更だが、リリース前で
+   既存ストアが存在しないため据え置き。リリース後の挙動変更からバンプする)。
+
+### テスト実績(実装完了時点)
+
+- ワークスペース全体: 89 テスト green(ユニット + 統合 + proptest 14 性質)、clippy -D warnings クリーン
+- E2E(実バイナリ、stdio JSON-RPC、1477x1108 JPEG フィクスチャ):
+  import → detect_tilt(+0.04°, conf 0.69)→ apply_transform(rotate + 16:9 + resize + webp)
+  → 再適用で reused:true(冪等)→ preview(インライン 768px JPEG)→ export、全工程確認済み
+- proptest が発見し修正した実バグ2件: §9-2, §9-3
+
+### 9.1 追補(2026-08-21): SOURCE 座標系クロップ と strip_metadata{exif}
+
+現場フィードバック起点の atx-core 拡張。既存レシピの `recipe_hash` とゴールデン出力は不変。
+
+8. **`Crop` に `coordinate_space`(`current` 既定 / `source`)を追加**。
+   `rotate` + `largest_inscribed_rect` の後は画像が縮む(1477x1108 のフィクスチャで 1467x1095)ため、
+   利用者が新座標系でのクロップ原点を手計算する必要があった。`source` を指定すると
+   **入力画像(EXIF orientation 正規化前)の座標系**で矩形を書ける。
+   - serde は `#[serde(default, skip_serializing_if = "CoordinateSpace::is_current")]`。
+     既定値のときは正規化 JSON にフィールドが現れないので、`coordinate_space` を書かない
+     既存レシピの canonical JSON はバイト単位で従来と一致し、ハッシュも不変
+     (§9-7 のゴールデン `884ea1…` は据え置き)。
+   - `source` は `rect` 専用。`aspect_ratio` との併用は validate エラー
+     (アスペクト比には写す座標系が存在しないため)。
+9. **エンジンが「SOURCE 画素座標 → CURRENT パイプライン座標」のアフィン変換(2x3 f64)を保持する**
+   (`crates/atx-core/src/transform.rs`)。幾何 op ごとに合成していく:
+   - EXIF orientation 正規化(反転・四半回転)/ `rotate`(中心回転 + 内接矩形または
+     全体キャンバスのオフセット平行移動)/ `crop`(負の平行移動)/ `pad`(正の平行移動)/
+     `resize`(スケール、`fit=cover` の内部中央クロップ平行移動を含む)
+   - `adjust` / `encode` / `strip_metadata` は座標を動かさない
+   - 行列は**連続座標**(画素 index `i` は `[i, i+1)`)で定義する。リサイズ `u' = s·u` と
+     反転 `u' = w - u` が連続座標でのみ厳密に線形になるため。
+     `imageproc` の `warp` 系は index 座標で回転中心を `(w/2, h/2)` に置くので、
+     任意角回転だけは連続座標へ換算した `(w/2 + 0.5, h/2 + 0.5)` を中心に使う。
+   - `source` 矩形は 4 隅を写して**軸並行外接矩形**を取り(= 回転後は「見た目上傾いた四角形」
+     ではなくその外接矩形。元矩形よりわずかに大きい)、half-away-from-zero で丸め、
+     現在の画像範囲へクランプする。クランプ時は `EncodedOutput::warnings` に記録し、
+     交差が空なら写像後の座標を含む構造化エラー(`AtxError::Operation`)を返す。
+10. **`strip_metadata` に scope `exif` を追加**: EXIF(GPS 含む)が確実に無いことを保証しつつ
+    **ICC プロファイルは温存する**(Web 配信で色が動かないことを優先)。
+    `all` は従来どおり ICC も落とす。`exif` でも ICC を実際に埋め込めるのは JPEG 出力のみで、
+    PNG/WebP/AVIF では従来どおり警告付きで破棄(§9-4 の制約は据え置き)。
+    enum の variant 追加は既存 2 値の正規化表現を変えないため、ハッシュも不変。
+11. `ENGINE_VERSION` は `atx-core/1` のまま。既定レシピ(新フィールド無し)の出力バイト列は
+    1 バイトも変わっていない(この時点のゴールデンは `99b05d96…`。§9.2 のフィクスチャ差し替えで値のみ移動)。
+
+#### 追補時点のテスト実績
+
+- `cargo test -p atx-core`: 82 テスト green(lib ユニット 5 / derived 7 / engine 43 /
+  proptest_engine 6 性質 / proptest_recipe 4 性質 / recipe 17)、
+  `clippy -p atx-core --all-targets -D warnings` クリーン、`cargo check --workspace --all-targets` も通過
+- 追加した検証: マーカー矩形つき合成画像による source 座標追従(rotate -1.8° 内接 / EXIF
+  orientation=6 / resize / rotate90+cover+crop の連鎖)、幾何 op が無いときの
+  source ≡ current 等価性、クランプ警告と空交差エラー、`coordinate_space` 既定値の
+  ハッシュ不可視性、`StripScope::Exif` の ICC 温存 + EXIF 不在(出力バイト列に
+  `Exif\0\0` が残らないことまで確認)
+- 追加した性質(proptest #9): SOURCE 全域を指す矩形は、前段の幾何チェーン
+  (rotate 小角度 / resize / aspect crop)が何であってもエラーにならず、
+  出力寸法はその時点の画像寸法を超えない
+
+### 9.2 追補(2026-08-21): テストフィクスチャ方針
+
+12. **リポジトリに置くテスト画像は完全合成のもののみ**とする。`tests/fixtures/synthetic_scene.jpg`
+    (1477x1108、APP2 ICC あり / EXIF なし)は `cargo run -p atx-core --example gen_fixture` で
+    決定論的に再生成でき、第三者・個人の写真素材はリポジトリに含めない。
+    エンジン挙動は不変なので `ENGINE_VERSION` は据え置き、ゴールデン出力 sha256 のみ
+    新フィクスチャに対して張り直した(`bc05827c…`)。
