@@ -1,8 +1,25 @@
-//! テストフィクスチャ `tests/fixtures/synthetic_scene.jpg` の生成器。
+//! テストフィクスチャ `tests/fixtures/synthetic_scene.jpg` および
+//! `evals/fixtures/tilted_scene.jpg` の生成器。
 //!
 //! ```sh
 //! cargo run -p atx-core --example gen_fixture
 //! ```
+//!
+//! ## tilted_scene.jpg(evals/tasks/t01_straighten_eyecatch.json 用)
+//!
+//! `synthetic_scene.jpg` はほぼ水平(atx-geometry の傾き検出が ~0° を返す)なため、
+//! 「まっすぐにして」という eval タスクで `rotate` op を使わなくても正しく振る舞える
+//! 状態だった。これは eval タスク側の不備であり、フィクスチャを客観的に傾いた画像に
+//! する方が正しい修正(docs/DESIGN.md 参照)。
+//!
+//! `synthetic_scene.jpg` と同じ合成シーンに対し、atx-core の決定論エンジン自身
+//! (`apply_recipe`)で `Rotate { angle_degrees: -2.4, crop: largest_inscribed_rect }`
+//! を適用したものを書き出す。atx-core の `Rotate.angle_degrees` は「正 = 時計回り」、
+//! atx-geometry の `recommended_angle_degrees` も同じ規約(「正 = 時計回りに回すと
+//! 水平になる」)なので、-2.4° 回転させた画像を水平に戻す補正角は理論上ちょうど
+//! +2.4° になる。本生成器はこれを仮定で終わらせず、生成直後に
+//! `atx_geometry::detect_tilt` を実際に走らせて `recommended_angle_degrees` が
+//! +2.4° 近辺・十分な confidence であることを assert で検証する。
 //!
 //! ## 方針(DESIGN §9 フィクスチャ方針)
 //!
@@ -26,6 +43,13 @@
 use std::path::PathBuf;
 
 use image::{Rgb, RgbImage};
+
+use atx_core::{Limits, Operation, OutputFormat, RotateCrop, TransformRecipe};
+use atx_geometry::{detect_tilt, DetectParams};
+
+/// `tilted_scene.jpg` に加える回転角(度、atx-core の規約で正 = 時計回り)。
+/// 水平に戻す補正角はこの符号反転(+2.4°)になる想定。
+const TILT_ROTATE_DEGREES: f64 = -2.4;
 
 /// フィクスチャの寸法(実写フィクスチャからの移行時に維持した値)。
 const WIDTH: u32 = 1477;
@@ -380,4 +404,77 @@ fn main() {
         HEIGHT,
         first.len()
     );
+
+    gen_tilted_fixture(&first);
+}
+
+/// `evals/fixtures/tilted_scene.jpg` を生成する。
+///
+/// `synthetic_scene.jpg` のバイト列(`base_jpeg`)に対し、atx-core の決定論エンジン
+/// (`apply_recipe`)自身で回転 + 最大内接矩形クロップを適用し、その出力をそのまま
+/// 書き出す。生成の決定論(2 回適用してバイト同一)と、傾き検出の符号・精度
+/// (`detect_tilt` が ~+2.4° を十分な confidence で返すこと)の両方をここで検証する。
+fn gen_tilted_fixture(base_jpeg: &[u8]) {
+    let recipe = tilt_recipe();
+    let limits = Limits::default();
+
+    let first = atx_core::apply_recipe(base_jpeg, &recipe, &limits)
+        .expect("apply_recipe(rotate) on synthetic scene");
+    let second = atx_core::apply_recipe(base_jpeg, &recipe, &limits)
+        .expect("apply_recipe(rotate) on synthetic scene (2nd run)");
+    assert_eq!(
+        first.bytes, second.bytes,
+        "tilted fixture generation must be byte-for-byte deterministic"
+    );
+
+    // 符号・精度の自己検証: 生成した画像を detect_tilt にかけ、
+    // 「時計回りに +2.4° 回すと水平になる」という想定を裏付ける。
+    let decoded = image::load_from_memory(&first.bytes).expect("decode generated tilted jpeg");
+    let detection = detect_tilt(&decoded, &DetectParams::default());
+    let recommended = detection
+        .recommended_angle_degrees
+        .expect("detect_tilt should recommend a correction angle for the tilted fixture");
+    println!(
+        "tilted_scene.jpg: detect_tilt recommended_angle_degrees={recommended:.3} confidence={:.3} method={}",
+        detection.confidence, detection.method
+    );
+    assert!(
+        (recommended - -TILT_ROTATE_DEGREES).abs() <= 0.3,
+        "expected detect_tilt to recommend ~{:.1}° to correct the {:.1}° tilt, got {recommended:.3}° ({detection:?})",
+        -TILT_ROTATE_DEGREES,
+        TILT_ROTATE_DEGREES
+    );
+    assert!(
+        detection.confidence >= 0.5,
+        "expected decent confidence for the tilted fixture, got {} ({detection:?})",
+        detection.confidence
+    );
+
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../evals/fixtures/tilted_scene.jpg");
+    std::fs::create_dir_all(path.parent().unwrap()).expect("evals/fixtures dir");
+    std::fs::write(&path, &first.bytes).expect("write tilted fixture");
+    println!(
+        "wrote {} ({}x{}, {} bytes, rotate={}°)",
+        path.display(),
+        first.width,
+        first.height,
+        first.bytes.len(),
+        TILT_ROTATE_DEGREES
+    );
+}
+
+fn tilt_recipe() -> TransformRecipe {
+    TransformRecipe {
+        operations: vec![
+            Operation::Rotate {
+                angle_degrees: TILT_ROTATE_DEGREES,
+                crop: RotateCrop::LargestInscribedRect,
+            },
+            Operation::Encode {
+                format: OutputFormat::Jpeg,
+                quality: Some(QUALITY),
+            },
+        ],
+    }
 }

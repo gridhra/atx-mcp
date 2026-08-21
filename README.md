@@ -113,13 +113,35 @@ It is created automatically if it doesn't exist.
 }
 ```
 
-Supported ops: `auto_orient` / `rotate` / `perspective` / `crop` (crop, pad) /
-`resize` (cover, contain, fill) / `adjust` / `color_matrix` / `curves` /
-`levels` / `blur` / `median` / `unsharp_mask` / `encode` (jpeg, png, webp,
-avif) / `strip_metadata`.
+Supported ops (18): `auto_orient` / `rotate` / `perspective` / `crop` (crop,
+pad) / `resize` (cover, contain, fill) / `adjust` / `color_matrix` / `curves` /
+`levels` / `lut` / `white_balance` / `hsl` / `blur` / `median` /
+`unsharp_mask` / `convolve` / `encode` (jpeg, png, webp, avif) /
+`strip_metadata`.
 The operation vocabulary is deliberately kept out of the tool schemas: call
 `list_operations` for the up-to-date catalog and `explain_operation` for one
 operation's full schema, examples and gotchas.
+
+### LUT (.cube)
+
+A `.cube` 3D/1D LUT is an *asset*, not an image: import it first, then point a
+recipe at the revision it produced.
+
+1. `import_asset` the `.cube` file. It is stored as an immutable revision with
+   `mime_type: "application/x-cube"` (`inspect_image` refuses it on purpose —
+   it is not an image).
+2. Reference the returned `revision_id` from a recipe:
+
+```json
+{ "op": "lut", "lut_revision_id": "rev_...", "strength": 0.8 }
+```
+
+`strength` (0..1, default 1.0) blends linearly with the original. Because
+revisions are immutable, including the referenced id in the `recipe_hash` keeps
+the transform fully deterministic — but it also means the recipe is only
+reproducible inside a workspace that holds that LUT, so move the `.cube`
+alongside the recipe when you move a look between machines. Referencing an
+unknown id fails with a structured error before any pixel work happens.
 
 ## Presets
 
@@ -130,6 +152,8 @@ the two:
 | Preset | What it does |
 |---|---|
 | `eyecatch_16_9` | Center-crop to 16:9, resize to 1600px wide, WebP q82 |
+| `film_soft` | Soft film look: gentle S-curve plus a 15% pull towards luma |
+| `product_clean` | Clean product shot: near-neutral white balance, levels lift, light sharpen |
 | `thumbnail_square` | Center-crop to 1:1, resize to 800x800, WebP q80 |
 | `web_optimize` | Fit inside 2000x2000 without upscaling, WebP q80 |
 | `grayscale` | Black and white via a BT.709 luma `color_matrix` |

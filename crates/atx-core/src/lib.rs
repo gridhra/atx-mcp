@@ -8,7 +8,10 @@ mod pixel_ops;
 pub mod recipe;
 pub(crate) mod transform;
 
-pub use engine::{apply_recipe, inspect_bytes, EncodedOutput, ImageInfo, ENGINE_VERSION};
+pub use engine::{
+    apply_recipe, apply_recipe_with_assets, inspect_bytes, AssetResolver, EncodedOutput, ImageInfo,
+    NoAssets, ENGINE_VERSION,
+};
 pub use recipe::{
     canonical_json, recipe_hash, Anchor, CoordinateSpace, CropMode, Fit, Operation, OutputFormat,
     RotateCrop, StripScope, TransformRecipe,

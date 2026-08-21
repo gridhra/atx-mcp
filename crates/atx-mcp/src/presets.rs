@@ -22,7 +22,12 @@ pub const PRESET_FILES: &[(&str, &str)] = &[
         "eyecatch_16_9",
         include_str!("../../../presets/eyecatch_16_9.json"),
     ),
+    ("film_soft", include_str!("../../../presets/film_soft.json")),
     ("grayscale", include_str!("../../../presets/grayscale.json")),
+    (
+        "product_clean",
+        include_str!("../../../presets/product_clean.json"),
+    ),
     ("sepia", include_str!("../../../presets/sepia.json")),
     (
         "thumbnail_square",
@@ -117,17 +122,22 @@ mod tests {
         }
     }
 
-    /// color_matrix 系プリセットの validate。
-    ///
-    /// `atx_core::ops::color::validate_matrix` は v0.2 の並行作業で実装中(現状 `todo!()`)
-    /// のため、統合が済むまで ignore する。統合後にこの属性を外すこと。
+    /// color_matrix / curves 系プリセットの validate(v0.2 の color op で実装済み)。
     #[test]
     fn color_presets_pass_core_validate() {
-        for name in ["grayscale", "sepia"] {
+        for name in ["film_soft", "grayscale", "sepia"] {
             let preset = resolve(name).expect("preset must resolve");
             atx_core::recipe::validate(&preset.recipe)
                 .unwrap_or_else(|e| panic!("preset {name} must be a valid recipe: {e}"));
         }
+    }
+
+    /// v0.3 op(white_balance)を使うプリセットの validate。
+    #[test]
+    fn v03_presets_pass_core_validate() {
+        let preset = resolve("product_clean").expect("preset must resolve");
+        atx_core::recipe::validate(&preset.recipe)
+            .unwrap_or_else(|e| panic!("preset product_clean must be a valid recipe: {e}"));
     }
 
     #[test]

@@ -79,6 +79,8 @@ fn ext_for_mime(mime_type: &str) -> &'static str {
         "image/png" => "png",
         "image/webp" => "webp",
         "image/avif" => "avif",
+        // 画像ではないアセット(v0.3: レシピから参照される .cube 3D LUT)。
+        "application/x-cube" => "cube",
         _ => "bin",
     }
 }
@@ -340,5 +342,17 @@ impl AssetStore {
             fs::rename(&tmp_path, &path)?;
         }
         Ok(path)
+    }
+}
+
+#[cfg(test)]
+mod ext_tests {
+    use super::ext_for_mime;
+
+    #[test]
+    fn cube_luts_keep_their_extension() {
+        assert_eq!(ext_for_mime("application/x-cube"), "cube");
+        assert_eq!(ext_for_mime("image/jpeg"), "jpg");
+        assert_eq!(ext_for_mime("application/whatever"), "bin");
     }
 }

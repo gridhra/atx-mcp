@@ -132,10 +132,40 @@ pub fn inspect_bytes(bytes: &[u8], limits: &Limits) -> Result<ImageInfo> {
 /// 2D アフィン変換を保持し、幾何 op ごとに合成していく
 /// (orientation 正規化 / rotate / crop / pad / resize。adjust・encode・strip は座標を動かさない)。
 /// 詳細は `crate::transform` と `recipe::CoordinateSpace` を参照。
+/// レシピが参照する他アセット(LUT 等)の実体を解決する。
+/// atx-core はストア実装に依存しないため、呼び出し側(atx-mcp / CLI / テスト)が実装する。
+pub trait AssetResolver {
+    /// revision id の実体バイト列を返す。見つからなければ Err。
+    fn read_revision(&self, revision_id: &str) -> Result<Vec<u8>>;
+}
+
+/// アセット参照を一切解決できないリゾルバ(後方互換の既定)。
+/// `lut` 等のアセット参照 op を含むレシピはエラーになる。
+pub struct NoAssets;
+
+impl AssetResolver for NoAssets {
+    fn read_revision(&self, revision_id: &str) -> Result<Vec<u8>> {
+        Err(AtxError::InvalidRecipe(format!(
+            "this recipe references asset {revision_id}, but no asset resolver is available              in this context"
+        )))
+    }
+}
+
 pub fn apply_recipe(
     bytes: &[u8],
     recipe: &TransformRecipe,
     limits: &Limits,
+) -> Result<EncodedOutput> {
+    apply_recipe_with_assets(bytes, recipe, limits, &NoAssets)
+}
+
+/// アセット参照 op(`lut` 等)を含むレシピに対応した本体。
+/// `assets` から参照先の実体を読み、決定論を保ったまま適用する。
+pub fn apply_recipe_with_assets(
+    bytes: &[u8],
+    recipe: &TransformRecipe,
+    limits: &Limits,
+    assets: &dyn AssetResolver,
 ) -> Result<EncodedOutput> {
     crate::recipe::validate(recipe)?;
     check_byte_limit(bytes, limits)?;
@@ -342,6 +372,45 @@ pub fn apply_recipe(
             } => {
                 img = crate::ops::blur::unsharp_mask(&img, *amount, *radius, *threshold);
             }
+            Operation::Lut {
+                lut_revision_id,
+                strength,
+            } => {
+                let lut_bytes = assets
+                    .read_revision(lut_revision_id)
+                    .map_err(|e| fail(e.to_string()))?;
+                let text = std::str::from_utf8(&lut_bytes).map_err(|_| {
+                    fail(format!("asset {lut_revision_id} is not a text .cube file"))
+                })?;
+                let lut = crate::ops::lut::parse_cube(text).map_err(|e| fail(e.to_string()))?;
+                img = crate::ops::lut::apply(&img, &lut, *strength);
+            }
+            Operation::WhiteBalance { temperature, tint } => {
+                img = crate::ops::wb::apply(&img, *temperature, *tint);
+            }
+            Operation::Hsl {
+                red,
+                orange,
+                yellow,
+                green,
+                aqua,
+                blue,
+                purple,
+                magenta,
+            } => {
+                let bands = [
+                    *red, *orange, *yellow, *green, *aqua, *blue, *purple, *magenta,
+                ];
+                img = crate::ops::hsl::apply(&img, &bands);
+            }
+            Operation::Convolve {
+                kernel,
+                size,
+                divisor,
+                offset,
+            } => {
+                img = crate::ops::convolve::apply(&img, kernel, *size, *divisor, *offset);
+            }
             Operation::StripMetadata { scope } => {
                 strip = Some(*scope);
             }
@@ -433,6 +502,10 @@ fn op_name(op: &Operation) -> &'static str {
         Operation::Blur { .. } => "blur",
         Operation::Median { .. } => "median",
         Operation::UnsharpMask { .. } => "unsharp_mask",
+        Operation::Lut { .. } => "lut",
+        Operation::WhiteBalance { .. } => "white_balance",
+        Operation::Hsl { .. } => "hsl",
+        Operation::Convolve { .. } => "convolve",
         Operation::StripMetadata { .. } => "strip_metadata",
     }
 }

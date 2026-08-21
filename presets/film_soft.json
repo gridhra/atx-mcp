@@ -1,0 +1,27 @@
+{
+  "name": "film_soft",
+  "description": "Soft film look: a gentle S-curve plus a 15% pull towards BT.709 luma (no resize/encode).",
+  "recipe": {
+    "operations": [
+      {
+        "op": "curves",
+        "master": [
+          [0, 4],
+          [64, 58],
+          [128, 128],
+          [192, 198],
+          [255, 251]
+        ]
+      },
+      {
+        "op": "color_matrix",
+        "matrix": [
+          0.88189, 0.10728, 0.01083, 0.0, 0.0,
+          0.03189, 0.95728, 0.01083, 0.0, 0.0,
+          0.03189, 0.10728, 0.86083, 0.0, 0.0,
+          0.0, 0.0, 0.0, 1.0, 0.0
+        ]
+      }
+    ]
+  }
+}

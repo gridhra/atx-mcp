@@ -307,3 +307,21 @@ v1 のオペレーション: `auto_orient` / `rotate` / `crop`(aspect_ratio or �
 - evals/ にエージェント eval ハーネス(実務タスク10本、リリース前の手動ゲート)
 - tests/f32_spike.rs: Phase B 前提の f32 クロスプラットフォーム決定論スパイク
   (CI 両アームの green で実証完了となる)
+
+### 9.4 v0.3 追補(2026-08-21)
+
+- **レシピからの他アセット参照を導入**(このリリースの設計判断):
+  atx-core に `AssetResolver` トレイトと `apply_recipe_with_assets` を追加。
+  core はストア非依存のまま、atx-mcp が `AssetStore` バックドのリゾルバを渡す。
+  参照は revision id で行い、revision 不変性によりハッシュ決定論が保たれる。
+  レシピの再現性はワークスペース内スコープ(他環境へは参照先アセットごと移す)。
+  このパターンは v0.5 のマスク参照・v0.6 のレイヤー source 参照の先行実装
+- op 14→18: `lut`(.cube 1D/3D、四面体補間、strength)、`white_balance`
+  (輝度正規化ゲイン)、`hsl`(8色相域 + 三角フェザ。無シフト往復は全 u8 三つ組で
+  バイト同一を検証済み)、`convolve`(≤9×9、RGB のみ)
+- `.cube` は import_asset が拡張子/内容で検出し mime `application/x-cube` で格納。
+  inspect_image は非画像 revision を構造化エラー(not_an_image)で拒否
+- プリセット 5→7(film_soft / product_clean。アセット参照を含むプリセットは
+  埋め込み LUT の自動 import 設計が必要なため次回以降に分離)
+- eval t01 は傾き付き合成フィクスチャ(evals/fixtures/tilted_scene.jpg、生成器が
+  detect_tilt で自己検証)に差し替え。eval 10/10

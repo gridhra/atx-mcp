@@ -13,4 +13,8 @@
 
 pub mod blur;
 pub mod color;
+pub mod convolve;
+pub mod hsl;
+pub mod lut;
 pub mod perspective;
+pub mod wb;

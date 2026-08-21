@@ -142,6 +142,55 @@ pub enum Operation {
         #[serde(default)]
         threshold: u8,
     },
+    /// 3D LUT(.cube)適用。LUT はワークスペースへ import 済みの revision を参照する。
+    /// revision は不変なので、参照 id をハッシュに含めるだけで決定論が保たれる。
+    /// 注意: レシピの再現はワークスペース内でのみ保証される(他環境へは LUT アセットごと移す)。
+    Lut {
+        /// .cube アセットの revision id("rev_...")。
+        lut_revision_id: String,
+        /// 適用強度 0.0..=1.0(元画像との線形ブレンド)。既定 1.0。
+        #[serde(default = "default_one")]
+        strength: f64,
+    },
+    /// ホワイトバランス。temperature: 正=暖色へ / 負=寒色へ(-100..=100)、
+    /// tint: 正=マゼンタへ / 負=グリーンへ(-100..=100)。0 = 変更なし。
+    WhiteBalance {
+        #[serde(default)]
+        temperature: f64,
+        #[serde(default)]
+        tint: f64,
+    },
+    /// 色相域別 HSL 調整(Lightroom HSL パネル相当)。8 色相域それぞれに
+    /// hue(-100..=100、隣接色相方向へのシフト)/ saturation / luminance(-100..=100)。
+    /// 未指定の域は変更なし。域境界は滑らかに減衰(フェザリング)する。
+    Hsl {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        red: Option<HslShift>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orange: Option<HslShift>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        yellow: Option<HslShift>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        green: Option<HslShift>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        aqua: Option<HslShift>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blue: Option<HslShift>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        purple: Option<HslShift>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        magenta: Option<HslShift>,
+    },
+    /// 任意カーネル畳み込み。kernel は size×size(行優先)、size は 3/5/7/9。
+    /// 出力 = (Σ kernel_i * px_i) / divisor + offset。端はクランプ。RGB のみ(A は不変)。
+    Convolve {
+        kernel: Vec<f64>,
+        size: u32,
+        #[serde(default = "default_one")]
+        divisor: f64,
+        #[serde(default)]
+        offset: f64,
+    },
     /// 出力エンコード指定。レシピ内で最後に1回のみ許可。省略時は入力フォーマット維持。
     Encode {
         format: OutputFormat,
@@ -156,6 +205,22 @@ pub enum Operation {
         #[serde(default)]
         scope: StripScope,
     },
+}
+
+/// 色相域ごとの HSL シフト量。各値 -100..=100(0 = 変更なし)。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HslShift {
+    #[serde(default)]
+    pub hue: f64,
+    #[serde(default)]
+    pub saturation: f64,
+    #[serde(default)]
+    pub luminance: f64,
+}
+
+fn default_one() -> f64 {
+    1.0
 }
 
 fn default_255() -> u8 {
@@ -410,6 +475,32 @@ pub fn validate(recipe: &TransformRecipe) -> crate::Result<()> {
             } => crate::ops::color::validate_levels(
                 index, *in_black, *in_white, *gamma, *out_black, *out_white,
             )?,
+            Operation::Lut {
+                lut_revision_id,
+                strength,
+            } => crate::ops::lut::validate(index, lut_revision_id, *strength)?,
+            Operation::WhiteBalance { temperature, tint } => {
+                crate::ops::wb::validate(index, *temperature, *tint)?
+            }
+            Operation::Hsl {
+                red,
+                orange,
+                yellow,
+                green,
+                aqua,
+                blue,
+                purple,
+                magenta,
+            } => crate::ops::hsl::validate(
+                index,
+                &[red, orange, yellow, green, aqua, blue, purple, magenta],
+            )?,
+            Operation::Convolve {
+                kernel,
+                size,
+                divisor,
+                offset,
+            } => crate::ops::convolve::validate(index, kernel, *size, *divisor, *offset)?,
             Operation::Blur { sigma } => crate::ops::blur::validate_blur(index, *sigma)?,
             Operation::Median { radius } => crate::ops::blur::validate_median(index, *radius)?,
             Operation::UnsharpMask {

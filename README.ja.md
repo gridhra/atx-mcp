@@ -107,11 +107,32 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 }
 ```
 
-対応 op: `auto_orient` / `rotate` / `perspective` / `crop`(crop・pad)/ `resize`(cover・contain・fill)/
-`adjust` / `color_matrix` / `curves` / `levels` / `blur` / `median` / `unsharp_mask` /
+対応 op(18種): `auto_orient` / `rotate` / `perspective` / `crop`(crop・pad)/ `resize`(cover・contain・fill)/
+`adjust` / `color_matrix` / `curves` / `levels` / `lut` / `white_balance` / `hsl` /
+`blur` / `median` / `unsharp_mask` / `convolve` /
 `encode`(jpeg・png・webp・avif)/ `strip_metadata`。
 op 一覧はツールのスキーマにあえて埋め込んでいない。最新のカタログは `list_operations`、
 個々の op の完全なスキーマ・例・注意点は `explain_operation` で取得する。
+
+### LUT(.cube)
+
+`.cube` の 3D/1D LUT は画像ではなく**アセット**である。先に取り込み、
+生成された revision をレシピから参照する。
+
+1. `.cube` ファイルを `import_asset` する。`mime_type: "application/x-cube"` の
+   不変 revision として格納される(画像ではないので `inspect_image` は意図的に
+   構造化エラーを返す)。
+2. 返ってきた `revision_id` をレシピから参照する:
+
+```json
+{ "op": "lut", "lut_revision_id": "rev_...", "strength": 0.8 }
+```
+
+`strength`(0..1、既定 1.0)は元画像との線形ブレンド。revision は不変なので、
+参照 id を `recipe_hash` に含めるだけで決定論が保たれる。一方で、そのレシピの
+再現はその LUT を持つワークスペース内でのみ保証されるため、ルックを別環境へ
+移すときは `.cube` ごと移すこと。存在しない id を参照した場合は、画素処理に
+入る前に構造化エラーで返る。
 
 ## プリセット
 
@@ -121,6 +142,8 @@ op 一覧はツールのスキーマにあえて埋め込んでいない。最�
 | プリセット | 内容 |
 |---|---|
 | `eyecatch_16_9` | 16:9 に中央クロップ → 幅 1600px → WebP q82 |
+| `film_soft` | フィルム風の柔らかさ: 緩い S 字カーブ + 輝度側へ 15% の脱色 |
+| `product_clean` | EC 商品向けの清潔感: ほぼ中立の WB + レベル調整 + 軽いシャープ |
 | `thumbnail_square` | 1:1 に中央クロップ → 800x800 → WebP q80 |
 | `web_optimize` | 拡大せず 2000x2000 に収める → WebP q80 |
 | `grayscale` | BT.709 輝度の `color_matrix` による白黒化 |

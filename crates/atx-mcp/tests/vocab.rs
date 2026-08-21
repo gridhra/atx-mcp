@@ -56,7 +56,7 @@ fn tools() -> (tempfile::TempDir, AtxTools) {
     (workspace, tools)
 }
 
-const V02_OPERATIONS: [&str; 14] = [
+const V03_OPERATIONS: [&str; 18] = [
     "auto_orient",
     "rotate",
     "crop",
@@ -66,16 +66,22 @@ const V02_OPERATIONS: [&str; 14] = [
     "color_matrix",
     "curves",
     "levels",
+    "lut",
+    "white_balance",
+    "hsl",
     "blur",
     "median",
     "unsharp_mask",
+    "convolve",
     "encode",
     "strip_metadata",
 ];
 
-const BUILTIN_PRESETS: [&str; 5] = [
+const BUILTIN_PRESETS: [&str; 7] = [
     "eyecatch_16_9",
+    "film_soft",
     "grayscale",
+    "product_clean",
     "sepia",
     "thumbnail_square",
     "web_optimize",
@@ -88,14 +94,14 @@ fn list_operations_returns_every_op_and_the_presets() {
     let out = structured(&result);
     let body = text(&result);
 
-    assert_eq!(out["count"], 14);
+    assert_eq!(out["count"], 18);
     let names: Vec<&str> = out["operations"]
         .as_array()
         .expect("operations must be an array")
         .iter()
         .map(|op| op["name"].as_str().unwrap())
         .collect();
-    for expected in V02_OPERATIONS {
+    for expected in V03_OPERATIONS {
         assert!(
             names.contains(&expected),
             "missing op {expected} in catalog"
@@ -125,9 +131,9 @@ fn list_operations_returns_every_op_and_the_presets() {
     assert!(body.contains("sigma"));
     assert!(body.contains("0.1..100"));
 
-    // 段階的開示: カタログはトークン的に軽いこと(目安 ~600 tokens ≒ 2600 chars)。
+    // 段階的開示: カタログはトークン的に軽いこと(v0.3 で 18 op、目安 ~850 tokens ≒ 3600 chars)。
     assert!(
-        body.len() < 2600,
+        body.len() < 3600,
         "the catalog must stay compact, got {} chars",
         body.len()
     );
@@ -146,9 +152,12 @@ fn list_operations_filters_by_category_and_rejects_unknown_ones() {
         .iter()
         .map(|op| op["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["blur", "median", "unsharp_mask"]);
+    assert_eq!(names, ["blur", "median", "unsharp_mask", "convolve"]);
     // プリセットは分類で絞っても常に出す(語彙の圧縮層は分類に属さない)。
-    assert_eq!(filtered["presets"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        filtered["presets"].as_array().unwrap().len(),
+        BUILTIN_PRESETS.len()
+    );
 
     let invalid = tools.list_operations(&ListOperationsParams {
         category: Some("vibes".to_string()),
@@ -228,12 +237,55 @@ fn explain_operation_returns_the_full_parameter_table() {
     assert!(semantics.contains("ORIGINAL"));
 
     // 全 op が説明可能であること。
-    for op in V02_OPERATIONS {
+    for op in V03_OPERATIONS {
         let result = tools.explain_operation(&ExplainOperationParams {
             operation: op.to_string(),
         });
         assert_ne!(result.is_error, Some(true), "{op} must be explainable");
     }
+}
+
+/// lut の説明は「先に .cube を import_asset する」ワークフローを明示すること
+/// (v0.3 のアセット参照は、この一手を飛ばすと必ず失敗する)。
+#[test]
+fn explain_lut_documents_the_import_first_workflow() {
+    let (_ws, tools) = tools();
+    let result = tools.explain_operation(&ExplainOperationParams {
+        operation: "lut".to_string(),
+    });
+    let out = structured(&result);
+    let body = text(&result);
+    assert_eq!(out["name"], "lut");
+    assert_eq!(out["category"], "color");
+
+    let params: Vec<&str> = out["params"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(params, ["lut_revision_id", "strength"]);
+
+    assert!(
+        body.contains("import_asset"),
+        "explain_operation(\"lut\") must spell out the import_asset step: {body}"
+    );
+    assert!(
+        out["params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["semantics"].as_str().unwrap().contains("import_asset")),
+        "the lut_revision_id semantics must name import_asset"
+    );
+    assert!(
+        out["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("import_asset")),
+        "lut must warn that the LUT has to be imported first"
+    );
 }
 
 #[test]
@@ -250,8 +302,8 @@ fn explain_operation_rejects_unknown_names_with_the_valid_list() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert_eq!(valid.len(), 14);
-    for op in V02_OPERATIONS {
+    assert_eq!(valid.len(), 18);
+    for op in V03_OPERATIONS {
         assert!(valid.contains(&op));
     }
     let suggestions = payload["error"]["details"]["did_you_mean"]
@@ -282,12 +334,18 @@ fn embedded_presets_are_well_formed() {
     }
 }
 
-/// color_matrix を使うプリセットの validate。
-/// `atx_core::ops::color::validate_matrix` が `todo!()` の間は panic するため ignore。
-/// v0.2 の color op 統合後にこの属性を外すこと。
+/// v0.3 op(white_balance)を使うプリセットの validate。
+#[test]
+fn v03_presets_pass_core_validate() {
+    let preset = atx_mcp::presets::resolve("product_clean").expect("preset must resolve");
+    atx_core::recipe::validate(&preset.recipe)
+        .unwrap_or_else(|e| panic!("preset product_clean must pass atx-core validate: {e}"));
+}
+
+/// color_matrix / curves を使うプリセットの validate(v0.2 の color op で実装済み)。
 #[test]
 fn color_presets_pass_core_validate() {
-    for name in ["grayscale", "sepia"] {
+    for name in ["film_soft", "grayscale", "sepia"] {
         let preset = atx_mcp::presets::resolve(name).expect("preset must resolve");
         atx_core::recipe::validate(&preset.recipe)
             .unwrap_or_else(|e| panic!("preset {name} must pass atx-core validate: {e}"));
