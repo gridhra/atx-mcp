@@ -1,11 +1,22 @@
 //! ホワイトバランス(temperature / tint)。
 //!
-//! RAW を持たない sRGB 画像への簡易モデル: temperature / tint をチャンネルゲインに
-//! 写像して適用する(正確な色順応変換は Phase B の f32 + lcms2 で扱う。
-//! ここでは「見た目が Lightroom の WB スライダに近い、決定論的で単調な補正」を目標とする)。
-//! ゲイン算出に超越関数を使う場合は f64 計算 → 1e-6 量子化(ops/mod.rs 規約)。
+//! **作業空間: 線形光**(`ops/mod.rs` の表を参照)。
 //!
-//! # ゲインモデル(v0.3 で確定。変更は ENGINE_VERSION 更新を伴う)
+//! # v2 でホワイトバランスは物理的に正しくなった
+//!
+//! ホワイトバランスの本質は「センサ/照明のチャンネルごとの露出違いを打ち消す」ことで、
+//! これは **光量に対する乗算**である。v1 は sRGB 符号値(u8)にゲインを直接掛けていたため、
+//! 数学的には `(k·v)` ではなく `OETF(k·EOTF(v))` ではなく `k·OETF(EOTF(v))` — つまり
+//! 符号値の線形スケール = 光量に対しては非線形な操作になっていた。
+//! v2 では同じゲインが**線形光の倍率**として掛かるため、実際のカラー写真の
+//! 色順応に一致する挙動になる。
+//!
+//! **見た目の変化**: スライダの写像(下記のモデル)は 1 も変えていないが、
+//! 同じ `temperature` でも v1 より**中間トーンの色転びが穏やかで、
+//! ハイライトとシャドウの色被りが自然**になる。強い暖色指定でハイライトが
+//! 飽和して色相が転ぶ現象も減る。数値としては v1 と一致しない(ENGINE_VERSION 2)。
+//!
+//! # ゲインモデル(v0.3 で確定した写像。v0.4 でも変更なし)
 //!
 //! スライダ `temperature = t ∈ [-100, 100]`(正 = 暖色へ)、
 //! `tint = m ∈ [-100, 100]`(正 = マゼンタへ)から生ゲインを作る:
@@ -27,21 +38,21 @@
 //! G_c  = quantize_1e6(g_c / mean)          (c ∈ {r, g, b})
 //! ```
 //!
-//! これで「ゲインの輝度加重平均 ≈ 1」となり、平均輝度はおおよそ保たれる
-//! (画素ごとのクランプがあるため厳密な保存ではない。テストでは 2% 以内を確認)。
+//! BT.709 係数は**線形光の輝度**の定義そのものなので、v2 ではこの正規化も
+//! 本来の意味(輝度保存)どおりに働く。
 //!
-//! 画素適用は `out_c = clamp(round_half_away(px_c * G_c), 0, 255)`。アルファは不変。
+//! 画素適用は `out_c = clamp(px_c * G_c, 0, 1)`。アルファは不変。
 //!
 //! # 決定論
 //! - 使う演算は四則のみで libm を踏まない。それでも `mean` による除算結果を
-//!   **画素ループに入る前に 1e-6 グリッドへ量子化**する(ops/mod.rs 規約の徹底。
-//!   将来モデルを黒体放射近似などへ差し替えても経路が変わらないようにする保険)
-//! - 量子化済みゲインから 256 エントリ LUT を組み、画素ループは配列引きに閉じる
+//!   **画素ループに入る前に 1e-6 グリッドへ量子化**する(ops/mod.rs 規約の徹底)
+//! - v1 は量子化ゲインから 256 エントリ LUT を組んでいたが、v2 の画素は連続値なので
+//!   LUT に落とさず f32 の乗算で直接適用する(丸めは出口の 1 回だけ)
 //! - `t == 0 && m == 0` は短絡して入力をそのまま返す(浮動小数の丸めで
 //!   `mean` が厳密に 1.0 にならない可能性があるため、恒等はバイト一致で保証する)
 
-use image::RgbaImage;
-
+use crate::linear::{quantize_1e6, LinearImage};
+use crate::parallel;
 use crate::{AtxError::InvalidRecipe, Result};
 
 /// スライダの許容範囲(両端含む)。
@@ -92,38 +103,31 @@ fn gains(temperature: f64, tint: f64) -> [f64; 3] {
     let mut out = [0.0f64; 3];
     for (slot, g) in out.iter_mut().zip(raw) {
         // 1e-6 グリッドへ量子化してから画素へ持ち込む。
-        *slot = (g / mean * 1e6).round() / 1e6;
+        *slot = quantize_1e6(g / mean);
     }
     out
 }
 
-/// 1 チャンネル分の 256 エントリ LUT(`round_half_away(i * gain)` をクランプ)。
-fn gain_lut(gain: f64) -> [u8; 256] {
-    let mut lut = [0u8; 256];
-    for (i, slot) in lut.iter_mut().enumerate() {
-        *slot = (i as f64 * gain).clamp(0.0, 255.0).round() as u8;
-    }
-    lut
-}
-
-/// ホワイトバランスを適用する。アルファは不変。
+/// ホワイトバランスを適用する(**線形光の乗算**)。アルファは不変。
 ///
 /// `temperature == 0.0 && tint == 0.0` は恒等として短絡する(バイト一致保証)。
 /// モデルの詳細はモジュールドキュメント参照。
-pub fn apply(img: &RgbaImage, temperature: f64, tint: f64) -> RgbaImage {
+pub fn apply(img: &LinearImage, temperature: f64, tint: f64) -> LinearImage {
     if temperature == 0.0 && tint == 0.0 {
         return img.clone();
     }
     let g = gains(temperature, tint);
-    let luts = [gain_lut(g[0]), gain_lut(g[1]), gain_lut(g[2])];
+    let gains_f32 = [g[0] as f32, g[1] as f32, g[2] as f32];
 
     let mut out = img.clone();
-    for px in out.pixels_mut() {
-        for (i, lut) in luts.iter().enumerate() {
-            px.0[i] = lut[px.0[i] as usize];
+    parallel::for_each_chunk(&mut out.data, |chunk| {
+        for px in chunk.iter_mut() {
+            for (i, gain) in gains_f32.iter().enumerate() {
+                px[i] = (px[i] * gain).clamp(0.0, 1.0);
+            }
+            // px[3](アルファ)は意図的に触れない。
         }
-        // px.0[3](アルファ)は意図的に触れない。
-    }
+    });
     out
 }
 

@@ -650,10 +650,11 @@ fn golden_curves_and_color_matrix_pipeline_sha256() {
         ]}"#,
     );
     let out = apply_recipe(FIXTURE, &r, &Limits::default()).unwrap();
-    assert_eq!(atx_core::ENGINE_VERSION, "atx-core/1");
+    assert_eq!(atx_core::ENGINE_VERSION, "atx-core/2");
     assert_eq!(
         sha256_hex(&out.bytes),
-        "a1ea7e7aaec270d0e73cbd095f97f4d068343e491179259fea7f69e5d21a3538",
+        // v2 (f32 linear) golden; v1 value was a1ea7e7aaec270d0e73cbd095f97f4d068343e491179259fea7f69e5d21a3538
+        "58fb0f6df4ac70a71764edfd71ea7a3d4c8cf7aa729855a0781e17512f590ba8",
         "color op golden"
     );
 }

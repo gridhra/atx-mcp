@@ -1553,6 +1553,7 @@ fn preview_recipe_of(recipe: &TransformRecipe) -> TransformRecipe {
     operations.push(Operation::Encode {
         format: OutputFormat::Jpeg,
         quality: Some(PREVIEW_JPEG_QUALITY),
+        bit_depth: None,
     });
     TransformRecipe { operations }
 }
@@ -1757,6 +1758,7 @@ mod tests {
                 Operation::Encode {
                     format: OutputFormat::Webp,
                     quality: Some(90),
+                    bit_depth: None,
                 },
             ],
         };
@@ -1766,7 +1768,8 @@ mod tests {
             preview.operations[2],
             Operation::Encode {
                 format: OutputFormat::Jpeg,
-                quality: Some(PREVIEW_JPEG_QUALITY)
+                quality: Some(PREVIEW_JPEG_QUALITY),
+                ..
             }
         ));
         assert!(atx_core::recipe::validate(&preview).is_ok());

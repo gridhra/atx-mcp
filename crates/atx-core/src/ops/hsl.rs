@@ -1,9 +1,22 @@
 //! 色相域別 HSL 調整(8域: red/orange/yellow/green/aqua/blue/purple/magenta)。
 //!
+//! **作業空間: sRGB 符号値**(`ops/mod.rs` の表を参照)。Lightroom の HSL パネルは
+//! 符号値上の色相環で定義されており、線形光で同じ数値を適用すると別物になる。
+//!
 //! - RGB → HSL 変換は f64 固定式(超越関数不使用の区分有理式で書けるため libm 遮断は容易)
 //! - 各域は中心色相で重み1、隣接域中心へ線形に減衰する三角フェザ
 //! - hue シフトは度数に写像(±100 → ±30°)、sat/lum は乗算的スケール
 //! - 決定論: 固定順序の四則演算のみ。域重みテーブルの係数は定数で明文化
+//!
+//! # v2 の変更点
+//!
+//! 入出力が u8 から **sRGB 符号値の f32(0..1)** になった。中間の 256 段丸めが
+//! 消えたため、HSL を重ねてもポスタリゼーションが蓄積しない。
+//! `rgb_to_hsl` → `hsl_to_rgb` の往復は f64 で計算して f32 へ戻すので、
+//! f32 の精度内で厳密(f64 の相対誤差 ~1e-16 は f32 の刻み ~1e-7 に完全に埋もれる)。
+//! これにより **u8 → 線形 → sRGB f32 → HSL 往復 → 線形 → u8 が全 u8 三つ組で
+//! バイト同一**という v1 からの品質ゲートがそのまま維持される
+//! (`tests/wb_hsl_ops.rs`)。
 //!
 //! # 色相域の中心(度)
 //!
@@ -13,8 +26,7 @@
 //! ```
 //!
 //! 間隔が不均等(30/30/60/60/60/40/40/40)なのは意図的で、Lightroom の HSL パネルの
-//! 知覚的な帯割りに合わせている(黄〜赤の暖色側は色相の変化が知覚的に速いため帯が狭く、
-//! 緑〜青の寒色側は広い)。この 8 定数は `recipe.rs` の `Operation::Hsl` の
+//! 知覚的な帯割りに合わせている。この 8 定数は `recipe.rs` の `Operation::Hsl` の
 //! フィールド宣言順と一致する。
 //!
 //! # 帯の重み(三角フェザ)
@@ -23,11 +35,9 @@
 //! `t = (h - c_i) / (c_{i+1} - c_i)` として
 //! `w_i = 1 - t`, `w_{i+1} = t`、他の帯は 0 とする。
 //! 中心では重み 1、隣接中心で 0 まで線形に落ち、**常に 2 帯の重み和が厳密に 1**
-//! になる(区分線形の分割の統一)。最後の区間は magenta(320) → red(360 ≡ 0) で環を閉じる。
+//! になる。最後の区間は magenta(320) → red(360 ≡ 0) で環を閉じる。
 //!
-//! # シフトの写像(v0.3 で確定。変更は ENGINE_VERSION 更新を伴う)
-//!
-//! 画素の色相 `h` に対して重み `w_i` を求め、有効な帯(高々 2 つ)の指定値から:
+//! # シフトの写像(v0.3 で確定。v0.4 でも写像自体は変更なし)
 //!
 //! ```text
 //! dh     = Σ w_i * hue_i * 0.3                       // ±100 → ±30 度
@@ -39,28 +49,14 @@
 //! l' = clamp(l * (1 + f_lum), 0, 1)
 //! ```
 //!
-//! クランプ幅 `-0.95..=1.0` は「下限は完全な 0 倍を避けて単調性を残す(-100 でも
-//! 元の 5% は残る)/ 上限は 2 倍まで」という単純で固定の規則。乗算的なので
-//! `saturation = 0` や `luminance = 0` は厳密な恒等になる。
-//! `luminance` に 0.5 が掛かっているのは、明度の乗算は彩度より知覚影響が大きく、
-//! ±100 でも ±50% に留めたいため。
-//!
 //! # 無彩色画素の扱い
 //!
-//! `s == 0`(= R == G == B)の画素は色相が定義できないため **一切変更しない**。
-//! 灰軸に色を乗せたい要求は将来 split-toning / color-grading の語彙で扱う(Phase C 以降)。
-//! この規則により、灰色のみの画像は任意の HSL 指定に対してバイト一致で不変。
-//!
-//! # 丸めと決定論
-//!
-//! RGB ⇄ HSL は f64、最終書き戻しは `clamp(0,255)` → half-away-from-zero 丸め。
-//! `rgb_to_hsl` → `hsl_to_rgb` の往復は **全 u8 RGB 値でバイト一致**
-//! (tests/wb_hsl_ops.rs の網羅テストが品質ゲート)。
-//! 全帯が未指定または全値 0 の場合は画像ごと短絡し、画素単位でも寄与 2 帯が
-//! ともに 0 なら元画素をそのままコピーする。
+//! `R == G == B`(f32 の厳密一致)の画素は色相が定義できないため **一切変更しない**。
+//! u8 入力では等しい符号値は等しい f32 に写るので、この規則は v1 と同じく
+//! 「灰色のみの画像は任意の HSL 指定に対してバイト一致で不変」を保証する。
 
-use image::RgbaImage;
-
+use crate::linear::LinearImage;
+use crate::parallel;
 use crate::recipe::HslShift;
 use crate::{AtxError::InvalidRecipe, Result};
 
@@ -117,21 +113,19 @@ pub fn validate(index: usize, bands: &[&Option<HslShift>; 8]) -> Result<()> {
 
 // ------------------------------------------------------------- RGB ⇄ HSL 変換
 
-/// RGB(u8) → HSL。無彩色(R == G == B)の場合は色相が定義できないため `None`。
+/// RGB(sRGB 符号値 f32、0..1)→ HSL。無彩色(R == G == B)の場合は `None`。
 ///
 /// 返り値は `(h, s, l)`。`h ∈ [0, 360)`、`s ∈ (0, 1]`、`l ∈ (0, 1)`。
-/// 標準の区分有理式(超越関数なし)。
-pub fn rgb_to_hsl(r: u8, g: u8, b: u8) -> Option<(f64, f64, f64)> {
-    let max_u = r.max(g).max(b);
-    let min_u = r.min(g).min(b);
-    if max_u == min_u {
+/// 標準の区分有理式(超越関数なし)を f64 で評価する。
+pub fn rgb_to_hsl(r: f32, g: f32, b: f32) -> Option<(f64, f64, f64)> {
+    if r == g && g == b {
         return None;
     }
-    let rf = r as f64 / 255.0;
-    let gf = g as f64 / 255.0;
-    let bf = b as f64 / 255.0;
-    let max = max_u as f64 / 255.0;
-    let min = min_u as f64 / 255.0;
+    let rf = r as f64;
+    let gf = g as f64;
+    let bf = b as f64;
+    let max = rf.max(gf).max(bf);
+    let min = rf.min(gf).min(bf);
 
     let l = (max + min) / 2.0;
     let d = max - min;
@@ -142,14 +136,14 @@ pub fn rgb_to_hsl(r: u8, g: u8, b: u8) -> Option<(f64, f64, f64)> {
     };
 
     // 6 分割セクタ座標 hp ∈ [0, 6) を先に求め、最後に 60 倍して度へ。
-    let hp = if max_u == r {
+    let hp = if max == rf {
         let v = (gf - bf) / d;
         if v < 0.0 {
             v + 6.0
         } else {
             v
         }
-    } else if max_u == g {
+    } else if max == gf {
         (bf - rf) / d + 2.0
     } else {
         (rf - gf) / d + 4.0
@@ -157,15 +151,14 @@ pub fn rgb_to_hsl(r: u8, g: u8, b: u8) -> Option<(f64, f64, f64)> {
     Some((hp * 60.0, s, l))
 }
 
-/// HSL → RGB(u8)。`rgb_to_hsl` の厳密な逆(全 u8 RGB でバイト一致往復)。
+/// HSL → RGB(sRGB 符号値 f32、0..1)。`rgb_to_hsl` の厳密な逆。
 ///
 /// `h` は任意の実数を受け付け内部で [0, 360) へ正規化する。
 /// `s`/`l` は [0, 1] を想定(範囲外は呼び出し側でクランプ済みであること)。
-/// 最終値は 0..255 にクランプして half-away-from-zero 丸め。
-pub fn hsl_to_rgb(h: f64, s: f64, l: f64) -> [u8; 3] {
-    let to_u8 = |v: f64| (v * 255.0).clamp(0.0, 255.0).round() as u8;
+pub fn hsl_to_rgb(h: f64, s: f64, l: f64) -> [f32; 3] {
+    let to_f32 = |v: f64| -> f32 { v.clamp(0.0, 1.0) as f32 };
     if s <= 0.0 {
-        let v = to_u8(l);
+        let v = to_f32(l);
         return [v, v, v];
     }
     // [0, 360) へ正規化。
@@ -195,7 +188,7 @@ pub fn hsl_to_rgb(h: f64, s: f64, l: f64) -> [u8; 3] {
         4 => (x, 0.0, c),
         _ => (c, 0.0, x),
     };
-    [to_u8(r1 + m), to_u8(g1 + m), to_u8(b1 + m)]
+    [to_f32(r1 + m), to_f32(g1 + m), to_f32(b1 + m)]
 }
 
 // -------------------------------------------------------------------- 帯の重み
@@ -224,11 +217,11 @@ fn band_weights(h: f64) -> ((usize, f64), (usize, f64)) {
 
 // ------------------------------------------------------------------------ op
 
-/// 色相域別 HSL 調整を適用する。アルファは不変。
+/// 色相域別 HSL 調整を適用する(**sRGB 符号値空間**)。アルファは不変。
 ///
 /// 写像とクランプの規則はモジュールドキュメント参照。全帯が未指定または
 /// 全値 0 の場合は入力をそのまま返す(バイト一致保証)。
-pub fn apply(img: &RgbaImage, bands: &[Option<HslShift>; 8]) -> RgbaImage {
+pub fn apply(img: &LinearImage, bands: &[Option<HslShift>; 8]) -> LinearImage {
     // 未指定の帯はゼロシフトへ畳む。以降は 8 個の HslShift として扱う。
     let shifts: [HslShift; 8] = std::array::from_fn(|i| {
         bands[i].unwrap_or(HslShift {
@@ -244,34 +237,36 @@ pub fn apply(img: &RgbaImage, bands: &[Option<HslShift>; 8]) -> RgbaImage {
     let zero: [bool; 8] = std::array::from_fn(|i| is_zero(&shifts[i]));
 
     let mut out = img.clone();
-    for px in out.pixels_mut() {
-        let Some((h, s, l)) = rgb_to_hsl(px.0[0], px.0[1], px.0[2]) else {
-            // 無彩色画素は色相を持たないので触れない。
-            continue;
-        };
-        let ((i, wi), (j, wj)) = band_weights(h);
-        if zero[i] && zero[j] {
-            // 寄与する 2 帯がともにゼロシフト → 変換往復を通さずそのまま残す。
-            continue;
+    parallel::for_each_chunk(&mut out.data, |chunk| {
+        for px in chunk.iter_mut() {
+            let Some((h, s, l)) = rgb_to_hsl(px[0], px[1], px[2]) else {
+                // 無彩色画素は色相を持たないので触れない。
+                continue;
+            };
+            let ((i, wi), (j, wj)) = band_weights(h);
+            if zero[i] && zero[j] {
+                // 寄与する 2 帯がともにゼロシフト → 変換往復を通さずそのまま残す。
+                continue;
+            }
+
+            let dh = (wi * shifts[i].hue + wj * shifts[j].hue) * HUE_DEGREES_PER_UNIT;
+            let f_sat = ((wi * shifts[i].saturation + wj * shifts[j].saturation) / 100.0)
+                .clamp(FACTOR_MIN, FACTOR_MAX);
+            let f_lum = ((wi * shifts[i].luminance + wj * shifts[j].luminance) / 100.0
+                * LUMINANCE_SCALE)
+                .clamp(FACTOR_MIN, FACTOR_MAX);
+
+            let nh = h + dh;
+            let ns = (s * (1.0 + f_sat)).clamp(0.0, 1.0);
+            let nl = (l * (1.0 + f_lum)).clamp(0.0, 1.0);
+
+            let rgb = hsl_to_rgb(nh, ns, nl);
+            px[0] = rgb[0];
+            px[1] = rgb[1];
+            px[2] = rgb[2];
+            // px[3](アルファ)は意図的に触れない。
         }
-
-        let dh = (wi * shifts[i].hue + wj * shifts[j].hue) * HUE_DEGREES_PER_UNIT;
-        let f_sat = ((wi * shifts[i].saturation + wj * shifts[j].saturation) / 100.0)
-            .clamp(FACTOR_MIN, FACTOR_MAX);
-        let f_lum = ((wi * shifts[i].luminance + wj * shifts[j].luminance) / 100.0
-            * LUMINANCE_SCALE)
-            .clamp(FACTOR_MIN, FACTOR_MAX);
-
-        let nh = h + dh;
-        let ns = (s * (1.0 + f_sat)).clamp(0.0, 1.0);
-        let nl = (l * (1.0 + f_lum)).clamp(0.0, 1.0);
-
-        let rgb = hsl_to_rgb(nh, ns, nl);
-        px.0[0] = rgb[0];
-        px.0[1] = rgb[1];
-        px.0[2] = rgb[2];
-        // px.0[3](アルファ)は意図的に触れない。
-    }
+    });
     out
 }
 
@@ -301,24 +296,25 @@ mod tests {
 
     #[test]
     fn primaries_map_to_expected_hues() {
-        assert_eq!(rgb_to_hsl(255, 0, 0).unwrap().0, 0.0);
-        assert_eq!(rgb_to_hsl(0, 255, 0).unwrap().0, 120.0);
-        assert_eq!(rgb_to_hsl(0, 0, 255).unwrap().0, 240.0);
-        assert_eq!(rgb_to_hsl(255, 255, 0).unwrap().0, 60.0);
-        assert!(rgb_to_hsl(77, 77, 77).is_none(), "grey has no hue");
+        assert_eq!(rgb_to_hsl(1.0, 0.0, 0.0).unwrap().0, 0.0);
+        assert_eq!(rgb_to_hsl(0.0, 1.0, 0.0).unwrap().0, 120.0);
+        assert_eq!(rgb_to_hsl(0.0, 0.0, 1.0).unwrap().0, 240.0);
+        assert_eq!(rgb_to_hsl(1.0, 1.0, 0.0).unwrap().0, 60.0);
+        assert!(rgb_to_hsl(0.3, 0.3, 0.3).is_none(), "grey has no hue");
     }
 
-    /// 網羅の縮小版(step 17)。フル網羅は tests/wb_hsl_ops.rs 側の品質ゲート。
+    /// 網羅の縮小版(step 17)。u8 格子上の f32 値で往復がビット同一であること。
+    /// フル網羅は tests/wb_hsl_ops.rs 側の品質ゲート。
     #[test]
     fn roundtrip_is_exact_on_coarse_grid() {
         for r in (0..=255u32).step_by(17) {
             for g in (0..=255u32).step_by(17) {
                 for b in (0..=255u32).step_by(17) {
-                    let (r, g, b) = (r as u8, g as u8, b as u8);
-                    let Some((h, s, l)) = rgb_to_hsl(r, g, b) else {
+                    let px = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0];
+                    let Some((h, s, l)) = rgb_to_hsl(px[0], px[1], px[2]) else {
                         continue;
                     };
-                    assert_eq!(hsl_to_rgb(h, s, l), [r, g, b], "roundtrip {r},{g},{b}");
+                    assert_eq!(hsl_to_rgb(h, s, l), px, "roundtrip {r},{g},{b}");
                 }
             }
         }

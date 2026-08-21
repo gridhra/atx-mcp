@@ -40,6 +40,41 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+// ---------------------------------------------------------------------------
+// v2(f32 リニアライト)の期待値ヘルパ
+//
+// convolve は **線形光**で畳み込む op になったため(ops/mod.rs の作業空間表)、
+// 期待値も「sRGB を線形化 → 線形で重み付き和 → sRGB へ戻す」で立てる。
+// ---------------------------------------------------------------------------
+
+/// sRGB EOTF(符号値 0..1 → 線形光)。
+fn eotf(c: f64) -> f64 {
+    if c <= 0.040_45 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// sRGB OETF(線形光 → 符号値 0..1)。
+fn oetf(l: f64) -> f64 {
+    if l <= 0.003_130_8 {
+        l * 12.92
+    } else {
+        1.055 * l.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// u8 符号値 → 線形光。
+fn lin(v: u8) -> f64 {
+    eotf(v as f64 / 255.0)
+}
+
+/// 線形光 → u8 符号値(half-away-from-zero)。
+fn srgb_u8(l: f64) -> u8 {
+    (oetf(l.clamp(0.0, 1.0)) * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
 /// 一様な色の画像。
 fn uniform(w: u32, h: u32, color: [u8; 4]) -> RgbaImage {
     RgbaImage::from_pixel(w, h, Rgba(color))
@@ -140,9 +175,15 @@ fn sharpen_kernel_increases_step_edge_contrast() {
     );
 }
 
-/// エンボスカーネル + offset=128 は、一様(フラット)領域では正確に 128 になる。
-/// 一様領域ではカーネル係数の和が 0(ゼロサム)のため、
-/// acc = color * sum(kernel) = 0、out = 0/divisor + 128 = 128 ちょうど。
+/// エンボスカーネル + offset=128 は、一様(フラット)領域では **線形光の 128/255** になる。
+///
+/// 一様領域ではカーネル係数の和が 0(ゼロサム)なので `acc = 0`、
+/// 出力は `0/divisor + offset` = offset そのものになる。
+/// **v2 の変更点**: 画素は線形光の 0..1 で、`offset` は u8 スケールのまま
+/// 受け取って `offset/255` を線形光に足す(ops/convolve.rs のドキュメント参照)。
+/// したがって出力は「線形光 128/255 = 0.50196」であり、
+/// sRGB 符号値に戻すと 188 になる(v1 は符号値 128 だった)。
+/// 「符号値としての中間グレー」に寄せたい場合は offset を 55 前後にする。
 #[test]
 fn emboss_kernel_with_offset_produces_exact_flat_value() {
     let color = [77, 150, 33, 255];
@@ -158,11 +199,13 @@ fn emboss_kernel_with_offset_produces_exact_flat_value() {
         ),
     );
     let decoded = decode_rgba(&out.bytes);
+    let expected = srgb_u8(128.0 / 255.0);
+    assert_eq!(expected, 188, "linear-light 128/255 encodes to sRGB 188");
     for p in decoded.pixels() {
         assert_eq!(
             &p.0[0..3],
-            &[128, 128, 128],
-            "flat region must map to exactly 128"
+            &[expected, expected, expected],
+            "flat region must map to exactly offset (in linear light)"
         );
         assert_eq!(p.0[3], 255, "alpha untouched");
     }
@@ -226,10 +269,15 @@ fn corner_edge_uses_clamp_replicate_border() {
     // (0,0) の 3x3 窓(クランプ後)は corner が4回(自身+複製2方向+対角複製)、
     // bg が5回サンプルされる: 窓は {(-1,-1)...(1,1)} クランプ後 {(0,0)x4,(0,1)x2,(1,0)x2,(1,1)}
     // = corner:4, bg:5。
+    //
+    // **v2 の変更点**: 平均は線形光で取る。暗い bg(=0)と明るい corner の平均は
+    // 符号値平均より明るくなる(符号値平均 [40,80,13] → 線形平均 [60,124,17])。
+    // これは「暗部に寄る」ガンマ・ブラー誤差が解消された結果であり、
+    // 物理的に正しいのは線形平均のほう。
     let expected = [
-        ((corner[0] as f64 * 4.0 + bg[0] as f64 * 5.0) / 9.0).round() as u8,
-        ((corner[1] as f64 * 4.0 + bg[1] as f64 * 5.0) / 9.0).round() as u8,
-        ((corner[2] as f64 * 4.0 + bg[2] as f64 * 5.0) / 9.0).round() as u8,
+        srgb_u8((lin(corner[0]) * 4.0 + lin(bg[0]) * 5.0) / 9.0),
+        srgb_u8((lin(corner[1]) * 4.0 + lin(bg[1]) * 5.0) / 9.0),
+        srgb_u8((lin(corner[2]) * 4.0 + lin(bg[2]) * 5.0) / 9.0),
     ];
     let actual = decoded.get_pixel(0, 0).0;
     assert_eq!(
@@ -370,7 +418,8 @@ fn full_pipeline_golden_sharpen_jpeg() {
     );
     let hash = sha256_hex(&out.bytes);
     assert_eq!(
-        hash, "7e22f7205979c3bb8ea15585faf75bda48139e78b67c65b798bfea06ee5ccd53",
+        hash, // v2 (f32 linear) golden; v1 value was 7e22f7205979c3bb8ea15585faf75bda48139e78b67c65b798bfea06ee5ccd53
+        "9be5fdfa2cab50fde4d4acb0810c7643d918c38b1d62e55f65ab4ce0993d2d3f",
         "golden hash mismatch: full pipeline output changed (recompute and update if intentional)"
     );
 }

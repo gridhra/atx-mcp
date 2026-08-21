@@ -397,10 +397,11 @@ fn golden_perspective_pipeline_sha256() {
         ]}"##,
     );
     let out = apply_recipe(FIXTURE, &r, &Limits::default()).unwrap();
-    assert_eq!(atx_core::ENGINE_VERSION, "atx-core/1");
+    assert_eq!(atx_core::ENGINE_VERSION, "atx-core/2");
     assert_eq!((out.width, out.height), (1477, 1108));
     assert_eq!(
         sha256_hex(&out.bytes),
-        "01b9590af0888b494f86cefd9a0b0f5db7061b48c183c9564cd3c43998c34ea9"
+        // v2 (f32 linear) golden; v1 value was 01b9590af0888b494f86cefd9a0b0f5db7061b48c183c9564cd3c43998c34ea9
+        "3251829bfcade24e722443f197b199710d9c28c37a7054d24e4227c5f86f215c"
     );
 }

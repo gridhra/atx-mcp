@@ -1,14 +1,30 @@
 //! blur / median / unsharp_mask(カーネル系)。
 //!
+//! **作業空間: 線形光**(`ops/mod.rs` の表を参照)。画素の加重平均は光量に対して
+//! 行ってはじめて物理的に正しい(v1 は sRGB 符号値の u8 上で平均していたため、
+//! 明暗の境界がぼかすたびに暗く沈んでいた)。
+//!
 //! 実装規約:
-//! - ガウスカーネルは f64 で生成後、重みを 1e-6 グリッドに量子化し正規化してから適用
-//!   (exp() の libm 差を遮断。mod.rs の決定論規約参照)
-//! - median は整数演算のみ(決定論は自明)
-//! - unsharp_mask は blur と同じ量子化カーネルを用い、ブレンドは f64 → 明示丸め
+//! - ガウスカーネルは f64 で生成後、重みを 1e-6 グリッドに量子化し、
+//!   **量子化後の合計**で正規化してから f32 化する(exp() の libm 差を遮断)
+//! - 画素の累算は f32・走査順そのままの左結合(再結合禁止、`mul_add` 不使用)
+//! - `blur` / `unsharp_mask` は **アルファをプリマルチプライしてから**畳み込み、
+//!   後で解く(半透明の縁で背景色が滲まない)。全画素 α=1.0 の画像では
+//!   プリマルチプライは厳密な恒等なので専用の高速パスは不要
+//! - `median` は加重平均を取らない順序統計フィルタなのでプリマルチプライしない。
+//!   f32 値の中央値は `f32::total_cmp`(全順序)でソートして取る
 
-use image::RgbaImage;
-
+use crate::linear::{quantize_1e6, LinearImage};
+use crate::parallel;
 use crate::{AtxError, Result};
+
+/// `unsharp_mask` の threshold を 0..1 スケールへ写す係数。
+///
+/// レシピ上の `threshold` は v1 から変わらず「u8 符号値の差」を意図した 0..=255 だが、
+/// v2 の比較は**線形光の 0..1** 上で行われる。`threshold / 255` を線形光の差の
+/// 閾値として解釈する(暗部では v1 より保護が効きやすく、明部では効きにくい)。
+/// 完全な等価性は空間が変わった以上あり得ないため、単純で説明可能な規則を採る。
+const THRESHOLD_SCALE: f32 = 1.0 / 255.0;
 
 pub fn validate_blur(index: usize, sigma: f64) -> Result<()> {
     if !sigma.is_finite() || !(0.1..=100.0).contains(&sigma) {
@@ -49,156 +65,90 @@ pub fn validate_unsharp(index: usize, amount: f64, radius: f64, threshold: u8) -
 /// 1. f64 で `exp(-(i^2) / (2*sigma^2))` を計算する
 /// 2. 各重みを 1e-6 グリッドへ量子化する((w*1e6).round()/1e6)
 /// 3. 量子化後の重みの合計で正規化する(除算の順序を固定: 量子化 → 合計 → 正規化)
+/// 4. 最後に f32 へ落とす(画素ループは f32 で回る)
 ///
 /// 半径(半値幅)は `ceil(3*sigma)` を 255 に上限キャップする。
-fn gaussian_kernel(sigma: f64) -> (i32, Vec<f64>) {
+fn gaussian_kernel(sigma: f64) -> (i32, Vec<f32>) {
     let radius = ((3.0 * sigma).ceil() as i64).clamp(1, 255) as i32;
     let two_sigma_sq = 2.0 * sigma * sigma;
 
-    let mut weights: Vec<f64> = (-radius..=radius)
-        .map(|i| {
-            let raw = (-((i * i) as f64) / two_sigma_sq).exp();
-            quantize_weight(raw)
-        })
+    let quantized: Vec<f64> = (-radius..=radius)
+        .map(|i| quantize_1e6((-((i * i) as f64) / two_sigma_sq).exp()))
         .collect();
 
     // 量子化後の重みの合計で正規化する(この順序が決定論の要)。
-    let sum: f64 = weights.iter().fold(0.0f64, |acc, w| acc + w);
-    for w in weights.iter_mut() {
-        *w /= sum;
-    }
+    let sum: f64 = quantized.iter().fold(0.0f64, |acc, w| acc + w);
+    let weights: Vec<f32> = quantized.iter().map(|w| (w / sum) as f32).collect();
     (radius, weights)
 }
 
-/// f64 の重みを 1e-6 グリッドへ量子化する。
-fn quantize_weight(w: f64) -> f64 {
-    (w * 1e6).round() / 1e6
-}
-
-/// half-away-from-zero で f64 を u8(0..=255)へ丸める。
-fn round_to_u8(v: f64) -> u8 {
-    let r = if v >= 0.0 {
-        (v + 0.5).floor()
-    } else {
-        (v - 0.5).ceil()
-    };
-    r.clamp(0.0, 255.0) as u8
-}
-
-/// x 座標を [0, len) へクランプ(端の複製、= replicate border)する。
-fn clamp_coord(v: i64, len: u32) -> u32 {
-    v.clamp(0, len as i64 - 1) as u32
-}
-
-/// 行の範囲を CPU コア数に応じたチャンクへ分割し、各チャンクを別スレッドで実行する。
-///
-/// **決定論への影響なし**: 行(または列。パス2は行方向にチャンク分割する点は同じ)は
-/// 互いに独立(1画素の f64 累算順序は `weights` の添字昇順のまま、他画素の計算順序と
-/// 無関係)なので、スレッド分割・実行順は出力バイト列に一切影響しない。
-/// 性能のためだけの並列化(mod.rs の決定論規約における「reassociation」とは
-/// 1画素内の累算順序の話であり、画素間の実行順序はそもそも規約の対象外)。
-fn parallel_row_chunks(total_rows: u32) -> Vec<std::ops::Range<u32>> {
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(total_rows.max(1) as usize)
-        .max(1);
-    let chunk = total_rows.div_ceil(n_threads as u32).max(1);
-    let mut ranges = Vec::new();
-    let mut start = 0u32;
-    while start < total_rows {
-        let end = (start + chunk).min(total_rows);
-        ranges.push(start..end);
-        start = end;
-    }
-    ranges
-}
-
 /// ガウスぼかし。分離可能な1次元カーネルを横→縦の順で適用する(2パス)。
-/// 端はクランプ(複製)。アルファチャンネルも含め全4チャンネルにぼかしをかける。
+/// 端はクランプ(複製)。**アルファをプリマルチプライした 4 チャンネル**に掛ける。
 ///
-/// 行(パス1)・列(パス2、実装上は転置せず行方向チャンクのまま)単位で
-/// スレッド分割して計算する。画素ごとの f64 累算順序(決定論の要)は
+/// 行単位でスレッド分割して計算する。画素ごとの f32 累算順序(決定論の要)は
 /// 分割の有無に関わらず `weights` の添字昇順で固定される。
-pub fn gaussian_blur(img: &RgbaImage, sigma: f64) -> RgbaImage {
-    let (radius, weights) = gaussian_kernel(sigma);
+pub fn gaussian_blur(img: &LinearImage, sigma: f64) -> LinearImage {
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return img.clone();
     }
+    let (radius, weights) = gaussian_kernel(sigma);
+    let premul = img.premultiplied();
     let (wu, hu) = (w as usize, h as usize);
-    let src: &[u8] = img.as_raw();
 
     // --- パス1: 水平方向 ---
-    let mut horiz = vec![0f64; wu * hu * 4];
-    std::thread::scope(|scope| {
-        let mut remaining = horiz.as_mut_slice();
-        for range in parallel_row_chunks(h) {
-            let rows_in_chunk = (range.end - range.start) as usize;
-            let (chunk, rest) = remaining.split_at_mut(rows_in_chunk * wu * 4);
-            remaining = rest;
-            let weights = &weights;
-            scope.spawn(move || {
-                for (i, row) in chunk.chunks_mut(wu * 4).enumerate() {
-                    let y = range.start + i as u32;
-                    for x in 0..w {
-                        let mut acc = [0f64; 4];
-                        for (k, &weight) in weights.iter().enumerate() {
-                            let dx = k as i32 - radius;
-                            let sx = clamp_coord(x as i64 + dx as i64, w);
-                            let src_idx = ((y as usize) * wu + sx as usize) * 4;
-                            for c in 0..4 {
-                                acc[c] += (src[src_idx + c] as f64) * weight;
-                            }
-                        }
-                        let idx = (x as usize) * 4;
-                        row[idx..idx + 4].copy_from_slice(&acc);
-                    }
+    let mut horiz = vec![[0f32; 4]; wu * hu];
+    parallel::fill_rows(&mut horiz, wu, hu, |y, row| {
+        for (x, slot) in row.iter_mut().enumerate() {
+            let mut acc = [0f32; 4];
+            for (k, &weight) in weights.iter().enumerate() {
+                let dx = k as i64 - radius as i64;
+                let sx = (x as i64 + dx).clamp(0, w as i64 - 1) as usize;
+                let px = premul.data[y * wu + sx];
+                for c in 0..4 {
+                    let term = px[c] * weight;
+                    acc[c] += term;
                 }
-            });
+            }
+            *slot = acc;
         }
     });
 
     // --- パス2: 垂直方向 ---
-    let mut out_raw = vec![0u8; wu * hu * 4];
-    let horiz_ref: &[f64] = &horiz;
-    std::thread::scope(|scope| {
-        let mut remaining = out_raw.as_mut_slice();
-        for range in parallel_row_chunks(h) {
-            let rows_in_chunk = (range.end - range.start) as usize;
-            let (chunk, rest) = remaining.split_at_mut(rows_in_chunk * wu * 4);
-            remaining = rest;
-            let weights = &weights;
-            scope.spawn(move || {
-                for (i, row) in chunk.chunks_mut(wu * 4).enumerate() {
-                    let y = range.start + i as u32;
-                    for x in 0..w {
-                        let mut acc = [0f64; 4];
-                        for (k, &weight) in weights.iter().enumerate() {
-                            let dy = k as i32 - radius;
-                            let sy = clamp_coord(y as i64 + dy as i64, h);
-                            let idx = (sy as usize * wu + x as usize) * 4;
-                            for c in 0..4 {
-                                acc[c] += horiz_ref[idx + c] * weight;
-                            }
-                        }
-                        let out_idx = (x as usize) * 4;
-                        row[out_idx] = round_to_u8(acc[0]);
-                        row[out_idx + 1] = round_to_u8(acc[1]);
-                        row[out_idx + 2] = round_to_u8(acc[2]);
-                        row[out_idx + 3] = round_to_u8(acc[3]);
-                    }
+    let mut out_data = vec![[0f32; 4]; wu * hu];
+    parallel::fill_rows(&mut out_data, wu, hu, |y, row| {
+        for (x, slot) in row.iter_mut().enumerate() {
+            let mut acc = [0f32; 4];
+            for (k, &weight) in weights.iter().enumerate() {
+                let dy = k as i64 - radius as i64;
+                let sy = (y as i64 + dy).clamp(0, h as i64 - 1) as usize;
+                let px = horiz[sy * wu + x];
+                for c in 0..4 {
+                    let term = px[c] * weight;
+                    acc[c] += term;
                 }
-            });
+            }
+            *slot = acc;
         }
     });
 
-    RgbaImage::from_raw(w, h, out_raw).expect("buffer sized w*h*4 matches RgbaImage layout")
+    let mut out = LinearImage {
+        width: w,
+        height: h,
+        data: out_data,
+    };
+    out.unpremultiply();
+    out
 }
 
-/// メディアンフィルタ。(2r+1)^2 の正方形ウィンドウ、チャンネル毎にカウントソートで
-/// 中央値を取る(u8 のヒストグラム、256 バケツの整数演算のみ)。端はクランプ。
-pub fn median(img: &RgbaImage, radius: u32) -> RgbaImage {
+/// メディアンフィルタ。(2r+1)^2 の正方形ウィンドウ、チャンネル毎に中央値を取る。
+/// 端はクランプ。
+///
+/// v1 は u8 の 256 バケツヒストグラムで求めていたが、v2 の画素は f32 なので
+/// **`f32::total_cmp` による全順序ソート**へ置き換えた(NaN が来ても順序が定まる。
+/// 実際には NaN は生成されないが、比較の全順序性は決定論の前提)。
+/// 順序統計量なので加重平均は発生せず、プリマルチプライは行わない。
+pub fn median(img: &LinearImage, radius: u32) -> LinearImage {
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return img.clone();
@@ -206,75 +156,94 @@ pub fn median(img: &RgbaImage, radius: u32) -> RgbaImage {
     let r = radius as i64;
     let window_len = (2 * radius + 1) as usize * (2 * radius + 1) as usize;
     let median_rank = window_len / 2; // 0-indexed、奇数個なので中央要素
+    let (wu, hu) = (w as usize, h as usize);
 
-    let mut out = RgbaImage::new(w, h);
-    let mut hist = [[0u32; 256]; 4];
-
-    for y in 0..h {
-        for x in 0..w {
-            for channel_hist in hist.iter_mut() {
-                *channel_hist = [0u32; 256];
-            }
+    let mut out_data = vec![[0f32; 4]; wu * hu];
+    parallel::fill_rows(&mut out_data, wu, hu, |y, row| {
+        let mut window: Vec<[f32; 4]> = Vec::with_capacity(window_len);
+        let mut channel: Vec<f32> = Vec::with_capacity(window_len);
+        for (x, slot) in row.iter_mut().enumerate() {
+            window.clear();
             for dy in -r..=r {
-                let sy = clamp_coord(y as i64 + dy, h);
                 for dx in -r..=r {
-                    let sx = clamp_coord(x as i64 + dx, w);
-                    let px = img.get_pixel(sx, sy).0;
-                    for c in 0..4 {
-                        hist[c][px[c] as usize] += 1;
-                    }
+                    window.push(img.get_clamped(x as i64 + dx, y as i64 + dy));
                 }
             }
-            let mut px = [0u8; 4];
-            for c in 0..4 {
-                let mut remaining = median_rank as i64;
-                let mut value = 0u8;
-                for (bucket, &count) in hist[c].iter().enumerate() {
-                    remaining -= count as i64;
-                    if remaining < 0 {
-                        value = bucket as u8;
-                        break;
-                    }
-                }
-                px[c] = value;
+            let mut px = [0f32; 4];
+            for (c, out_c) in px.iter_mut().enumerate() {
+                channel.clear();
+                channel.extend(window.iter().map(|p| p[c]));
+                channel.sort_by(|a, b| a.total_cmp(b));
+                *out_c = channel[median_rank];
             }
-            out.put_pixel(x, y, image::Rgba(px));
+            *slot = px;
         }
-    }
+    });
 
-    out
+    LinearImage {
+        width: w,
+        height: h,
+        data: out_data,
+    }
 }
 
 /// アンシャープマスク。`blurred = gaussian_blur(img, radius)` を基準に、
-/// チャンネル毎の絶対差が `threshold` 以下ならそのまま(保護)、超えていれば
-/// `orig + amount * (orig - blurred)` を f64 で計算し、クランプ・half-away-from-zero
-/// 丸めで u8 化する。
+/// チャンネル毎の絶対差が `threshold/255`(線形光スケール)以下ならそのまま(保護)、
+/// 超えていれば `orig + amount * (orig - blurred)` を f32 で計算し 0..1 へクランプする。
 ///
 /// `threshold` はチャンネル毎の絶対差で判定する(輝度ベースではない)。
 /// より単純で決定論を保ちやすいための意図的な簡略化。
-pub fn unsharp_mask(img: &RgbaImage, amount: f64, radius: f64, threshold: u8) -> RgbaImage {
+pub fn unsharp_mask(img: &LinearImage, amount: f64, radius: f64, threshold: u8) -> LinearImage {
     let blurred = gaussian_blur(img, radius);
-    let (w, h) = img.dimensions();
-    let mut out = RgbaImage::new(w, h);
-    let threshold = threshold as i32;
+    let amount = amount as f32;
+    let threshold = threshold as f32 * THRESHOLD_SCALE;
+    let mut out = img.clone();
 
-    for y in 0..h {
-        for x in 0..w {
-            let orig = img.get_pixel(x, y).0;
-            let blur = blurred.get_pixel(x, y).0;
-            let mut px = [0u8; 4];
-            for c in 0..4 {
-                let diff = orig[c] as i32 - blur[c] as i32;
-                px[c] = if diff.abs() <= threshold {
-                    orig[c]
-                } else {
-                    let value = orig[c] as f64 + amount * (diff as f64);
-                    round_to_u8(value)
-                };
+    for (px, blur) in out.data.iter_mut().zip(blurred.data.iter()) {
+        // v1 と同じく 4 チャンネルすべてに掛ける(アルファのエッジも同時に立てる)。
+        for c in 0..4 {
+            let diff = px[c] - blur[c];
+            if diff.abs() > threshold {
+                let boost = amount * diff;
+                px[c] = (px[c] + boost).clamp(0.0, 1.0);
             }
-            out.put_pixel(x, y, image::Rgba(px));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gaussian_weights_sum_to_one() {
+        for sigma in [0.5f64, 1.0, 3.7, 12.0] {
+            let (_, weights) = gaussian_kernel(sigma);
+            let sum: f32 = weights.iter().fold(0.0f32, |a, w| a + w);
+            assert!((sum - 1.0).abs() < 1e-5, "sigma {sigma}: sum {sum}");
         }
     }
 
-    out
+    #[test]
+    fn blur_of_uniform_image_is_uniform() {
+        let img = LinearImage::from_pixel(16, 16, [0.2, 0.4, 0.6, 1.0]);
+        let out = gaussian_blur(&img, 2.0);
+        for px in &out.data {
+            for (a, b) in px.iter().zip([0.2f32, 0.4, 0.6, 1.0]) {
+                assert!((a - b).abs() < 1e-5, "{px:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn median_picks_the_middle_value() {
+        // 3x3 に 0,1,...,8 を敷き詰め、radius=1 の中央画素は中央値 4/8 になる。
+        let mut img = LinearImage::new(3, 3);
+        for i in 0..9u32 {
+            img.set(i % 3, i / 3, [i as f32 / 8.0, 0.0, 0.0, 1.0]);
+        }
+        let out = median(&img, 1);
+        assert!((out.get(1, 1)[0] - 4.0 / 8.0).abs() < 1e-6);
+    }
 }

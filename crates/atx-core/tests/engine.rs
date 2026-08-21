@@ -1156,7 +1156,7 @@ fn golden_full_pipeline_sha256() {
         ]}"#,
     );
     let out = apply_recipe(FIXTURE, &r, &Limits::default()).unwrap();
-    assert_eq!(atx_core::ENGINE_VERSION, "atx-core/1");
+    assert_eq!(atx_core::ENGINE_VERSION, "atx-core/2");
     assert_eq!((out.width, out.height), (800, 450));
     // 出力ハッシュは合成フィクスチャ `tests/fixtures/synthetic_scene.jpg`
     // (`cargo run -p atx-core --example gen_fixture` で再生成可能)に対してピン留めしている。
@@ -1170,7 +1170,8 @@ fn golden_full_pipeline_sha256() {
     // ENGINE_VERSION は DESIGN §9-7 の方針どおり据え置く。
     assert_eq!(
         sha256_hex(&out.bytes),
-        "bc05827c9622122dc94f64ff9ae735aa682c4320541fcffd61465d30dfc67e2a"
+        // v2 (f32 linear) golden; v1 value was bc05827c9622122dc94f64ff9ae735aa682c4320541fcffd61465d30dfc67e2a
+        "b9371140e7251bd3ea2b92e46e7a3c02aa4d32e6fc07224ff7eb33f6512d15f8"
     );
 
     // レシピハッシュも同時にピン留めする(冪等キーの回帰検証)。

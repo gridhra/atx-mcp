@@ -89,7 +89,11 @@ fn arb_pipeline_recipe() -> impl Strategy<Value = TransformRecipe> {
                         sharpness,
                     });
                 }
-                ops.push(Operation::Encode { format, quality });
+                ops.push(Operation::Encode {
+                    format,
+                    quality,
+                    bit_depth: None,
+                });
                 TransformRecipe { operations: ops }
             },
         )
@@ -161,7 +165,7 @@ proptest! {
         let (iw, ih) = img.dimensions();
         let bytes = encode_png(&img);
         let limits = Limits::default();
-        let encode = Operation::Encode { format: OutputFormat::Png, quality: None };
+        let encode = Operation::Encode { format: OutputFormat::Png, quality: None, bit_depth: None };
 
         // 前段だけを適用したときの寸法(= crop 実行時点の「現在の寸法」)。
         let mut base_ops = chain.clone();
@@ -229,7 +233,7 @@ proptest! {
                     fit: Fit::Contain,
                     without_enlargement,
                 },
-                Operation::Encode { format: OutputFormat::Png, quality: None },
+                Operation::Encode { format: OutputFormat::Png, quality: None, bit_depth: None },
             ],
         };
         let out = apply_recipe(&bytes, &recipe, &Limits::default()).unwrap();
@@ -251,7 +255,7 @@ proptest! {
                     pad_color: None,
                     coordinate_space: CoordinateSpace::Current,
                 },
-                Operation::Encode { format: OutputFormat::Png, quality: None },
+                Operation::Encode { format: OutputFormat::Png, quality: None, bit_depth: None },
             ],
         };
         let out = apply_recipe(&bytes, &recipe, &Limits::default()).unwrap();
@@ -275,7 +279,7 @@ proptest! {
         let recipe = TransformRecipe {
             operations: vec![
                 Operation::Rotate { angle_degrees: angle, crop: RotateCrop::LargestInscribedRect },
-                Operation::Encode { format: OutputFormat::Png, quality: None },
+                Operation::Encode { format: OutputFormat::Png, quality: None, bit_depth: None },
             ],
         };
         let out = apply_recipe(&bytes, &recipe, &Limits::default()).unwrap();
@@ -305,13 +309,13 @@ proptest! {
             coordinate_space: CoordinateSpace::Current,
         };
         let once = TransformRecipe {
-            operations: vec![crop_op(), Operation::Encode { format: OutputFormat::Png, quality: None }],
+            operations: vec![crop_op(), Operation::Encode { format: OutputFormat::Png, quality: None, bit_depth: None }],
         };
         let twice = TransformRecipe {
             operations: vec![
                 crop_op(),
                 crop_op(),
-                Operation::Encode { format: OutputFormat::Png, quality: None },
+                Operation::Encode { format: OutputFormat::Png, quality: None, bit_depth: None },
             ],
         };
         let a = apply_recipe(&bytes, &once, &Limits::default()).unwrap();

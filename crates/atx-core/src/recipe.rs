@@ -197,6 +197,18 @@ pub enum Operation {
         /// 1..=100。lossless フォーマット(png)では無視。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quality: Option<u8>,
+        /// 出力のチャンネルビット深度。`8`(既定)または `16`。
+        ///
+        /// `16` は **png 出力でのみ**有効(他フォーマットは validate エラー)。
+        /// 内部パイプラインは v0.4 以降 f32 リニアライトなので、16bit 出力では
+        /// 8bit へ丸めずに階調をそのまま書き出せる(グラデーションのバンディング回避)。
+        ///
+        /// serde は `#[serde(default, skip_serializing_if = "Option::is_none")]`。
+        /// 既定(未指定)のときは正規化 JSON にフィールドが現れないので、
+        /// `bit_depth` を書かない既存レシピの canonical JSON はバイト単位で従来と一致し、
+        /// **`recipe_hash` は不変**(v0.3 の `coordinate_space` と同じ手口)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bit_depth: Option<u8>,
     },
     /// メタデータ剥離。
     StripMetadata {
@@ -589,7 +601,11 @@ pub fn validate(recipe: &TransformRecipe) -> crate::Result<()> {
                     )));
                 }
             }
-            Operation::Encode { quality, .. } => {
+            Operation::Encode {
+                format,
+                quality,
+                bit_depth,
+            } => {
                 if index != last_index {
                     return Err(InvalidRecipe(format!(
                         "operations[{index}] (encode): encode must be the last operation"
@@ -599,6 +615,19 @@ pub fn validate(recipe: &TransformRecipe) -> crate::Result<()> {
                     if !(1..=100).contains(q) {
                         return Err(InvalidRecipe(format!(
                             "operations[{index}] (encode): quality must be within 1..=100, got {q}"
+                        )));
+                    }
+                }
+                if let Some(depth) = bit_depth {
+                    if !matches!(depth, 8 | 16) {
+                        return Err(InvalidRecipe(format!(
+                            "operations[{index}] (encode): bit_depth must be 8 or 16, got {depth}"
+                        )));
+                    }
+                    if *depth == 16 && *format != OutputFormat::Png {
+                        return Err(InvalidRecipe(format!(
+                            "operations[{index}] (encode): bit_depth 16 is only supported for \
+                             png output, got {format:?}"
                         )));
                     }
                 }

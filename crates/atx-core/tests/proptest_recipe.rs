@@ -153,8 +153,13 @@ fn arb_op_no_encode() -> impl Strategy<Value = Operation> {
 }
 
 fn arb_encode_op() -> impl Strategy<Value = Operation> {
-    (arb_output_format(), prop::option::of(1u8..=100))
-        .prop_map(|(format, quality)| Operation::Encode { format, quality })
+    (arb_output_format(), prop::option::of(1u8..=100)).prop_map(|(format, quality)| {
+        Operation::Encode {
+            format,
+            quality,
+            bit_depth: None,
+        }
+    })
 }
 
 /// 構造的に妥当な(validate を通る)レシピ。encode は末尾に高々1つ。
@@ -255,8 +260,13 @@ fn arb_any_op() -> impl Strategy<Value = Operation> {
                 sharpness,
             }
         ),
-        (arb_output_format(), prop::option::of(any::<u8>()))
-            .prop_map(|(format, quality)| Operation::Encode { format, quality }),
+        (arb_output_format(), prop::option::of(any::<u8>())).prop_map(|(format, quality)| {
+            Operation::Encode {
+                format,
+                quality,
+                bit_depth: None,
+            }
+        }),
         arb_strip_scope().prop_map(|scope| Operation::StripMetadata { scope }),
     ]
 }

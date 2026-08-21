@@ -4,10 +4,11 @@
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
-use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, RgbaImage};
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
 use serde::Serialize;
 
 use crate::codec;
+use crate::linear::{pad_to_linear, pad_to_srgb, LinearImage, Space};
 use crate::pixel_ops;
 use crate::recipe::{
     parse_aspect_ratio, parse_hex_color, CoordinateSpace, Operation, OutputFormat, StripScope,
@@ -18,7 +19,11 @@ use crate::{AtxError, Limits, Result};
 
 /// エンジンの挙動バージョン。出力バイト列に影響する変更を入れたら上げる。
 /// ゴールデンテストはこのバージョンの挙動をピン留めしている。
-pub const ENGINE_VERSION: &str = "atx-core/1";
+///
+/// `atx-core/2`(v0.4): 内部表現を RGBA8 / sRGB から **f32 リニアライト**へ移行した
+/// 唯一の破壊的リリース。レシピの正規化 JSON とハッシュは 1 ビットも変わっていないが、
+/// 出力バイト列は全面的に変わる(DESIGN.md §9.5)。
+pub const ENGINE_VERSION: &str = "atx-core/2";
 
 /// 既定のパディング色(白・不透明)。
 const DEFAULT_PAD: [u8; 4] = [255, 255, 255, 255];
@@ -188,7 +193,31 @@ pub fn apply_recipe_with_assets(
         .filter(|p| !p.is_empty());
     let decoded =
         DynamicImage::from_decoder(decoder).map_err(|e| AtxError::Decode(e.to_string()))?;
-    let mut img: RgbaImage = decoded.to_rgba8();
+    // 16bit 入力(PNG16 等)は 65536 エントリの EOTF テーブルで線形化する。
+    // 8bit へ落としてから線形化すると、そもそも 16bit で受け取った意味が無くなる。
+    let is_16bit = matches!(
+        decoded.color(),
+        image::ColorType::L16
+            | image::ColorType::La16
+            | image::ColorType::Rgb16
+            | image::ColorType::Rgba16
+    );
+    // 作業空間の遅延決定: **最初に現れる空間依存 op が要求する空間**へ直接デコードする。
+    // こうすると「トーン系 op だけのレシピ」では伝達関数を一度も通さずに済み、
+    // 符号値が u8 のビット精度のまま最後まで運ばれる(空間依存 op が無い
+    // = クロップ/エンコードだけのレシピも同様に無損失)。
+    let mut space = recipe
+        .operations
+        .iter()
+        .find_map(op_space)
+        .unwrap_or(Space::Srgb);
+    let mut img = match (is_16bit, space) {
+        (true, Space::Linear) => LinearImage::from_rgba16(&decoded.to_rgba16()),
+        (true, Space::Srgb) => LinearImage::from_rgba16_srgb(&decoded.to_rgba16()),
+        (false, Space::Linear) => LinearImage::from_rgba8(&decoded.to_rgba8()),
+        (false, Space::Srgb) => LinearImage::from_rgba8_srgb(&decoded.to_rgba8()),
+    };
+    drop(decoded);
 
     // SOURCE 画素座標 → CURRENT パイプライン座標 のアフィン変換。
     // 幾何 op ごとに合成し、`Crop { coordinate_space: Source }` で使う。
@@ -219,8 +248,9 @@ pub fn apply_recipe_with_assets(
                 angle_degrees,
                 crop,
             } => {
+                ensure_space(&mut img, &mut space, Space::Linear);
                 let (rotated, warning, step) =
-                    pixel_ops::rotate(&img, *angle_degrees, *crop, DEFAULT_PAD);
+                    pixel_ops::rotate(&img, *angle_degrees, *crop, pad_to_linear(DEFAULT_PAD));
                 img = rotated;
                 xf = xf.then(step);
                 if let Some(w) = warning {
@@ -235,10 +265,17 @@ pub fn apply_recipe_with_assets(
                 pad_color,
                 coordinate_space,
             } => {
-                let pad = match pad_color {
+                let pad_u8 = match pad_color {
                     Some(c) => parse_hex_color(c)
                         .ok_or_else(|| fail(format!("invalid pad_color {c:?}")))?,
                     None => DEFAULT_PAD,
+                };
+                // crop / pad は添字操作なので作業空間を選ばない(v2 では余計な
+                // 空間往復を避けるため、現在の空間のまま実行する)。pad 色だけを
+                // 現在の空間へ写す。
+                let pad = match space {
+                    Space::Linear => pad_to_linear(pad_u8),
+                    Space::Srgb => pad_to_srgb(pad_u8),
                 };
                 if let Some(ratio) = aspect_ratio {
                     let ratio = parse_aspect_ratio(ratio)
@@ -246,7 +283,7 @@ pub fn apply_recipe_with_assets(
                     let (fitted, step) = pixel_ops::fit_aspect(&img, ratio, *anchor, *mode, pad);
                     img = fitted;
                     xf = xf.then(step);
-                    if *mode == crate::recipe::CropMode::Pad && pad[3] < 255 {
+                    if *mode == crate::recipe::CropMode::Pad && pad_u8[3] < 255 {
                         has_alpha = true;
                     }
                 } else if let Some(rect) = rect {
@@ -291,16 +328,17 @@ pub fn apply_recipe_with_assets(
                 fit,
                 without_enlargement,
             } => {
+                ensure_space(&mut img, &mut space, Space::Linear);
                 let (iw, ih) = img.dimensions();
                 let ((sw, sh), (cw, ch)) =
                     pixel_ops::resize_targets(iw, ih, *width, *height, *fit, *without_enlargement);
-                img = pixel_ops::resize_lanczos3(&img, sw, sh, has_alpha).map_err(fail)?;
+                img = pixel_ops::resize_lanczos3(&img, sw, sh).map_err(fail)?;
                 // 連続座標では拡縮は原点固定の純粋なスケール。
                 xf = xf.then(Affine::scale(sw as f64 / iw as f64, sh as f64 / ih as f64));
                 if (cw, ch) != (sw, sh) {
                     let x = (sw - cw) / 2;
                     let y = (sh - ch) / 2;
-                    img = image::imageops::crop_imm(&img, x, y, cw, ch).to_image();
+                    img = pixel_ops::crop_view(&img, x, y, cw, ch);
                     // fit=cover の内部中央クロップぶんの平行移動。
                     xf = xf.then(Affine::translate(-(x as f64), -(y as f64)));
                 }
@@ -311,6 +349,7 @@ pub fn apply_recipe_with_assets(
                 saturation,
                 sharpness,
             } => {
+                ensure_space(&mut img, &mut space, Space::Srgb);
                 img = pixel_ops::adjust(&img, *brightness, *contrast, *saturation, *sharpness);
             }
             Operation::Perspective {
@@ -319,6 +358,7 @@ pub fn apply_recipe_with_assets(
                 horizontal_degrees,
                 pad_color,
             } => {
+                ensure_space(&mut img, &mut space, Space::Linear);
                 let (out, warns, step) = crate::ops::perspective::apply(
                     &img,
                     quad,
@@ -338,6 +378,7 @@ pub fn apply_recipe_with_assets(
                 );
             }
             Operation::ColorMatrix { matrix } => {
+                ensure_space(&mut img, &mut space, Space::Srgb);
                 img = crate::ops::color::color_matrix(&img, matrix);
             }
             Operation::Curves {
@@ -346,6 +387,7 @@ pub fn apply_recipe_with_assets(
                 green,
                 blue,
             } => {
+                ensure_space(&mut img, &mut space, Space::Srgb);
                 img = crate::ops::color::curves(&img, master, red, green, blue);
             }
             Operation::Levels {
@@ -355,14 +397,17 @@ pub fn apply_recipe_with_assets(
                 out_black,
                 out_white,
             } => {
+                ensure_space(&mut img, &mut space, Space::Srgb);
                 img = crate::ops::color::levels(
                     &img, *in_black, *in_white, *gamma, *out_black, *out_white,
                 );
             }
             Operation::Blur { sigma } => {
+                ensure_space(&mut img, &mut space, Space::Linear);
                 img = crate::ops::blur::gaussian_blur(&img, *sigma);
             }
             Operation::Median { radius } => {
+                ensure_space(&mut img, &mut space, Space::Linear);
                 img = crate::ops::blur::median(&img, *radius);
             }
             Operation::UnsharpMask {
@@ -370,6 +415,7 @@ pub fn apply_recipe_with_assets(
                 radius,
                 threshold,
             } => {
+                ensure_space(&mut img, &mut space, Space::Linear);
                 img = crate::ops::blur::unsharp_mask(&img, *amount, *radius, *threshold);
             }
             Operation::Lut {
@@ -383,9 +429,11 @@ pub fn apply_recipe_with_assets(
                     fail(format!("asset {lut_revision_id} is not a text .cube file"))
                 })?;
                 let lut = crate::ops::lut::parse_cube(text).map_err(|e| fail(e.to_string()))?;
+                ensure_space(&mut img, &mut space, Space::Srgb);
                 img = crate::ops::lut::apply(&img, &lut, *strength);
             }
             Operation::WhiteBalance { temperature, tint } => {
+                ensure_space(&mut img, &mut space, Space::Linear);
                 img = crate::ops::wb::apply(&img, *temperature, *tint);
             }
             Operation::Hsl {
@@ -401,6 +449,7 @@ pub fn apply_recipe_with_assets(
                 let bands = [
                     *red, *orange, *yellow, *green, *aqua, *blue, *purple, *magenta,
                 ];
+                ensure_space(&mut img, &mut space, Space::Srgb);
                 img = crate::ops::hsl::apply(&img, &bands);
             }
             Operation::Convolve {
@@ -409,6 +458,7 @@ pub fn apply_recipe_with_assets(
                 divisor,
                 offset,
             } => {
+                ensure_space(&mut img, &mut space, Space::Linear);
                 img = crate::ops::convolve::apply(&img, kernel, *size, *divisor, *offset);
             }
             Operation::StripMetadata { scope } => {
@@ -419,24 +469,35 @@ pub fn apply_recipe_with_assets(
         }
     }
 
+    // 出口の空間確定: 常に sRGB 符号値へ移してから量子化する。
+    // 最後の op が sRGB 空間だった場合は変換が 0 回で済み、丸め直前に
+    // 変換の補間誤差が乗らない(`linear::encoded_to_rgba8` のドキュメント参照)。
+    ensure_space(&mut img, &mut space, Space::Srgb);
+
     // --- 出力フォーマットの決定 ---
     let encode_op = recipe.operations.iter().find_map(|op| match op {
-        Operation::Encode { format, quality } => Some((*format, *quality)),
+        Operation::Encode {
+            format,
+            quality,
+            bit_depth,
+        } => Some((*format, *quality, *bit_depth)),
         _ => None,
     });
-    let (format, quality) = match encode_op {
+    let (format, quality, bit_depth) = match encode_op {
         Some(v) => v,
         None => match input_format.and_then(output_format_of) {
-            Some(f) => (f, None),
+            Some(f) => (f, None, None),
             None => {
                 warnings.push(format!(
                     "input format {:?} cannot be re-encoded; falling back to jpeg",
                     input_format
                 ));
-                (OutputFormat::Jpeg, None)
+                (OutputFormat::Jpeg, None, None)
             }
         },
     };
+    // validate が 8 / 16 のみを通し、16 は png のみに限定している。
+    let bit_depth = bit_depth.unwrap_or(8);
 
     // --- メタデータの取り扱い ---
     if strip == Some(StripScope::All) && icc.is_some() {
@@ -471,8 +532,14 @@ pub fn apply_recipe_with_assets(
 
     // --- エンコード ---
     let out_has_alpha = has_alpha && format != OutputFormat::Jpeg;
-    let (out_bytes, icc_embedded) =
-        codec::encode(&img, format, quality, out_has_alpha, icc.as_deref())?;
+    let (out_bytes, icc_embedded) = codec::encode(
+        &img,
+        format,
+        quality,
+        out_has_alpha,
+        icc.as_deref(),
+        bit_depth,
+    )?;
     if icc.is_some() && !icc_embedded {
         warnings.push("ICC profile could not be embedded and was dropped".to_string());
     }
@@ -485,6 +552,51 @@ pub fn apply_recipe_with_assets(
         height: h,
         warnings,
     })
+}
+
+/// op が要求する作業空間(`ops/mod.rs` の表)。
+///
+/// `None` は**空間非依存**の op。`auto_orient` / `crop` / `strip_metadata` / `encode` は
+/// 添字操作かメタデータ操作でしかないので、どちらの空間でもビット同一に動く
+/// (`crop` の pad 色だけは現在の空間へ写す。engine の該当分岐を参照)。
+fn op_space(op: &Operation) -> Option<Space> {
+    match op {
+        Operation::AutoOrient
+        | Operation::Crop { .. }
+        | Operation::StripMetadata { .. }
+        | Operation::Encode { .. } => None,
+        Operation::Rotate { .. }
+        | Operation::Resize { .. }
+        | Operation::Perspective { .. }
+        | Operation::Blur { .. }
+        | Operation::Median { .. }
+        | Operation::UnsharpMask { .. }
+        | Operation::Convolve { .. }
+        | Operation::WhiteBalance { .. } => Some(Space::Linear),
+        Operation::Adjust { .. }
+        | Operation::ColorMatrix { .. }
+        | Operation::Curves { .. }
+        | Operation::Levels { .. }
+        | Operation::Lut { .. }
+        | Operation::Hsl { .. } => Some(Space::Srgb),
+    }
+}
+
+/// 作業空間の遅延切り替え。すでに目的の空間なら何もしない
+/// (= 同じ空間の op が連続するときは変換を往復させない)。
+///
+/// これは性能のためだけでなく **精度のため**でもある: 変換 1 回あたり
+/// 符号値で 2e-5 程度の補間誤差が乗るので、op ごとに往復させると
+/// トーンスタックを重ねたときに誤差が積み上がる。
+fn ensure_space(img: &mut LinearImage, current: &mut Space, want: Space) {
+    if *current == want {
+        return;
+    }
+    match want {
+        Space::Srgb => img.encode_in_place(),
+        Space::Linear => img.decode_in_place(),
+    }
+    *current = want;
 }
 
 fn op_name(op: &Operation) -> &'static str {

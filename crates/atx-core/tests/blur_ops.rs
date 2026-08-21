@@ -406,7 +406,8 @@ fn full_pipeline_golden_blur_unsharp_jpeg() {
     );
     let hash = sha256_hex(&out.bytes);
     assert_eq!(
-        hash, "9f93db6234def3510714674c69de34b5fd2398e7d2d97540265d42fce6beedc9",
+        hash, // v2 (f32 linear) golden; v1 value was 9f93db6234def3510714674c69de34b5fd2398e7d2d97540265d42fce6beedc9
+        "08c0775c1a40288d40e31ff4268126e033935ab1aa048e7ff17a28455d017fc4",
         "golden hash mismatch: full pipeline output changed (recompute and update if intentional)"
     );
 }

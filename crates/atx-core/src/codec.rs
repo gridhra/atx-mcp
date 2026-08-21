@@ -2,10 +2,15 @@
 //!
 //! エンコーダのバージョンは Cargo.lock で固定される前提(DESIGN §5「決定論」)。
 
-use image::{ExtendedColorType, ImageEncoder, RgbImage, RgbaImage};
+use image::{ExtendedColorType, ImageBuffer, ImageEncoder, Rgb, RgbImage, Rgba, RgbaImage};
 
+use crate::linear::LinearImage;
 use crate::recipe::OutputFormat;
 use crate::{AtxError, Result};
+
+/// 16bit の RGBA / RGB バッファ(PNG16 出力用)。
+type Rgba16Image = ImageBuffer<Rgba<u16>, Vec<u16>>;
+type Rgb16Image = ImageBuffer<Rgb<u16>, Vec<u16>>;
 
 /// フォーマット別のデフォルト品質。
 pub(crate) const DEFAULT_JPEG_QUALITY: u8 = 85;
@@ -39,22 +44,46 @@ fn flatten_to_rgb(img: &RgbaImage) -> RgbImage {
     out
 }
 
+/// 白背景との 16bit アルファ合成(PNG16 の非アルファ出力用)。
+fn flatten_to_rgb16(img: &Rgba16Image) -> Rgb16Image {
+    let (w, h) = img.dimensions();
+    let mut out = Rgb16Image::new(w, h);
+    for (dst, src) in out.pixels_mut().zip(img.pixels()) {
+        let a = src.0[3] as u64;
+        for i in 0..3 {
+            let v = (src.0[i] as u64 * a + 65535 * (65535 - a) + 32767) / 65535;
+            dst.0[i] = v.min(65535) as u16;
+        }
+    }
+    out
+}
+
 /// 指定フォーマットでエンコードする。
 ///
-/// - `has_alpha=false` の場合、アルファチャンネルを持たない表現(RGB8)で書き出す
+/// 入力は **すでに sRGB 符号値へ符号化済みの `LinearImage`**(エンジンが出口直前に
+/// `Space::Srgb` へ移す)。ここで行うのはビット深度への丸め
+/// (half-away-from-zero)だけ(`crate::linear` 参照)。
+///
+/// - `has_alpha=false` の場合、アルファチャンネルを持たない表現(RGB8 / RGB16)で書き出す
 /// - `icc` が Some かつフォーマットが対応する場合のみ ICC プロファイルを埋め込む
-///   (v1 では JPEG のみ埋め込みに対応。他フォーマットでは破棄され warning が出る)
+///   (JPEG のみ埋め込みに対応。他フォーマットでは破棄され warning が出る)
+/// - `bit_depth == 16` は png のみ(`recipe::validate` が保証する)
 pub(crate) fn encode(
-    img: &RgbaImage,
+    img: &LinearImage,
     format: OutputFormat,
     quality: Option<u8>,
     has_alpha: bool,
     icc: Option<&[u8]>,
+    bit_depth: u8,
 ) -> Result<(Vec<u8>, bool)> {
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return Err(AtxError::Encode("image has zero dimension".into()));
     }
+    if format == OutputFormat::Png && bit_depth == 16 {
+        return encode_png16(&img.encoded_to_rgba16(), has_alpha).map(|b| (b, false));
+    }
+    let img = &img.encoded_to_rgba8();
     match format {
         OutputFormat::Jpeg => encode_jpeg(img, quality.unwrap_or(DEFAULT_JPEG_QUALITY), icc),
         OutputFormat::Png => encode_png(img, has_alpha).map(|b| (b, false)),
@@ -132,6 +161,37 @@ fn encode_png(img: &RgbaImage, has_alpha: bool) -> Result<Vec<u8>> {
         encoder
             .write_image(rgb.as_raw(), w, h, ExtendedColorType::Rgb8)
             .map_err(|e| AtxError::Encode(format!("png: {e}")))?;
+    }
+    Ok(out)
+}
+
+/// PNG16(`image` の PngEncoder、既定圧縮・フィルタ)。
+///
+/// 内部が f32 リニアライトなので、8bit へ丸める前の階調をそのまま書き出せる。
+/// 変換誤差の見積りは `crate::linear` のモジュールドキュメント参照
+/// (最暗部で高々 1〜2 LSB)。
+fn encode_png16(img: &Rgba16Image, has_alpha: bool) -> Result<Vec<u8>> {
+    let (w, h) = img.dimensions();
+    let mut out = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut out);
+    // `ImageEncoder::write_image` の契約はネイティブエンディアンのバイト列で、
+    // PNG が要求する big-endian への並べ替えはエンコーダ側が行う。
+    let to_ne = |data: &[u16]| -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(data.len() * 2);
+        for v in data {
+            bytes.extend_from_slice(&v.to_ne_bytes());
+        }
+        bytes
+    };
+    if has_alpha {
+        encoder
+            .write_image(&to_ne(img.as_raw()), w, h, ExtendedColorType::Rgba16)
+            .map_err(|e| AtxError::Encode(format!("png16: {e}")))?;
+    } else {
+        let rgb = flatten_to_rgb16(img);
+        encoder
+            .write_image(&to_ne(rgb.as_raw()), w, h, ExtendedColorType::Rgb16)
+            .map_err(|e| AtxError::Encode(format!("png16: {e}")))?;
     }
     Ok(out)
 }

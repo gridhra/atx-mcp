@@ -26,9 +26,11 @@
 //! 1e-2 まで悪化し、端で 1 画素近くずれてしまう)。
 //! 正規化座標 → 画素座標の戻しは対角スケール行列との合成、つまり四則演算のみ。
 
-use image::{Rgba, RgbaImage};
+use image::Rgba;
 use imageproc::geometric_transformations::{warp_into, Border, Interpolation, Projection};
 
+use crate::linear::{pad_to_linear, LinearImage};
+use crate::pixel_ops::{from_f32_image, to_f32_image, F32Image};
 use crate::recipe::parse_hex_color;
 use crate::transform::{quantize_1e6, Transform};
 use crate::{AtxError, Result};
@@ -179,13 +181,19 @@ fn is_strictly_convex_in_order(q: &[[f64; 2]; 4]) -> bool {
 ///
 /// 出力キャンバスは入力と同寸。補正で画像外へ出た領域は `pad_color`(既定は白)で
 /// 埋め、埋まった画素の割合を警告として返す。
+///
+/// # v2(f32 リニアライト)での補間
+///
+/// 補間(bicubic)は **線形光の f32 上で、アルファをプリマルチプライしてから** 行う。
+/// 幾何写像そのもの(行列の組み立て・量子化・出力寸法の規則)は v1 と完全に同一で、
+/// 変わったのは「何を混ぜるか」だけである。
 pub fn apply(
-    img: &RgbaImage,
+    img: &LinearImage,
     quad: &Option<[[f64; 2]; 4]>,
     vertical_degrees: &Option<f64>,
     horizontal_degrees: &Option<f64>,
     pad_color: &Option<String>,
-) -> Result<(RgbaImage, Vec<String>, Transform)> {
+) -> Result<(LinearImage, Vec<String>, Transform)> {
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return Err(AtxError::InvalidRecipe(
@@ -370,12 +378,12 @@ fn homography_from_points(from: &[[f64; 2]; 4], to: &[[f64; 2]; 4]) -> Option<Tr
 /// `imageproc` 内部の座標計算は f32 だが、係数は f64 → 1e-6 グリッド量子化済みの
 /// 値を丸めたものなので、プラットフォームによらず同じ f32 になる。
 fn warp(
-    img: &RgbaImage,
+    img: &LinearImage,
     step: &Transform,
     out_w: u32,
     out_h: u32,
     pad: [u8; 4],
-) -> Result<RgbaImage> {
+) -> Result<LinearImage> {
     let index_space = Transform::translate(0.5, 0.5)
         .then(*step)
         .then(Transform::translate(-0.5, -0.5));
@@ -389,14 +397,25 @@ fn warp(
     let projection = Projection::from_matrix(coeffs).ok_or_else(|| {
         AtxError::InvalidRecipe("perspective: the transform is not invertible".into())
     })?;
-    let mut out = RgbaImage::new(out_w, out_h);
+    // 補間はプリマルチプライした線形光空間で行う。境界色も同じ空間へ持ち込む。
+    let pad_linear = pad_to_linear(pad);
+    let pad_premul = Rgba([
+        pad_linear[0] * pad_linear[3],
+        pad_linear[1] * pad_linear[3],
+        pad_linear[2] * pad_linear[3],
+        pad_linear[3],
+    ]);
+    let src = to_f32_image(&img.premultiplied());
+    let mut warped: F32Image = F32Image::new(out_w, out_h);
     warp_into(
-        img,
+        &src,
         projection,
         Interpolation::Bicubic,
-        Border::Constant(Rgba(pad)),
-        &mut out,
+        Border::Constant(pad_premul),
+        &mut warped,
     );
+    let mut out = from_f32_image(&warped);
+    out.unpremultiply();
     Ok(out)
 }
 
