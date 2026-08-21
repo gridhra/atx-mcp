@@ -131,9 +131,10 @@ fn list_operations_returns_every_op_and_the_presets() {
     assert!(body.contains("sigma"));
     assert!(body.contains("0.1..100"));
 
-    // 段階的開示: カタログはトークン的に軽いこと(v0.3 で 18 op、目安 ~850 tokens ≒ 3600 chars)。
+    // 段階的開示: カタログはトークン的に軽いこと
+    // (v0.5 で 18 op + 11 op に付く mask の1行、目安 ~980 tokens ≒ 4100 chars)。
     assert!(
-        body.len() < 3600,
+        body.len() < 4100,
         "the catalog must stay compact, got {} chars",
         body.len()
     );
@@ -211,7 +212,8 @@ fn explain_operation_returns_the_full_parameter_table() {
         .iter()
         .map(|p| p["name"].as_str().unwrap())
         .collect();
-    assert_eq!(params, ["master", "red", "green", "blue"]);
+    // v0.5: 局所適用マスクが調整系 op の共有パラメータとして最後に並ぶ。
+    assert_eq!(params, ["master", "red", "green", "blue", "mask"]);
     assert!(
         out["warnings"]
             .as_array()
@@ -264,7 +266,7 @@ fn explain_lut_documents_the_import_first_workflow() {
         .iter()
         .map(|p| p["name"].as_str().unwrap())
         .collect();
-    assert_eq!(params, ["lut_revision_id", "strength"]);
+    assert_eq!(params, ["lut_revision_id", "strength", "mask"]);
 
     assert!(
         body.contains("import_asset"),
@@ -395,6 +397,7 @@ fn preset_apply_is_pure_sugar_over_the_resolved_recipe() {
         recipe: None,
         preset: Some("web_optimize".to_string()),
         overlay: None,
+        mask_revision_id: None,
     }));
     assert_eq!(preview["recipe_hash"].as_str().unwrap(), preset_hash);
     assert_eq!(preview["mime_type"], "image/jpeg");
@@ -459,6 +462,7 @@ fn recipe_and_preset_are_mutually_exclusive_and_one_is_required() {
         recipe: None,
         preset: None,
         overlay: None,
+        mask_revision_id: None,
     });
     assert_eq!(
         error_payload(&preview_neither)["error"]["code"],

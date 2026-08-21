@@ -198,6 +198,7 @@ fn full_flow_import_inspect_detect_preview_apply_export() {
         recipe: Some(serde_json::from_value(recipe()).unwrap()),
         preset: None,
         overlay: None,
+        mask_revision_id: None,
     });
     let preview = structured(&preview_result);
     assert_eq!(preview["mime_type"], "image/jpeg");
@@ -421,6 +422,7 @@ fn tool_registration_matches_the_design_contract() {
             "detect_tilt",
             "explain_operation",
             "export_asset",
+            "generate_mask",
             "import_asset",
             "inspect_image",
             "list_assets",
@@ -461,7 +463,8 @@ fn tool_registration_matches_the_design_contract() {
         );
         assert_eq!(ann.read_only_hint, Some(read_only), "{}", tool.name);
         match tool.name.as_ref() {
-            "import_asset" | "apply_transform" | "render_preview" | "compare_revisions" => {
+            "import_asset" | "apply_transform" | "render_preview" | "compare_revisions"
+            | "generate_mask" => {
                 assert_eq!(ann.destructive_hint, Some(false), "{}", tool.name);
                 assert_eq!(ann.idempotent_hint, Some(true), "{}", tool.name);
             }
@@ -486,6 +489,12 @@ fn tool_registration_matches_the_design_contract() {
     // 語彙参照ツールとプリセットが「発見の道筋」として instructions に載っていること
     // (ROADMAP §Agent UX の規律 #2 / #3)。
     assert!(instructions.contains("list_operations"));
+    // v0.5: マスクの作業手順(generate_mask → op の mask フィールド)が一文で載っていること。
+    assert!(
+        instructions.contains("generate_mask"),
+        "instructions must point at the mask workflow"
+    );
+    assert!(instructions.contains("\"mask\": {\"revision_id\""));
     assert!(instructions.contains("explain_operation"));
     assert!(instructions.contains("preset"));
     // op を instructions 側で列挙しないこと(列挙は list_operations の役目)。
@@ -530,6 +539,7 @@ fn render_preview_overlay_variants() {
         recipe: Some(serde_json::from_value(recipe()).unwrap()),
         preset: None,
         overlay: None,
+        mask_revision_id: None,
     });
     let base_structured = structured(&base_result);
     let base_bytes = preview_jpeg_bytes(&base_result);
@@ -549,6 +559,7 @@ fn render_preview_overlay_variants() {
             recipe: Some(serde_json::from_value(recipe()).unwrap()),
             preset: None,
             overlay: Some(overlay.to_string()),
+            mask_revision_id: None,
         });
         let structured_out = structured(&result);
         assert_eq!(structured_out["overlay"], overlay);
@@ -582,6 +593,7 @@ fn render_preview_overlay_variants() {
             recipe: Some(serde_json::from_value(recipe()).unwrap()),
             preset: None,
             overlay: Some(overlay.to_string()),
+            mask_revision_id: None,
         });
         let again_bytes = preview_jpeg_bytes(&again);
         assert_eq!(
@@ -598,6 +610,7 @@ fn render_preview_overlay_variants() {
         recipe: Some(serde_json::from_value(recipe()).unwrap()),
         preset: None,
         overlay: Some("scanlines".to_string()),
+        mask_revision_id: None,
     });
     let payload = error_payload(&invalid);
     assert_eq!(payload["error"]["code"], "invalid_overlay");
@@ -605,7 +618,7 @@ fn render_preview_overlay_variants() {
         .as_array()
         .expect("valid_values must be listed");
     let valid_values: Vec<&str> = valid_values.iter().map(|v| v.as_str().unwrap()).collect();
-    assert_eq!(valid_values, ["grid", "thirds", "horizon"]);
+    assert_eq!(valid_values, ["grid", "thirds", "horizon", "mask"]);
 }
 
 /// compare_revisions: side_by_side / stacked の両方で合成寸法が期待通りになること、

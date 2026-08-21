@@ -87,6 +87,7 @@ fn arb_pipeline_recipe() -> impl Strategy<Value = TransformRecipe> {
                         contrast,
                         saturation,
                         sharpness,
+                        mask: None,
                     });
                 }
                 ops.push(Operation::Encode {

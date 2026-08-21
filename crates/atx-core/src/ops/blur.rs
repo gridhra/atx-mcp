@@ -68,7 +68,10 @@ pub fn validate_unsharp(index: usize, amount: f64, radius: f64, threshold: u8) -
 /// 4. 最後に f32 へ落とす(画素ループは f32 で回る)
 ///
 /// 半径(半値幅)は `ceil(3*sigma)` を 255 に上限キャップする。
-fn gaussian_kernel(sigma: f64) -> (i32, Vec<f32>) {
+///
+/// `ops::mask` のフェザ(単一チャンネルのガウス)も同じ係数生成を使う
+/// (blur 自体の挙動には影響しない)。
+pub(crate) fn gaussian_kernel(sigma: f64) -> (i32, Vec<f32>) {
     let radius = ((3.0 * sigma).ceil() as i64).clamp(1, 255) as i32;
     let two_sigma_sq = 2.0 * sigma * sigma;
 

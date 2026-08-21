@@ -146,6 +146,7 @@ fn arb_op_no_encode() -> impl Strategy<Value = Operation> {
                 contrast,
                 saturation,
                 sharpness,
+                mask: None,
             }
         ),
         arb_strip_scope().prop_map(|scope| Operation::StripMetadata { scope }),
@@ -258,6 +259,7 @@ fn arb_any_op() -> impl Strategy<Value = Operation> {
                 contrast,
                 saturation,
                 sharpness,
+                mask: None,
             }
         ),
         (arb_output_format(), prop::option::of(any::<u8>())).prop_map(|(format, quality)| {

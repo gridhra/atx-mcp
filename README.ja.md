@@ -79,7 +79,7 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 
 `--workspace`(env: `ATX_WORKSPACE`)はアセットストアのディレクトリ。存在しなければ作成される。
 
-## ツール(10)
+## ツール(11)
 
 | ツール | 役割 |
 |---|---|
@@ -88,7 +88,8 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 | `import_asset` | ローカル画像をワークスペースへ取り込み(sha256 冪等) |
 | `inspect_image` | 寸法・EXIF・ICC・GPS 有無などの検査(read-only) |
 | `detect_tilt` | Canny+Hough(粗)+ 投影プロファイル(0.1° 未満の細分)による傾き角推定。水平族/垂直族の推定とスコア曲線も返す。confidence 低なら「補正しない」を返す(read-only) |
-| `render_preview` | レシピ(または `preset`)を低解像度(長辺 ≤768)で適用、インライン画像付きで返却。`overlay:"grid"\|"thirds"\|"horizon"` で構図確認用のガイド線を重ねられる(プレビューのみに描画、本適用には影響しない) |
+| `generate_mask` | 決定論的なグレースケールマスク(`linear_gradient` / `radial_gradient` / `luminosity_range` / `color_range`)を、参照画像と同寸法の PNG revision として生成する。op の `mask` フィールドから参照して使う(冪等) |
+| `render_preview` | レシピ(または `preset`)を低解像度(長辺 ≤768)で適用、インライン画像付きで返却。`overlay:"grid"\|"thirds"\|"horizon"` で構図確認用のガイド線を、`overlay:"mask"`(+ `mask_revision_id`)でマスクの被覆を重ねられる(プレビューのみに描画、本適用には影響しない) |
 | `apply_transform` | レシピ(または `preset`)を高解像度適用し新 revision を発行(同一レシピ→同一 revision) |
 | `compare_revisions` | 2つの revision を長辺 ≤640 に縮小し、`layout:"side_by_side"\|"stacked"` で1枚に並べてインライン画像で返却(A/B・before/after の視覚比較用) |
 | `list_assets` | revision 台帳の参照(read-only) |
@@ -133,6 +134,41 @@ op 一覧はツールのスキーマにあえて埋め込んでいない。最�
 再現はその LUT を持つワークスペース内でのみ保証されるため、ルックを別環境へ
 移すときは `.cube` ごと移すこと。存在しない id を参照した場合は、画素処理に
 入る前に構造化エラーで返る。
+
+### マスク(部分適用)
+
+マスクは**グレースケールの画像 revision** である。BT.709 輝度がそのまま重みで、
+白 = その op を全量適用、黒 = その画素には適用しない。トーン系・フィルタ系の 11 op
+(`adjust` / `color_matrix` / `curves` / `levels` / `hsl` / `lut` / `white_balance` /
+`blur` / `median` / `unsharp_mask` / `convolve`)が受け取れる。
+
+1. `generate_mask` が、参照画像と**厳密に同じ寸法**のマスクを決定論的に作る:
+
+| `kind` | パラメータ | 選択されるもの |
+|---|---|---|
+| `linear_gradient` | `angle_degrees`(0 = 上が白で下へ向かって黒、正で時計回り)、`start` / `end`(軸上で重みが 1→0 になる位置、0..1) | ハーフ ND(空・手前) |
+| `radial_gradient` | `center_x` / `center_y`(0..1 の相対位置)、`radius`(対角線の半分に対する比 0..1)、`feather`(0..1 の追加減衰帯) | ビネット・被写体スポット |
+| `luminosity_range` | `min` / `max`(0..255)、`feather`(帯の外側の減衰幅、輝度単位) | ハイライト・中間調・シャドウ |
+| `color_range` | `hue_center`(0..360)、`hue_width`(片側幅 1..180)、`feather`(追加の度数) | 特定の色相域(空の青・葉の緑) |
+
+   自前のグレースケール画像を `import_asset` して使ってもよい。
+
+2. 返ってきた `revision_id` を op に付ける:
+
+```json
+{ "op": "curves", "master": [[0,0],[128,168],[255,255]],
+  "mask": { "revision_id": "rev_...", "invert": false, "feather_px": 8.0 } }
+```
+
+   `invert`(既定 `false`)は重みを `1-w` に反転する。`feather_px`(既定 `0.0`)は
+   マスク境界を、現在の画像座標でのガウス σ [px] だけぼかす。
+
+3. `render_preview` に `overlay:"mask"` と `mask_revision_id` を渡すと、重みが 0.5 を
+   超える領域を赤で、それ以外を少し暗く塗ったプレビューが返る。本適用の前に
+   被覆を目視で確認できる。
+
+マスクの参照は LUT と同じ仕組みなので、注意点も同じ: 参照 id は `recipe_hash` に
+含まれ、そのレシピの再現はそのマスクを持つワークスペース内でのみ保証される。
 
 ## プリセット
 

@@ -63,6 +63,33 @@ pub struct OpDoc {
 /// `list_operations` で使える category の一覧。
 pub const CATEGORIES: [&str; 4] = ["geometry", "color", "filter", "output"];
 
+/// 局所適用マスク(v0.5)の共有パラメータ説明。
+///
+/// トーン系・フィルタ系の 11 op が同じ `mask` フィールドを取るので、
+/// **説明は1箇所だけ**持ち、各 op の `params` から同じ定数を参照する。
+/// カタログ(`list_operations`)には `compact()` の1行
+/// `mask?: {revision_id,invert,feather_px}` だけが出て、
+/// 下の詳細は `explain_operation` の params 表にだけ現れる
+/// (ROADMAP §Agent UX の規律 #2「語彙の段階的開示」= カタログの予算を守る)。
+pub const MASK_PARAM: ParamDoc = ParamDoc {
+    name: "mask",
+    type_hint: "{revision_id,invert,feather_px}",
+    requirement: "optional",
+    semantics: "Applies this operation only where a mask says so, instead of over the whole image. \
+        revision_id (required) is a GRAYSCALE IMAGE revision in this workspace whose BT.709 luma is the weight: \
+        white = the operation applies at full strength, black = the pixel is left untouched, grey = a linear blend of the two. \
+        invert (default false) flips the weight to 1-w. feather_px (default 0.0, up to 200.0) blurs the mask edge by that gaussian sigma, in pixels of the CURRENT image. \
+        A mask whose dimensions differ from the current image is resampled to fit, so build it against the same revision you are transforming. \
+        Get a mask from generate_mask (linear_gradient / radial_gradient / luminosity_range / color_range) or import_asset your own, \
+        and check its coverage with render_preview overlay=\"mask\". The referenced revision id is part of the recipe hash, so the recipe only reproduces inside a workspace that holds that mask.",
+};
+
+/// 11 の調整・フィルタ op に共通で付ける `mask` の注意書き(実体は1つ)。
+pub const MASK_WARNING: &str = "Optional `mask` restricts this operation to part of the image \
+    (white = full strength, black = untouched). Order matters: masked and unmasked ops still run \
+    strictly in sequence, and a geometric op (rotate/crop/resize/perspective) after a masked op \
+    moves the pixels but not the mask you already applied - put the geometry first when you can.";
+
 /// レシピ語彙の全 op(`atx_core::recipe::Operation` と1対1)。
 pub const OPERATIONS: &[OpDoc] = &[
     OpDoc {
@@ -222,6 +249,7 @@ pub const OPERATIONS: &[OpDoc] = &[
                 requirement: "default: 0",
                 semantics: "0 = unchanged. Note the range starts at 0, unlike the other three.",
             },
+        MASK_PARAM,
         ],
         examples: &[
             r#"{"op": "adjust", "brightness": 0.05, "contrast": 0.1}"#,
@@ -230,6 +258,7 @@ pub const OPERATIONS: &[OpDoc] = &[
         warnings: &[
             "sharpness is 0..1, the others are -1..1; out-of-range values are a validation error, not a clamp.",
             "For precise tone work prefer curves/levels; for a full desaturate prefer the grayscale preset (BT.709 luma) over saturation=-1.",
+                    MASK_WARNING,
         ],
     },
     OpDoc {
@@ -281,7 +310,9 @@ pub const OPERATIONS: &[OpDoc] = &[
             type_hint: "f64[20]",
             requirement: "required",
             semantics: "Row-major 4x5 matrix M with [R',G',B',A'] = M * [R,G,B,A,1], applied to values normalized to 0..1 and then clamped. The 5th column of each row is a constant offset in 0..1 units.",
-        }],
+        },
+        MASK_PARAM,
+        ],
         examples: &[
             r#"{"op": "color_matrix", "matrix": [0.2126,0.7152,0.0722,0,0, 0.2126,0.7152,0.0722,0,0, 0.2126,0.7152,0.0722,0,0, 0,0,0,1,0]}"#,
             r#"{"op": "color_matrix", "matrix": [0.393,0.769,0.189,0,0, 0.349,0.686,0.168,0,0, 0.272,0.534,0.131,0,0, 0,0,0,1,0]}"#,
@@ -290,6 +321,7 @@ pub const OPERATIONS: &[OpDoc] = &[
             "The matrix must have exactly 20 elements; the identity is [1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,1,0].",
             "Alpha is part of the matrix. Keep the last row as 0,0,0,1,0 unless you intend to change transparency.",
             "The two examples above are exactly the built-in grayscale and sepia presets; use preset=\"grayscale\" / \"sepia\" instead of retyping them.",
+                    MASK_WARNING,
         ],
     },
     OpDoc {
@@ -321,6 +353,7 @@ pub const OPERATIONS: &[OpDoc] = &[
                 requirement: "optional",
                 semantics: "Control points applied to the blue channel only.",
             },
+        MASK_PARAM,
         ],
         examples: &[
             r#"{"op": "curves", "master": [[0,0],[64,50],[192,205],[255,255]]}"#,
@@ -330,6 +363,7 @@ pub const OPERATIONS: &[OpDoc] = &[
             "Control point x values must be strictly increasing; duplicate x is a validation error.",
             "Order matters: master runs first, then the per-channel curves on the result.",
             "An omitted channel is the identity; a single point makes that channel constant.",
+                    MASK_WARNING,
         ],
     },
     OpDoc {
@@ -367,6 +401,7 @@ pub const OPERATIONS: &[OpDoc] = &[
                 requirement: "default: 255",
                 semantics: "Output level for in_white.",
             },
+        MASK_PARAM,
         ],
         examples: &[
             r#"{"op": "levels", "in_black": 12, "in_white": 240}"#,
@@ -375,6 +410,7 @@ pub const OPERATIONS: &[OpDoc] = &[
         warnings: &[
             "Everything defaults to the identity, so an empty levels op does nothing.",
             "It compiles down to the same 256-entry LUT path as curves; use curves when you need shaped, non-linear control.",
+                    MASK_WARNING,
         ],
     },
     OpDoc {
@@ -394,6 +430,7 @@ pub const OPERATIONS: &[OpDoc] = &[
                 requirement: "default: 1.0",
                 semantics: "Linear blend between the original (0.0) and the fully LUT-mapped image (1.0).",
             },
+        MASK_PARAM,
         ],
         examples: &[
             r#"{"op": "lut", "lut_revision_id": "rev_01J000000000000000000000"}"#,
@@ -404,6 +441,7 @@ pub const OPERATIONS: &[OpDoc] = &[
             "inspect_image refuses a .cube revision on purpose - it is an asset, not an image.",
             "The recipe hash includes the referenced revision id, so a recipe is only reproducible inside a workspace that holds that LUT. Export/import the .cube alongside the recipe to move a look between machines.",
             "3D LUTs use tetrahedral interpolation; 1D LUTs are interpolated linearly.",
+                    MASK_WARNING,
         ],
     },
     OpDoc {
@@ -423,6 +461,7 @@ pub const OPERATIONS: &[OpDoc] = &[
                 requirement: "default: 0",
                 semantics: "0 = unchanged; positive shifts towards magenta, negative towards green.",
             },
+        MASK_PARAM,
         ],
         examples: &[
             r#"{"op": "white_balance", "temperature": 12, "tint": -4}"#,
@@ -431,6 +470,7 @@ pub const OPERATIONS: &[OpDoc] = &[
         warnings: &[
             "This is an sRGB channel-gain approximation of the Lightroom sliders, not a colorimetric chromatic-adaptation transform; it is monotonic and deterministic but not physically exact.",
             "Large shifts clip highlights in the boosted channels. Preview before committing.",
+                    MASK_WARNING,
         ],
     },
     OpDoc {
@@ -486,6 +526,7 @@ pub const OPERATIONS: &[OpDoc] = &[
                 requirement: "optional",
                 semantics: "Same shape as red, for the magenta band.",
             },
+        MASK_PARAM,
         ],
         examples: &[
             r#"{"op": "hsl", "blue": {"saturation": 15, "luminance": -8}}"#,
@@ -495,6 +536,7 @@ pub const OPERATIONS: &[OpDoc] = &[
             "Every field of every band is -100..100; out-of-range values are a validation error, not a clamp.",
             "Band boundaries are feathered, so a shift on one band bleeds slightly into its neighbours. For a global change use adjust or color_matrix instead.",
             "hue is a shift towards the neighbouring hue, not an absolute hue value.",
+                    MASK_WARNING,
         ],
     },
     OpDoc {
@@ -506,7 +548,9 @@ pub const OPERATIONS: &[OpDoc] = &[
             type_hint: "f64 0.1..100",
             requirement: "required",
             semantics: "Standard deviation in pixels; the kernel radius is ceil(3*sigma).",
-        }],
+        },
+        MASK_PARAM,
+        ],
         examples: &[
             r#"{"op": "blur", "sigma": 2.0}"#,
             r#"{"op": "blur", "sigma": 12.0}"#,
@@ -514,6 +558,7 @@ pub const OPERATIONS: &[OpDoc] = &[
         warnings: &[
             "Cost grows with sigma. Blur AFTER resizing when you can: the same visual softness needs a much smaller sigma on a smaller image.",
             "The alpha channel is blurred too.",
+                    MASK_WARNING,
         ],
     },
     OpDoc {
@@ -525,7 +570,9 @@ pub const OPERATIONS: &[OpDoc] = &[
             type_hint: "u32 1..16",
             requirement: "required",
             semantics: "Half-width in pixels; the window is (2*radius+1)^2 pixels.",
-        }],
+        },
+        MASK_PARAM,
+        ],
         examples: &[
             r#"{"op": "median", "radius": 2}"#,
             r#"{"op": "median", "radius": 5}"#,
@@ -533,6 +580,7 @@ pub const OPERATIONS: &[OpDoc] = &[
         warnings: &[
             "Cost is O(radius^2) per pixel; radius above ~5 is slow on large images.",
             "It removes fine texture along with the noise. Preview before committing.",
+                    MASK_WARNING,
         ],
     },
     OpDoc {
@@ -558,6 +606,7 @@ pub const OPERATIONS: &[OpDoc] = &[
                 requirement: "default: 0",
                 semantics: "Per-channel absolute difference below which a pixel is left untouched, protecting flat areas such as sky and skin.",
             },
+        MASK_PARAM,
         ],
         examples: &[
             r#"{"op": "unsharp_mask", "amount": 0.8, "radius": 1.2, "threshold": 3}"#,
@@ -566,6 +615,7 @@ pub const OPERATIONS: &[OpDoc] = &[
         warnings: &[
             "threshold compares per-channel differences, not luminance (a deliberate simplification for determinism).",
             "Sharpen LAST, after the final resize; sharpening before downscaling produces halos.",
+                    MASK_WARNING,
         ],
     },
     OpDoc {
@@ -597,6 +647,7 @@ pub const OPERATIONS: &[OpDoc] = &[
                 requirement: "default: 0",
                 semantics: "Constant added after the division, in 0..255 units; typically 128 for emboss/edge kernels that center on zero.",
             },
+        MASK_PARAM,
         ],
         examples: &[
             r#"{"op": "convolve", "kernel": [0,-1,0, -1,5,-1, 0,-1,0], "size": 3}"#,
@@ -606,6 +657,7 @@ pub const OPERATIONS: &[OpDoc] = &[
             "kernel.len() must equal size*size and divisor must not be ~0; both are validation errors.",
             "Only RGB is convolved; the alpha channel passes through untouched. Borders replicate the edge pixel.",
             "For plain sharpening prefer unsharp_mask (radius/threshold control); convolve is the escape hatch for W3C feConvolveMatrix-style effects.",
+                    MASK_WARNING,
         ],
     },
     OpDoc {
