@@ -31,7 +31,16 @@ pub const COMPARE_LONG_EDGE: u32 = 640;
 /// `compare_revisions` の合成キャンバスで2枚の画像を隔てる隙間(px)。
 pub const COMPARE_GAP_PX: u32 = 8;
 /// `render_preview` の overlay で使う有効値。
-pub const OVERLAY_VALUES: [&str; 3] = ["grid", "thirds", "horizon"];
+/// `"mask"` だけはガイド線ではなくマスクの可視化で、`mask_revision_id` を伴う(v0.5)。
+pub const OVERLAY_VALUES: [&str; 4] = ["grid", "thirds", "horizon", "mask"];
+/// マスク可視化 overlay で「被覆している」と塗り分ける重みのしきい値。
+pub const MASK_OVERLAY_THRESHOLD: f64 = 0.5;
+/// マスク可視化 overlay の被覆域を塗る赤の混合率。
+const MASK_OVERLAY_ALPHA: f32 = 0.6;
+/// マスク可視化 overlay で非被覆域を落とす係数(被覆域とのコントラストを付ける)。
+const MASK_OVERLAY_DIM: f32 = 0.75;
+/// マスク可視化 overlay の被覆色。
+const MASK_OVERLAY_COLOR: [u8; 3] = [0xFF, 0x22, 0x22];
 /// .cube 3D LUT アセットの MIME type(v0.3「レシピ → アセット参照」)。
 ///
 /// 画像ではないアセットをストアの台帳上で区別するための擬似 MIME。
@@ -97,9 +106,14 @@ pub struct RenderPreviewParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
     /// 構図確認用のガイド線。`"grid"`(1/8 刻みの格子)| `"thirds"`(三分割法)|
-    /// `"horizon"`(1/12 刻みの水平線のみ、傾き目視用)。省略時はガイドなし。
+    /// `"horizon"`(1/12 刻みの水平線のみ、傾き目視用)| `"mask"`(マスクの被覆可視化。
+    /// `mask_revision_id` が必須)。省略時はオーバレイなし。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay: Option<String>,
+    /// `overlay: "mask"` で可視化するマスク画像 revision ID。
+    /// `overlay` が `"mask"` のときのみ指定でき、そのときは必須。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_revision_id: Option<String>,
 }
 
 /// `list_operations` の引数。
@@ -256,9 +270,32 @@ pub struct RenderPreviewOutput {
     pub byte_size: u64,
     pub mime_type: String,
     pub warnings: Vec<String>,
-    /// 適用した guide overlay。未指定なら null。
+    /// 適用した overlay。未指定なら null。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overlay: Option<String>,
+    /// `overlay: "mask"` で可視化したマスクの revision ID。それ以外では null。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mask_revision_id: Option<String>,
+}
+
+/// `generate_mask` の structuredContent。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct GenerateMaskOutput {
+    pub revision: RevisionSummary,
+    /// 生成した種別(`linear_gradient` 等)。
+    pub kind: String,
+    /// 参照した画像 revision(寸法・画素の供給元)。
+    pub reference_revision_id: String,
+    pub width: u32,
+    pub height: u32,
+    /// 既定値まで解決したパラメータの正規化 JSON(origin の generator と同一文字列)。
+    pub generator: String,
+    /// マスクの平均重み(0..1)。1 に近いほど広く、0 に近いほど狭い被覆。
+    pub mean_weight: f64,
+    /// 同じマスクが既に生成済みで既存 revision を返した場合 true(冪等ヒット)。
+    pub reused: bool,
+    /// 次の一手(op への参照の仕方)。
+    pub next: String,
 }
 
 /// `compare_revisions` の片側(A または B)の要約。
@@ -978,6 +1015,101 @@ impl AtxTools {
         )
     }
 
+    // -- 3d. generate_mask --------------------------------------------------
+
+    /// 決定論的にグレースケールマスクを生成し、画像 revision として発行する(v0.5)。
+    ///
+    /// ROADMAP §Agent UX の規律 #1 が許す「生成系/検出系」のツール追加にあたる:
+    /// op を増やすのではなく、**マスクという第一級アセットを作る動詞**を1つ足す。
+    ///
+    /// 冪等性: 同じ params + 同じ参照画像 → 同じ PNG バイト列 → ストアの sha256 dedup で
+    /// 既存 revision がそのまま返る(`reused: true`)。
+    pub fn generate_mask(&self, params: &crate::mask::GenerateMaskParams) -> CallToolResult {
+        let spec = match crate::mask::build(params) {
+            Ok(spec) => spec,
+            Err(e) => return tool_error(e.code, e.message, e.details),
+        };
+
+        let reference = tri!(
+            self.store.get_revision(&params.reference_revision_id),
+            store_error
+        );
+        if !reference.mime_type.starts_with("image/") {
+            return not_an_image(&params.reference_revision_id, &reference.mime_type);
+        }
+        let bytes = tri!(
+            self.store.read_bytes(&params.reference_revision_id),
+            store_error
+        );
+        let info = tri!(atx_core::inspect_bytes(&bytes, &self.limits), atx_error);
+        let image = tri!(
+            image::load_from_memory(&bytes).map_err(|e| AtxError::Decode(e.to_string())),
+            atx_error
+        );
+        // atx-core はデコード時に必ず Orientation を焼き込むので、マスクも同じ向き
+        // ・同じ寸法(= 実効寸法)で作る。そうでないと op 側で寸法が食い違う。
+        let image = apply_orientation(image, info.exif_orientation.unwrap_or(1)).to_rgb8();
+
+        let rendered = spec.render(&image);
+        let (width, height) = rendered.dimensions();
+        let mean_weight = crate::mask::mean_weight(&rendered);
+        let png = tri!(crate::mask::encode_png(&rendered), |e: String| tool_error(
+            "encode_failed",
+            format!("failed to encode the mask as png: {e}"),
+            serde_json::Value::Null
+        ));
+
+        let generator = spec.canonical_json();
+        let mut origin = BTreeMap::new();
+        origin.insert("asset_kind".to_string(), "mask".to_string());
+        origin.insert("generator".to_string(), generator.clone());
+
+        let known_before = tri!(self.known_revision_ids(), store_error);
+        let revision = tri!(
+            self.store
+                .import_bytes(&png, "image/png", width, height, origin),
+            store_error
+        );
+        let reused = known_before.contains(&revision.revision_id);
+        let summary = RevisionSummary::new(&self.store, &revision);
+
+        let next = format!(
+            "reference it from any tone/filter op as \"mask\": {{\"revision_id\": \"{}\"}} (optionally with \"invert\": true or \"feather_px\": <sigma>), or visualise it with render_preview overlay=\"mask\"",
+            summary.revision_id
+        );
+        let text = format!(
+            "{} a {} mask as {} ({}x{} 8-bit grayscale png, {} bytes, mean weight {:.3}). White = the op applies fully, black = not at all.\n{}\nparams: {}\npath: {}",
+            if reused {
+                "Reused the identical"
+            } else {
+                "Generated"
+            },
+            spec.kind(),
+            summary.revision_id,
+            summary.width,
+            summary.height,
+            summary.byte_size,
+            mean_weight,
+            next,
+            generator,
+            summary.path,
+        );
+        ok_result(
+            text,
+            &GenerateMaskOutput {
+                revision: summary,
+                kind: spec.kind().to_string(),
+                reference_revision_id: params.reference_revision_id.clone(),
+                width,
+                height,
+                generator,
+                mean_weight,
+                reused,
+                next,
+            },
+        )
+    }
+
     // -- 4. apply_transform -------------------------------------------------
 
     /// レシピを高解像度で適用し、新しい revision を発行する。
@@ -1104,6 +1236,36 @@ impl AtxTools {
                 );
             }
         }
+        // overlay="mask" と mask_revision_id は相互に必須・排他(片方だけでは意味がない)。
+        let mask_revision_id = match (params.overlay.as_deref(), params.mask_revision_id.as_deref())
+        {
+            (Some("mask"), Some(id)) => Some(id.to_string()),
+            (Some("mask"), None) => {
+                return tool_error(
+                    "mask_revision_id_required",
+                    "overlay \"mask\" visualises a mask, so mask_revision_id is required",
+                    serde_json::json!({
+                        "overlay": "mask",
+                        "recovery": "pass mask_revision_id (call generate_mask to create one, or import_asset an existing grayscale image), or use a different overlay",
+                    }),
+                )
+            }
+            (other, Some(id)) => {
+                return tool_error(
+                    "mask_revision_id_without_mask_overlay",
+                    format!(
+                        "mask_revision_id was given but overlay is {}; it is only meaningful with overlay=\"mask\"",
+                        match other { Some(o) => format!("{o:?}"), None => "not set".to_string() }
+                    ),
+                    serde_json::json!({
+                        "given_overlay": other,
+                        "mask_revision_id": id,
+                        "recovery": "set overlay=\"mask\" to visualise it, or drop mask_revision_id",
+                    }),
+                )
+            }
+            (_, None) => None,
+        };
         // 冪等キーは(プリセット解決後の)ユーザレシピのハッシュ。
         // プレビュー用に差し替えた encode は含めない。
         let recipe_hash = tri!(atx_core::recipe_hash(&recipe), atx_error);
@@ -1125,18 +1287,43 @@ impl AtxTools {
         // 描画色は per-pixel のコントラスト適応ではなく、固定の高視認性色
         // #FF3355 を ~60% 不透明度でブレンドする(実装が単純で、どんな背景でも
         // 見失いにくいため。per-pixel 適応は今回は見送った)。
-        let final_bytes = match params.overlay.as_deref() {
-            Some(overlay) => tri!(draw_overlay_jpeg(&output.bytes, overlay), |e: String| {
+        // overlay="mask" だけは別経路: 参照マスクをプレビュー寸法へ合わせ、
+        // 重み > 0.5 の被覆域を赤で染め、それ以外を軽く落として被覆を目視できるようにする。
+        let final_bytes = match (params.overlay.as_deref(), mask_revision_id.as_deref()) {
+            (Some("mask"), Some(mask_id)) => {
+                let mask_revision = tri!(self.store.get_revision(mask_id), store_error);
+                if !mask_revision.mime_type.starts_with("image/") {
+                    return not_an_image(mask_id, &mask_revision.mime_type);
+                }
+                let mask_bytes = tri!(self.store.read_bytes(mask_id), store_error);
+                tri!(
+                    draw_mask_overlay_jpeg(&output.bytes, &mask_bytes),
+                    |e: String| tool_error(
+                        "overlay_render_failed",
+                        format!("failed to draw the mask overlay for {mask_id:?}: {e}"),
+                        serde_json::json!({
+                            "mask_revision_id": mask_id,
+                            "recovery": "make sure mask_revision_id points at a decodable image revision",
+                        }),
+                    )
+                )
+            }
+            (Some(overlay), _) => tri!(draw_overlay_jpeg(&output.bytes, overlay), |e: String| {
                 tool_error(
                     "overlay_render_failed",
                     format!("failed to draw overlay {overlay:?}: {e}"),
                     serde_json::Value::Null,
                 )
             }),
-            None => output.bytes.clone(),
+            (None, _) => output.bytes.clone(),
         };
 
-        let key = preview_key(&params.revision_id, &recipe_hash, params.overlay.as_deref());
+        let key = preview_key(
+            &params.revision_id,
+            &recipe_hash,
+            params.overlay.as_deref(),
+            mask_revision_id.as_deref(),
+        );
         let path = tri!(
             self.store.put_preview(&key, "jpg", &final_bytes),
             store_error
@@ -1151,9 +1338,12 @@ impl AtxTools {
             output.height,
             final_bytes.len(),
             PREVIEW_LONG_EDGE,
-            match params.overlay.as_deref() {
-                Some(o) => format!(" Guide overlay: {o}."),
-                None => String::new(),
+            match (params.overlay.as_deref(), mask_revision_id.as_deref()) {
+                (Some("mask"), Some(id)) => format!(
+                    " Mask overlay: {id} is tinted red where its weight exceeds {MASK_OVERLAY_THRESHOLD}, and the rest is dimmed."
+                ),
+                (Some(o), _) => format!(" Guide overlay: {o}."),
+                (None, _) => String::new(),
             },
             if output.warnings.is_empty() {
                 String::new()
@@ -1179,6 +1369,7 @@ impl AtxTools {
                 mime_type: output.mime_type,
                 warnings: output.warnings,
                 overlay: params.overlay.clone(),
+                mask_revision_id,
             },
             vec![image_block],
         )
@@ -1558,18 +1749,28 @@ fn preview_recipe_of(recipe: &TransformRecipe) -> TransformRecipe {
     TransformRecipe { operations }
 }
 
-/// プレビューのキャッシュキー: sha256(source_revision + recipe_hash [+ overlay]) の先頭 32 文字。
+/// プレビューのキャッシュキー:
+/// sha256(source_revision + recipe_hash + overlay + mask_revision_id) の先頭 32 文字。
 ///
 /// `overlay` をハッシュ入力に含めることで、同じ (revision, recipe) でも
 /// overlay の有無・種類ごとに別ファイルとしてキャッシュされ、
 /// overlay 付きプレビューが overlay なしプレビューを上書きしない。
-fn preview_key(source_revision_id: &str, recipe_hash: &str, overlay: Option<&str>) -> String {
+/// `overlay="mask"` は可視化するマスクごとに絵が変わるので、
+/// マスクの revision id もキーに含める(でないと別マスクの結果を掴む)。
+fn preview_key(
+    source_revision_id: &str,
+    recipe_hash: &str,
+    overlay: Option<&str>,
+    mask_revision_id: Option<&str>,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(source_revision_id.as_bytes());
     hasher.update([0u8]);
     hasher.update(recipe_hash.as_bytes());
     hasher.update([0u8]);
     hasher.update(overlay.unwrap_or("").as_bytes());
+    hasher.update([0u8]);
+    hasher.update(mask_revision_id.unwrap_or("").as_bytes());
     let digest = hex::encode(hasher.finalize());
     digest[..32].to_string()
 }
@@ -1710,6 +1911,50 @@ fn draw_overlay_jpeg(jpeg_bytes: &[u8], overlay: &str) -> Result<Vec<u8>, String
     encode_jpeg_q80(&rgb)
 }
 
+/// プレビュー jpeg にマスクの被覆を焼き込む(`overlay: "mask"`)。
+///
+/// マスクの重みは `atx_core::recipe::MaskRef` と同じ規約
+/// (sRGB 符号値上の BT.709 輝度、白 = 1.0)で読む。寸法が違えばプレビュー寸法へ
+/// 双線形で合わせる(マスクは参照画像と同寸法だが、プレビューは縮小済みのため)。
+///
+/// 塗り分けは2値: 重み > [`MASK_OVERLAY_THRESHOLD`] を赤 60% でブレンドし、
+/// それ以外は 0.75 倍に落とす。連続階調でなく2値にするのは
+/// 「どこに効くか」を一目で掴ませるのが目的だから(強度の確認は apply 後の比較で行う)。
+fn draw_mask_overlay_jpeg(jpeg_bytes: &[u8], mask_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let preview = image::load_from_memory(jpeg_bytes)
+        .map_err(|e| format!("failed to decode preview jpeg: {e}"))?;
+    let mut rgb = preview.to_rgb8();
+    let (w, h) = rgb.dimensions();
+
+    let mask = image::load_from_memory(mask_bytes)
+        .map_err(|e| format!("failed to decode the mask image: {e}"))?
+        .to_luma8();
+    let mask = if mask.dimensions() == (w, h) {
+        mask
+    } else {
+        image::imageops::resize(&mask, w, h, image::imageops::FilterType::Triangle)
+    };
+
+    let threshold = (MASK_OVERLAY_THRESHOLD * 255.0).round() as u8;
+    for y in 0..h {
+        for x in 0..w {
+            let covered = mask.get_pixel(x, y).0[0] > threshold;
+            let pixel = rgb.get_pixel_mut(x, y);
+            for (channel, &tint) in pixel.0.iter_mut().zip(MASK_OVERLAY_COLOR.iter()) {
+                let src = *channel as f32;
+                *channel = if covered {
+                    (src * (1.0 - MASK_OVERLAY_ALPHA) + tint as f32 * MASK_OVERLAY_ALPHA).round()
+                        as u8
+                } else {
+                    (src * MASK_OVERLAY_DIM).round() as u8
+                };
+            }
+        }
+    }
+
+    encode_jpeg_q80(&rgb)
+}
+
 /// 相対パスを cwd 基準の絶対パスにし、`.` / `..` を字句的に畳む。
 /// 書き出し先はまだ存在しないことがあるので `canonicalize` は使えない。
 fn absolutize(path: &str) -> std::io::Result<PathBuf> {
@@ -1777,21 +2022,31 @@ mod tests {
 
     #[test]
     fn preview_key_is_deterministic_and_path_safe() {
-        let a = preview_key("rev_1", "abc", None);
-        assert_eq!(a, preview_key("rev_1", "abc", None));
-        assert_ne!(a, preview_key("rev_1", "abd", None));
+        let a = preview_key("rev_1", "abc", None, None);
+        assert_eq!(a, preview_key("rev_1", "abc", None, None));
+        assert_ne!(a, preview_key("rev_1", "abd", None, None));
         assert_eq!(a.len(), 32);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
     fn preview_key_differs_by_overlay() {
-        let base = preview_key("rev_1", "abc", None);
-        let grid = preview_key("rev_1", "abc", Some("grid"));
-        let thirds = preview_key("rev_1", "abc", Some("thirds"));
+        let base = preview_key("rev_1", "abc", None, None);
+        let grid = preview_key("rev_1", "abc", Some("grid"), None);
+        let thirds = preview_key("rev_1", "abc", Some("thirds"), None);
         assert_ne!(base, grid);
         assert_ne!(base, thirds);
         assert_ne!(grid, thirds);
+    }
+
+    /// 同じ (revision, recipe, overlay="mask") でもマスクが違えば別キーになること。
+    #[test]
+    fn preview_key_differs_by_mask_revision() {
+        let m1 = preview_key("rev_1", "abc", Some("mask"), Some("rev_m1"));
+        let m2 = preview_key("rev_1", "abc", Some("mask"), Some("rev_m2"));
+        let none = preview_key("rev_1", "abc", Some("mask"), None);
+        assert_ne!(m1, m2);
+        assert_ne!(m1, none);
     }
 
     #[test]

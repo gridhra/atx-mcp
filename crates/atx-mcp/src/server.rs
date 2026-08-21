@@ -13,11 +13,12 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 
+use crate::mask::GenerateMaskParams;
 use crate::tools::{
     ApplyTransformOutput, AtxTools, CompareRevisionsOutput, CompareRevisionsParams,
     DetectTiltOutput, DetectTiltParams, ExplainOperationOutput, ExplainOperationParams,
-    ExportAssetOutput, ExportAssetParams, ImportAssetParams, ImportOutput, InspectOutput,
-    ListAssetsOutput, ListAssetsParams, ListOperationsOutput, ListOperationsParams,
+    ExportAssetOutput, ExportAssetParams, GenerateMaskOutput, ImportAssetParams, ImportOutput,
+    InspectOutput, ListAssetsOutput, ListAssetsParams, ListOperationsOutput, ListOperationsParams,
     RenderPreviewOutput, RenderPreviewParams, RevisionParams, TransformParams,
 };
 
@@ -41,6 +42,7 @@ Example:
 ]}
 EXIF orientation is always normalized into the pixels at decode time, so auto_orient is an explicit no-op.
 LUT workflow: a .cube 3D LUT is an asset, not an image - import_asset the .cube file first, then reference the revision_id it returns from the recipe as {"op": "lut", "lut_revision_id": "rev_...", "strength": 1.0}.
+Mask workflow (local adjustments): a mask is a grayscale image revision (white = apply fully, black = leave alone) - create one with generate_mask (linear/radial gradient, luminosity range, color range) or import_asset your own, then attach it to any tone/filter operation as "mask": {"revision_id": "rev_...", "invert": false, "feather_px": 0}, and check the coverage with render_preview overlay="mask".
 
 Discovering the vocabulary (the ops are deliberately NOT enumerated in the tool schemas)
 - list_operations  - compact catalog of every operation (name, one-line summary, parameter names with type/range hints) plus the built-in preset names. Start here.
@@ -63,7 +65,7 @@ Use list_assets to review the ledger (lineage, recipes, sizes). All tool results
 
 Note on ICC: when a recipe's encode output format is png, webp, or avif, any ICC color profile on the source is dropped (embedding is only supported for jpeg output), and apply_transform/render_preview report this as a warning rather than failing.
 
-Visual verification: render_preview accepts an optional `overlay` ("grid" | "thirds" | "horizon") to draw composition guide lines on the returned preview; compare_revisions places two revisions side by side (or stacked) in one inline image so before/after or A/B differences can be checked without leaving the MCP."#;
+Visual verification: render_preview accepts an optional `overlay` ("grid" | "thirds" | "horizon", or "mask" with a mask_revision_id) to draw composition guide lines or a mask coverage tint on the returned preview; compare_revisions places two revisions side by side (or stacked) in one inline image so before/after or A/B differences can be checked without leaving the MCP."#;
 
 /// MCP サーバ本体。ワークスペース1つに対応する。
 #[derive(Clone)]
@@ -195,6 +197,34 @@ impl AtxServer {
         self.tools.explain_operation(&params)
     }
 
+    /// Generate a deterministic grayscale mask as a new PNG revision, with exactly the
+    /// dimensions of `reference_revision_id`. `kind` is "linear_gradient" (angle_degrees,
+    /// start, end), "radial_gradient" (center_x, center_y, radius, feather),
+    /// "luminosity_range" (min, max, feather) or "color_range" (hue_center, hue_width,
+    /// feather); the gradients use only the reference's dimensions, the other two compute
+    /// weights from its pixels. White = the masked operation applies fully, black = not at
+    /// all. Reference the returned revision_id from any tone/filter operation as
+    /// "mask": {"revision_id": "rev_...", "invert": false, "feather_px": 0}, or visualise it
+    /// with render_preview overlay="mask". Idempotent: the same params over the same
+    /// reference produce byte-identical PNG bytes and return the existing revision.
+    #[tool(
+        name = "generate_mask",
+        output_schema = schema_for_output::<GenerateMaskOutput>(),
+        annotations(
+            title = "Generate mask",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn generate_mask(
+        &self,
+        Parameters(params): Parameters<GenerateMaskParams>,
+    ) -> CallToolResult {
+        self.tools.generate_mask(&params)
+    }
+
     /// Apply a transform recipe at full resolution and issue a new revision.
     /// Pass either `recipe` ({"operations": [...]}, applied in order, at most one
     /// "encode" and it must be last) or `preset` (a built-in named recipe) - exactly
@@ -228,6 +258,9 @@ impl AtxServer {
     /// Takes either `recipe` or `preset`, exactly like apply_transform.
     /// Optional `overlay` ("grid" | "thirds" | "horizon") draws semi-transparent composition
     /// guide lines on the returned preview only (never on the apply_transform output).
+    /// overlay="mask" instead visualises a mask: pass `mask_revision_id` (required for this
+    /// overlay and rejected for the others) and the preview is tinted red where the mask
+    /// weight exceeds 0.5 and dimmed elsewhere, so the coverage can be eyeballed.
     /// Note: if the recipe's encode format is png, webp, or avif, any ICC color profile
     /// on the source is dropped (embedding is only supported for jpeg output); this is
     /// reported as a warning, not an error.

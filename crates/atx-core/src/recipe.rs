@@ -79,6 +79,8 @@ pub enum Operation {
         saturation: f64,
         #[serde(default)]
         sharpness: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mask: Option<MaskRef>,
     },
     /// 遠近(台形/キーストーン)補正。`quad` または `vertical_degrees`/`horizontal_degrees`
     /// のどちらか一方の形式で指定する(排他)。射影変換のため、これ以降
@@ -103,6 +105,8 @@ pub enum Operation {
     ColorMatrix {
         /// 長さ 20(4行 × 5列)。
         matrix: Vec<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mask: Option<MaskRef>,
     },
     /// チャンネル別トーンカーブ。制御点 [x, y](0-255)列を単調3次補間し 256 LUT 化。
     /// master は RGB 共通(適用順: master → 各チャンネル)。
@@ -115,6 +119,8 @@ pub enum Operation {
         green: Option<Vec<[u8; 2]>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         blue: Option<Vec<[u8; 2]>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mask: Option<MaskRef>,
     },
     /// レベル補正(master のみ)。内部的には curves 相当の 256 LUT に落ちる。
     Levels {
@@ -129,11 +135,21 @@ pub enum Operation {
         out_black: u8,
         #[serde(default = "default_255")]
         out_white: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mask: Option<MaskRef>,
     },
     /// ガウスぼかし。sigma は 0.1..=100.0。
-    Blur { sigma: f64 },
+    Blur {
+        sigma: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mask: Option<MaskRef>,
+    },
     /// メディアンフィルタ。radius は 1..=16。
-    Median { radius: u32 },
+    Median {
+        radius: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mask: Option<MaskRef>,
+    },
     /// アンシャープマスク。amount 0.0..=4.0、radius(gaussian σ)0.1..=50.0、
     /// threshold は輝度差がこの値以下の画素を保護。
     UnsharpMask {
@@ -141,6 +157,8 @@ pub enum Operation {
         radius: f64,
         #[serde(default)]
         threshold: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mask: Option<MaskRef>,
     },
     /// 3D LUT(.cube)適用。LUT はワークスペースへ import 済みの revision を参照する。
     /// revision は不変なので、参照 id をハッシュに含めるだけで決定論が保たれる。
@@ -151,6 +169,8 @@ pub enum Operation {
         /// 適用強度 0.0..=1.0(元画像との線形ブレンド)。既定 1.0。
         #[serde(default = "default_one")]
         strength: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mask: Option<MaskRef>,
     },
     /// ホワイトバランス。temperature: 正=暖色へ / 負=寒色へ(-100..=100)、
     /// tint: 正=マゼンタへ / 負=グリーンへ(-100..=100)。0 = 変更なし。
@@ -159,6 +179,8 @@ pub enum Operation {
         temperature: f64,
         #[serde(default)]
         tint: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mask: Option<MaskRef>,
     },
     /// 色相域別 HSL 調整(Lightroom HSL パネル相当)。8 色相域それぞれに
     /// hue(-100..=100、隣接色相方向へのシフト)/ saturation / luminance(-100..=100)。
@@ -180,6 +202,8 @@ pub enum Operation {
         purple: Option<HslShift>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         magenta: Option<HslShift>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mask: Option<MaskRef>,
     },
     /// 任意カーネル畳み込み。kernel は size×size(行優先)、size は 3/5/7/9。
     /// 出力 = (Σ kernel_i * px_i) / divisor + offset。端はクランプ。RGB のみ(A は不変)。
@@ -190,6 +214,8 @@ pub enum Operation {
         divisor: f64,
         #[serde(default)]
         offset: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mask: Option<MaskRef>,
     },
     /// 出力エンコード指定。レシピ内で最後に1回のみ許可。省略時は入力フォーマット維持。
     Encode {
@@ -219,6 +245,30 @@ pub enum Operation {
     },
 }
 
+/// 局所適用マスクの参照(v0.5)。
+///
+/// マスクはワークスペースへ import 済みの **画像 revision**(任意フォーマット)を参照する。
+/// revision は不変なので、参照 id をハッシュに含めるだけで決定論が保たれる
+/// (`lut` の参照と同じ設計。DESIGN.md §9.4 / §9.6)。
+///
+/// 重みは「マスク画像の **sRGB 符号値上の BT.709 輝度**」で、白 = 1.0(op を全量適用)、
+/// 黒 = 0.0(op を適用しない)。マスクは**光ではなく被覆率**なので、線形光へ
+/// 戻さず符号値のまま輝度を取る(§9.6)。マスクのアルファは無視する。
+///
+/// マスク画像の寸法が現在の画像と違う場合は、双線形補間で現在の寸法へ合わせる。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MaskRef {
+    /// マスク画像アセットの revision id("rev_...")。
+    pub revision_id: String,
+    /// true なら重みを反転する(w = 1 - w)。リサイズ後・フェザ前に適用。
+    #[serde(default)]
+    pub invert: bool,
+    /// 境界のフェザ量。0 = なし。0.0..=200.0(ガウスぼかしの σ [px]、現在の画像座標)。
+    #[serde(default)]
+    pub feather_px: f64,
+}
+
 /// 色相域ごとの HSL シフト量。各値 -100..=100(0 = 変更なし)。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -229,6 +279,37 @@ pub struct HslShift {
     pub saturation: f64,
     #[serde(default)]
     pub luminance: f64,
+}
+
+impl Operation {
+    /// この op に付いた局所適用マスク(あれば)。
+    ///
+    /// マスクを持てるのは**調整系 11 op のみ**(adjust / color_matrix / curves / levels /
+    /// hsl / lut / white_balance / blur / median / unsharp_mask / convolve)。
+    /// 幾何 op(resize / rotate / crop / perspective)は「一部だけリサイズ」に
+    /// 意味が無いため対象外、encode / strip_metadata / auto_orient も同様。
+    pub fn mask(&self) -> Option<&MaskRef> {
+        match self {
+            Operation::Adjust { mask, .. }
+            | Operation::ColorMatrix { mask, .. }
+            | Operation::Curves { mask, .. }
+            | Operation::Levels { mask, .. }
+            | Operation::Hsl { mask, .. }
+            | Operation::Lut { mask, .. }
+            | Operation::WhiteBalance { mask, .. }
+            | Operation::Blur { mask, .. }
+            | Operation::Median { mask, .. }
+            | Operation::UnsharpMask { mask, .. }
+            | Operation::Convolve { mask, .. } => mask.as_ref(),
+            Operation::AutoOrient
+            | Operation::Rotate { .. }
+            | Operation::Crop { .. }
+            | Operation::Resize { .. }
+            | Operation::Perspective { .. }
+            | Operation::Encode { .. }
+            | Operation::StripMetadata { .. } => None,
+        }
+    }
 }
 
 fn default_one() -> f64 {
@@ -456,6 +537,10 @@ pub fn validate(recipe: &TransformRecipe) -> crate::Result<()> {
     let last_index = recipe.operations.len() - 1;
 
     for (index, op) in recipe.operations.iter().enumerate() {
+        // 局所適用マスクは op 種別に依らず同じ静的制約なので、まとめて検証する。
+        if let Some(mask) = op.mask() {
+            crate::ops::mask::validate(index, mask)?;
+        }
         match op {
             Operation::AutoOrient | Operation::StripMetadata { .. } => {}
             // v0.2 で追加された op の静的検証は各実装モジュールに委譲する。
@@ -471,12 +556,15 @@ pub fn validate(recipe: &TransformRecipe) -> crate::Result<()> {
                 horizontal_degrees,
                 pad_color,
             )?,
-            Operation::ColorMatrix { matrix } => crate::ops::color::validate_matrix(index, matrix)?,
+            Operation::ColorMatrix { matrix, .. } => {
+                crate::ops::color::validate_matrix(index, matrix)?
+            }
             Operation::Curves {
                 master,
                 red,
                 green,
                 blue,
+                ..
             } => crate::ops::color::validate_curves(index, master, red, green, blue)?,
             Operation::Levels {
                 in_black,
@@ -484,16 +572,18 @@ pub fn validate(recipe: &TransformRecipe) -> crate::Result<()> {
                 gamma,
                 out_black,
                 out_white,
+                ..
             } => crate::ops::color::validate_levels(
                 index, *in_black, *in_white, *gamma, *out_black, *out_white,
             )?,
             Operation::Lut {
                 lut_revision_id,
                 strength,
+                ..
             } => crate::ops::lut::validate(index, lut_revision_id, *strength)?,
-            Operation::WhiteBalance { temperature, tint } => {
-                crate::ops::wb::validate(index, *temperature, *tint)?
-            }
+            Operation::WhiteBalance {
+                temperature, tint, ..
+            } => crate::ops::wb::validate(index, *temperature, *tint)?,
             Operation::Hsl {
                 red,
                 orange,
@@ -503,6 +593,7 @@ pub fn validate(recipe: &TransformRecipe) -> crate::Result<()> {
                 blue,
                 purple,
                 magenta,
+                ..
             } => crate::ops::hsl::validate(
                 index,
                 &[red, orange, yellow, green, aqua, blue, purple, magenta],
@@ -512,13 +603,15 @@ pub fn validate(recipe: &TransformRecipe) -> crate::Result<()> {
                 size,
                 divisor,
                 offset,
+                ..
             } => crate::ops::convolve::validate(index, kernel, *size, *divisor, *offset)?,
-            Operation::Blur { sigma } => crate::ops::blur::validate_blur(index, *sigma)?,
-            Operation::Median { radius } => crate::ops::blur::validate_median(index, *radius)?,
+            Operation::Blur { sigma, .. } => crate::ops::blur::validate_blur(index, *sigma)?,
+            Operation::Median { radius, .. } => crate::ops::blur::validate_median(index, *radius)?,
             Operation::UnsharpMask {
                 amount,
                 radius,
                 threshold,
+                ..
             } => crate::ops::blur::validate_unsharp(index, *amount, *radius, *threshold)?,
             Operation::Rotate { angle_degrees, .. } => {
                 if !angle_degrees.is_finite() || !(-360.0..=360.0).contains(angle_degrees) {
@@ -583,6 +676,7 @@ pub fn validate(recipe: &TransformRecipe) -> crate::Result<()> {
                 contrast,
                 saturation,
                 sharpness,
+                ..
             } => {
                 for (name, v) in [
                     ("brightness", brightness),

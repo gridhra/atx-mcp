@@ -4,6 +4,7 @@
 //! 統合テストからトランスポート抜きで直接叩ける。
 //! rmcp のツール定義(`#[tool]` / `#[tool_router]` / `#[tool_handler]`)は [`server`]。
 
+pub mod mask;
 pub mod presets;
 pub mod server;
 pub mod tools;

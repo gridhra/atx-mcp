@@ -498,7 +498,7 @@ fn validate_rejects_non_finite_matrix_value() {
     let mut matrix = vec![0.0f64; 20];
     matrix[0] = f64::NAN;
     let r = TransformRecipe {
-        operations: vec![atx_core::Operation::ColorMatrix { matrix }],
+        operations: vec![atx_core::Operation::ColorMatrix { matrix, mask: None }],
     };
     let err = apply_recipe(&encode_png(&probe_image()), &r, &Limits::default())
         .expect_err("NaN matrix must be rejected");

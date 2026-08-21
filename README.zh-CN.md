@@ -80,7 +80,7 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 
 `--workspace`(环境变量:`ATX_WORKSPACE`)是资产存储所在的目录,若不存在会自动创建。
 
-## 工具(10 个)
+## 工具(11 个)
 
 | 工具 | 作用 |
 |---|---|
@@ -89,7 +89,8 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 | `import_asset` | 将本地图片导入工作区(基于 sha256,幂等) |
 | `inspect_image` | 检查尺寸、EXIF、ICC 配置文件、是否含 GPS 信息等(只读) |
 | `detect_tilt` | 通过 Canny+Hough(粗定位)加投影轮廓法(精细化到 0.1° 以内)估算倾斜角度,同时返回水平/垂直族的估计值及其评分曲线。置信度低时返回"不进行校正"(只读) |
-| `render_preview` | 以低分辨率(长边 ≤768)应用配方(或 `preset` 预设)并以内联图像返回。可通过 `overlay:"grid"\|"thirds"\|"horizon"` 叠加构图参考线(仅绘制在预览图上,不影响实际变换) |
+| `generate_mask` | 确定性地生成灰度蒙版(`linear_gradient` / `radial_gradient` / `luminosity_range` / `color_range`),存为与参考图像同尺寸的 PNG 修订版本,供操作的 `mask` 字段引用(幂等) |
+| `render_preview` | 以低分辨率(长边 ≤768)应用配方(或 `preset` 预设)并以内联图像返回。可通过 `overlay:"grid"\|"thirds"\|"horizon"` 叠加构图参考线,或通过 `overlay:"mask"`(配合 `mask_revision_id`)叠加蒙版覆盖范围(仅绘制在预览图上,不影响实际变换) |
 | `apply_transform` | 以完整分辨率应用配方(或 `preset` 预设)并生成新的修订版本(同一配方 → 同一修订版本) |
 | `compare_revisions` | 将两个修订版本缩放到长边 ≤640,通过 `layout:"side_by_side"\|"stacked"` 拼接为一张内联图像返回(用于 A/B 或前后对比的可视化) |
 | `list_assets` | 查阅修订版本台账(只读) |
@@ -131,6 +132,40 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 计入 `recipe_hash` 即可保持完全确定性;但这也意味着该配方只能在持有该 LUT 的
 工作区内复现,跨机器搬运风格时请连同 `.cube` 一起搬。引用不存在的 id 会在任何
 像素处理开始之前以结构化错误返回。
+
+### 蒙版(局部调整)
+
+蒙版是一个**灰度图像修订版本**:其 BT.709 亮度即权重,白色表示该操作全量生效,
+黑色表示该像素保持不变。11 个色调/滤镜类操作(`adjust` / `color_matrix` /
+`curves` / `levels` / `hsl` / `lut` / `white_balance` / `blur` / `median` /
+`unsharp_mask` / `convolve`)都可以接受蒙版。
+
+1. `generate_mask` 会基于参考图像确定性地生成一张**尺寸完全一致**的蒙版:
+
+| `kind` | 参数 | 选中的区域 |
+|---|---|---|
+| `linear_gradient` | `angle_degrees`(0 = 顶部为白并向下渐隐,正值为顺时针)、`start` / `end`(权重由 1 降到 0 的轴向位置,0..1) | 渐变滤镜(天空、前景) |
+| `radial_gradient` | `center_x` / `center_y`(0..1 相对位置)、`radius`(相对半对角线,0..1)、`feather`(0..1 的额外衰减带) | 暗角或主体聚光 |
+| `luminosity_range` | `min` / `max`(0..255)、`feather`(区间之外的柔化过渡,亮度单位) | 高光、中间调或阴影 |
+| `color_range` | `hue_center`(0..360)、`hue_width`(单侧宽度 1..180)、`feather`(额外角度) | 某一色相族(天空蓝、植被绿) |
+
+   也可以用 `import_asset` 导入你自己的灰度图像。
+
+2. 把返回的 `revision_id` 挂到操作上:
+
+```json
+{ "op": "curves", "master": [[0,0],[128,168],[255,255]],
+  "mask": { "revision_id": "rev_...", "invert": false, "feather_px": 8.0 } }
+```
+
+   `invert`(默认 `false`)将权重翻转为 `1-w`;`feather_px`(默认 `0.0`)按当前图像
+   坐标下的高斯 σ(像素)羽化蒙版边缘。
+
+3. 给 `render_preview` 传入 `overlay:"mask"` 和 `mask_revision_id`,预览图会在权重
+   超过 0.5 的区域染红、其余区域略微压暗,便于在正式应用前目视确认覆盖范围。
+
+蒙版与 LUT 采用同一套引用机制,注意事项也相同:被引用的 id 计入 `recipe_hash`,
+该配方只能在持有该蒙版的工作区内复现。
 
 ## 预设
 

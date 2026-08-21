@@ -5,6 +5,7 @@
 //! - `color`: color_matrix / curves / levels(トーン・カラー系メタ op)
 //! - `blur`: blur / median / unsharp_mask(カーネル系)
 //! - `convolve` / `hsl` / `lut` / `wb`
+//! - `mask`: 局所適用マスク(重み平面の解決とブレンド。v0.5、DESIGN.md §9.6)
 //!
 //! # 画素エンジン v2: op ごとの作業空間(v0.4 の中核設計)
 //!
@@ -46,5 +47,6 @@ pub mod color;
 pub mod convolve;
 pub mod hsl;
 pub mod lut;
+pub mod mask;
 pub mod perspective;
 pub mod wb;

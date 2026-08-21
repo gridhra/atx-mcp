@@ -235,12 +235,30 @@ pub fn apply_recipe_with_assets(
 
     // --- op を順次適用 ---
     let mut strip: Option<StripScope> = None;
+    // 1 回の apply_recipe 内でのマスク解決キャッシュ(同じ MaskRef + 同じ寸法は 1 回だけ)。
+    let mut masks = crate::ops::mask::MaskCache::new();
     for (index, op) in recipe.operations.iter().enumerate() {
         let fail = |message: String| AtxError::Operation {
             index,
             op: op_name(op).to_string(),
             message,
         };
+
+        // --- 局所適用マスク(v0.5): op ループ 1 箇所だけの汎用処理 ---
+        //
+        // マスクが付いていれば、**その op の作業空間へ先に移してから**適用前の状態を
+        // 退避しておく(空間変換を挟んだ後の値どうしを混ぜないと意味が変わる)。
+        // op 本体の `ensure_space` はここで既に目的の空間なので no-op になる。
+        let masked = op.mask().cloned();
+        let before = if masked.is_some() {
+            if let Some(want) = op_space(op) {
+                ensure_space(&mut img, &mut space, want);
+            }
+            Some(img.clone())
+        } else {
+            None
+        };
+
         match op {
             // Orientation はデコード直後に正規化済みのため、ここでは何もしない。
             Operation::AutoOrient => {}
@@ -348,6 +366,7 @@ pub fn apply_recipe_with_assets(
                 contrast,
                 saturation,
                 sharpness,
+                ..
             } => {
                 ensure_space(&mut img, &mut space, Space::Srgb);
                 img = pixel_ops::adjust(&img, *brightness, *contrast, *saturation, *sharpness);
@@ -377,7 +396,7 @@ pub fn apply_recipe_with_assets(
                         .map(|w| format!("operations[{index}] (perspective): {w}")),
                 );
             }
-            Operation::ColorMatrix { matrix } => {
+            Operation::ColorMatrix { matrix, .. } => {
                 ensure_space(&mut img, &mut space, Space::Srgb);
                 img = crate::ops::color::color_matrix(&img, matrix);
             }
@@ -386,6 +405,7 @@ pub fn apply_recipe_with_assets(
                 red,
                 green,
                 blue,
+                ..
             } => {
                 ensure_space(&mut img, &mut space, Space::Srgb);
                 img = crate::ops::color::curves(&img, master, red, green, blue);
@@ -396,17 +416,18 @@ pub fn apply_recipe_with_assets(
                 gamma,
                 out_black,
                 out_white,
+                ..
             } => {
                 ensure_space(&mut img, &mut space, Space::Srgb);
                 img = crate::ops::color::levels(
                     &img, *in_black, *in_white, *gamma, *out_black, *out_white,
                 );
             }
-            Operation::Blur { sigma } => {
+            Operation::Blur { sigma, .. } => {
                 ensure_space(&mut img, &mut space, Space::Linear);
                 img = crate::ops::blur::gaussian_blur(&img, *sigma);
             }
-            Operation::Median { radius } => {
+            Operation::Median { radius, .. } => {
                 ensure_space(&mut img, &mut space, Space::Linear);
                 img = crate::ops::blur::median(&img, *radius);
             }
@@ -414,6 +435,7 @@ pub fn apply_recipe_with_assets(
                 amount,
                 radius,
                 threshold,
+                ..
             } => {
                 ensure_space(&mut img, &mut space, Space::Linear);
                 img = crate::ops::blur::unsharp_mask(&img, *amount, *radius, *threshold);
@@ -421,6 +443,7 @@ pub fn apply_recipe_with_assets(
             Operation::Lut {
                 lut_revision_id,
                 strength,
+                ..
             } => {
                 let lut_bytes = assets
                     .read_revision(lut_revision_id)
@@ -432,7 +455,9 @@ pub fn apply_recipe_with_assets(
                 ensure_space(&mut img, &mut space, Space::Srgb);
                 img = crate::ops::lut::apply(&img, &lut, *strength);
             }
-            Operation::WhiteBalance { temperature, tint } => {
+            Operation::WhiteBalance {
+                temperature, tint, ..
+            } => {
                 ensure_space(&mut img, &mut space, Space::Linear);
                 img = crate::ops::wb::apply(&img, *temperature, *tint);
             }
@@ -445,6 +470,7 @@ pub fn apply_recipe_with_assets(
                 blue,
                 purple,
                 magenta,
+                ..
             } => {
                 let bands = [
                     *red, *orange, *yellow, *green, *aqua, *blue, *purple, *magenta,
@@ -457,6 +483,7 @@ pub fn apply_recipe_with_assets(
                 size,
                 divisor,
                 offset,
+                ..
             } => {
                 ensure_space(&mut img, &mut space, Space::Linear);
                 img = crate::ops::convolve::apply(&img, kernel, *size, *divisor, *offset);
@@ -466,6 +493,20 @@ pub fn apply_recipe_with_assets(
             }
             // エンコード指定は最後にまとめて処理する(validate により最後の op であることが保証される)。
             Operation::Encode { .. } => {}
+        }
+
+        // --- マスクブレンド(現在の作業空間、RGBA 4 チャンネル) ---
+        if let (Some(mask), Some(before)) = (masked, before) {
+            let (w, h) = img.dimensions();
+            if before.dimensions() != (w, h) {
+                return Err(fail(
+                    "mask is only supported for ops that preserve the image dimensions".to_string(),
+                ));
+            }
+            let weights = masks
+                .resolve(&mask, w, h, assets)
+                .map_err(|e| fail(e.to_string()))?;
+            img = crate::ops::mask::blend(&before, &img, weights);
         }
     }
 

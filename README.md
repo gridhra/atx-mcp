@@ -85,7 +85,7 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 `--workspace` (env: `ATX_WORKSPACE`) is the directory used as the asset store.
 It is created automatically if it doesn't exist.
 
-## Tools (10)
+## Tools (11)
 
 | Tool | Role |
 |---|---|
@@ -94,7 +94,8 @@ It is created automatically if it doesn't exist.
 | `import_asset` | Import a local image into the workspace (sha256-idempotent) |
 | `inspect_image` | Inspect dimensions, EXIF, ICC profile, presence of GPS data, etc. (read-only) |
 | `detect_tilt` | Estimate tilt angle via Canny+Hough (coarse) plus a projection profile (sub-0.1° refinement). Also returns horizontal/vertical family estimates and their score curves. Returns "do not correct" when confidence is low (read-only) |
-| `render_preview` | Apply a recipe (or a `preset`) at low resolution (long edge ≤768) and return it as an inline image. `overlay:"grid"\|"thirds"\|"horizon"` overlays composition guide lines (drawn on the preview only; it has no effect on the actual transform) |
+| `generate_mask` | Generate a deterministic grayscale mask (`linear_gradient` / `radial_gradient` / `luminosity_range` / `color_range`) as a PNG revision with the same dimensions as the reference image, to be referenced from an operation's `mask` field (idempotent) |
+| `render_preview` | Apply a recipe (or a `preset`) at low resolution (long edge ≤768) and return it as an inline image. `overlay:"grid"\|"thirds"\|"horizon"` overlays composition guide lines, and `overlay:"mask"` (with `mask_revision_id`) tints the coverage of a mask (drawn on the preview only; it has no effect on the actual transform) |
 | `apply_transform` | Apply a recipe (or a `preset`) at full resolution and produce a new revision (the same recipe always yields the same revision) |
 | `compare_revisions` | Downscale two revisions to long edge ≤640 and return them composited into a single inline image, arranged via `layout:"side_by_side"\|"stacked"` (for A/B and before/after visual comparison) |
 | `list_assets` | Read the revision ledger (read-only) |
@@ -142,6 +143,45 @@ the transform fully deterministic — but it also means the recipe is only
 reproducible inside a workspace that holds that LUT, so move the `.cube`
 alongside the recipe when you move a look between machines. Referencing an
 unknown id fails with a structured error before any pixel work happens.
+
+### Masks (local adjustments)
+
+A mask is a *grayscale image revision*: its BT.709 luma is the weight, so white
+means "apply this operation at full strength" and black means "leave the pixel
+alone". Any of the 11 tone/filter ops (`adjust`, `color_matrix`, `curves`,
+`levels`, `hsl`, `lut`, `white_balance`, `blur`, `median`, `unsharp_mask`,
+`convolve`) accepts one.
+
+1. `generate_mask` builds one deterministically against a reference image, with
+   exactly that image's dimensions:
+
+| `kind` | Parameters | What it selects |
+|---|---|---|
+| `linear_gradient` | `angle_degrees` (0 = white at the top fading down, positive = clockwise), `start`, `end` (0..1 positions along the axis where the weight goes 1→0) | A graduated filter (skies, foregrounds) |
+| `radial_gradient` | `center_x`, `center_y` (0..1 relative), `radius` (0..1 of the half-diagonal), `feather` (0..1 extra falloff band) | A vignette or a subject spotlight |
+| `luminosity_range` | `min`, `max` (0..255), `feather` (luma units of soft shoulder outside the range) | Highlights, midtones or shadows |
+| `color_range` | `hue_center` (0..360), `hue_width` (1..180 half-width), `feather` (extra degrees) | One hue family (sky blue, foliage green) |
+
+   You can also `import_asset` your own grayscale image instead.
+
+2. Attach the returned `revision_id` to an operation:
+
+```json
+{ "op": "curves", "master": [[0,0],[128,168],[255,255]],
+  "mask": { "revision_id": "rev_...", "invert": false, "feather_px": 8.0 } }
+```
+
+   `invert` (default `false`) flips the weight to `1-w`; `feather_px` (default
+   `0.0`) blurs the mask edge by that gaussian sigma in pixels of the current
+   image.
+
+3. `render_preview` with `overlay:"mask"` and `mask_revision_id` tints the
+   preview red where the weight exceeds 0.5 and dims it elsewhere, so the
+   coverage can be checked before committing.
+
+Masks are referenced by revision id exactly like LUTs, so the same caveat
+applies: the recipe hash includes the id, and the recipe only reproduces inside
+a workspace that holds that mask.
 
 ## Presets
 

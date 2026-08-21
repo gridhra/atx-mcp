@@ -364,6 +364,7 @@ fn convolve_rejects_non_finite_kernel_value() {
             size: 3,
             divisor: 1.0,
             offset: 0.0,
+            mask: None,
         }],
     };
     let msg = atx_core::recipe::validate(&recipe).unwrap_err().to_string();
