@@ -167,6 +167,44 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 蒙版与 LUT 采用同一套引用机制,注意事项也相同:被引用的 id 计入 `recipe_hash`,
 该配方只能在持有该蒙版的工作区内复现。
 
+### 图层
+
+配方可以携带 `layers` 图层栈,取代(或搭配)线性的 `operations` 列表。图层
+自下而上合成,每个图层的 `ops` 先作用于自己的来源图像,再把结果混合到当前的
+合成结果上:
+
+```json
+{
+  "layers": [
+    { "source": "base", "ops": [] },
+    {
+      "source": { "revision_id": "rev_..." },
+      "ops": [{ "op": "blur", "sigma": 8 }],
+      "blend_mode": "multiply",
+      "opacity": 0.6
+    }
+  ],
+  "operations": [
+    { "op": "resize", "width": 1600 },
+    { "op": "encode", "format": "webp", "quality": 82 }
+  ]
+}
+```
+
+- `source` 是 `"base"`(传给 `apply_transform` / `render_preview` 的输入
+  修订版本)或 `{"revision_id": "rev_..."}`(工作区内的任意其他修订版本)。
+  每个图层来源的尺寸都必须与 base 图像完全一致,否则会在任何像素处理开始之前
+  返回结构化错误。
+- `ops` 是普通的操作列表,只作用于该图层自己的来源。
+- `mask`、`blend_mode`(默认 `"normal"`)与 `opacity`(默认 `1.0`)决定该图层
+  如何混合到下方的图层上。
+- 混合模式为 W3C 的 12 种 separable 模式之一:`normal` / `multiply` /
+  `screen` / `overlay` / `darken` / `lighten` / `color_dodge` / `color_burn` /
+  `hard_light` / `soft_light` / `difference` / `exclusion`。
+- 存在 `layers` 时,顶层的 `operations` 就成为对合成结果的**收尾流程**——
+  `resize` 与最终的 `encode` 都放在这里(`encode` 仍须最后出现且至多一次)。
+- 调用 `explain_operation {"operation":"layers"}` 可获取完整参考。
+
 ## 预设
 
 `apply_transform` 与 `render_preview` 接受 `recipe`(原始 DSL)或

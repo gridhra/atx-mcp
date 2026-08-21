@@ -505,3 +505,173 @@ ROADMAP の Phase C 前半。調整系 op に `mask` を付けると、その op
   未知 revision / デコード不能マスクが revision id を含む実行時エラーになる
 - ゴールデン: フィクスチャ + テスト内生成の放射グラデーションマスク +
   feather 5px + curves + jpeg85(マスク画像自身の sha256 も同時にピン留め)
+
+### 9.7 v0.6 追補(2026-08-21): レイヤーグラフ前半(core 側)
+
+ROADMAP の Phase D 前半。レシピに `layers` を書くと、複数のソース画像を
+**W3C の separable ブレンド 12 種**で合成し、その結果に従来どおりの
+`operations` を仕上げパスとして掛けられるようになる。実装は
+`crates/atx-core/src/ops/blend.rs`(式)と `engine.rs`(合成ループ + op ループの共通化)。
+
+#### レシピ DSL v2 の形(atx-mcp との契約)
+
+```jsonc
+{
+  "layers": [
+    {"source": "base", "ops": [{"op": "resize", "width": 320, "fit": "contain"}]},
+    {"source": {"revision_id": "rev_glow"},
+     "mask": {"revision_id": "rev_mask", "feather_px": 3.0},
+     "blend_mode": "screen", "opacity": 0.75},
+    {"source": {"revision_id": "rev_edge"},
+     "ops": [{"op": "blur", "sigma": 2.0}],
+     "blend_mode": "multiply", "opacity": 0.4}
+  ],
+  "operations": [
+    {"op": "adjust", "brightness": 0.02, "contrast": 0.03},
+    {"op": "encode", "format": "jpeg", "quality": 85}
+  ]
+}
+```
+
+正規化 JSON(キー辞書順・デフォルト明示)は次の形になる:
+
+```json
+{"layers":[{"blend_mode":"normal","opacity":1.0,"ops":[],"source":"base"},
+{"blend_mode":"multiply","mask":{"feather_px":4.0,"invert":false,"revision_id":"rev_m1"},
+"opacity":0.5,"ops":[{"op":"blur","sigma":2.0}],"source":{"revision_id":"rev_tex1"}}],
+"operations":[{"format":"png","op":"encode"}]}
+```
+
+- `layers: Option<Vec<Layer>>` は
+  `#[serde(default, skip_serializing_if = "Option::is_none")]`。
+  **`layers` を書かない v1 レシピの canonical JSON はバイト単位で従来と一致し、
+  `recipe_hash` は不変**(§9.1-8 の `coordinate_space`、§9.5-18 の `bit_depth`、
+  §9.6 の `mask` と同じ手口)。ピン留めゴールデン `884ea169…` は据え置きで green。
+  ROADMAP は「ハッシュは世代分離」と書いていたが、**世代を分ける必要が無かった**:
+  v1 レシピの正規化表現が 1 ビットも動かないので、既存の冪等キーがそのまま使える
+  (`recipe_version` フィールドも追加していない。JSON の形そのものが世代を表す)
+- `Layer { source, ops = [], mask = null, blend_mode = "normal", opacity = 1.0 }`
+  (`deny_unknown_fields`)
+- **`source` は untagged enum**: `"base"`(入力画像)か
+  `{"revision_id": "rev_..."}`(ワークスペースの別 revision)。
+  2 形が JSON の型レベル(文字列 / オブジェクト)で排他なので曖昧さが無く、
+  `{"kind": "base"}` のようなラッパを増やさずに済み(トークン規律)、
+  JSON Schema でも `anyOf` として表現でき、キー順の揺れが無いので canonical も安定。
+  serde の untagged ユニットバリアントは `null` としか往復しないため、
+  `base` は 1 バリアントだけの文字列 enum `BaseKeyword` を包んで表現している
+- **`blend_mode`** は snake_case の 12 種:
+  `normal`(既定)/ `multiply` / `screen` / `overlay` / `darken` / `lighten` /
+  `color_dodge` / `color_burn` / `hard_light` / `soft_light` / `difference` / `exclusion`。
+  非 separable 系(hue / saturation / color / luminosity)は v0.7
+
+#### validate(静的制約)
+
+- `layers` が `Some` なら空であってはならない
+- **先頭レイヤーは backdrop**: 下に合成相手が居ないので
+  `blend_mode: normal` / `opacity: 1.0` / `mask` 無しでなければならない
+  (エラー文がその理由を説明する)
+- レイヤー `ops` に `encode` / `strip_metadata` は書けない
+  (**仕上げパス専用 op**。エラーはレイヤー番号と op 番号の両方を名指しする)。
+  それ以外の op のバリデーションはトップレベルと同じ関数を共有し、
+  メッセージに `layers[i].ops:` を前置する
+- `opacity` は有限かつ 0.0..=1.0、`source` の `revision_id` は `"rev_"` 始まり
+- **トップレベル `operations` は layers があるときに限り空でよい**
+  (従来は空 = エラー。今回そのケースだけ緩めた)。encode は末尾 1 回までなど
+  他の規則は従来どおりで、掛かる対象が合成結果になるだけ
+
+#### 合成空間の判断: **sRGB 符号値**(線形光ではない)
+
+v0.4 で「画素を混ぜる処理は線形光で」と決めた(§9.5)のに対し、
+**レイヤー合成は sRGB 符号値空間で行う**。理由:
+
+- ブレンド関数は「Cb / Cs が 0..1 の符号値」である前提で定義されている。
+  `multiply` で中間グレー同士が中間より暗くなること、`screen` の対称性、
+  `soft_light` の `D(Cb)` の分岐点 0.25 — いずれも符号値上の慣習。
+  線形光で同じ式を適用すると Photoshop / CSS / Figma と見た目が一致しない
+- 「合成は結果が一致することに意味がある」語彙なので、物理的正しさより
+  **既存ツールとの一致**を採る(`.cube` LUT を符号値で引く §9.5-14、
+  マスクの輝度を符号値で取る §9.6 と同じ判断軸)
+- したがって `layers` があるときは**入力もレイヤーソースも sRGB 符号値でデコード**する。
+  u8 → sRGB f32 は伝達関数を通さない厳密な `/255` なので情報は落ちない。
+  レイヤー内の `ops` は従来どおり自分の作業空間へ遅延で移り、
+  合成直前に sRGB 符号値へ戻る
+
+#### 合成式(W3C conformance)
+
+ストレートアルファのまま [compositing-1](https://www.w3.org/TR/compositing-1/) の式をそのまま書く:
+
+```text
+αs = レイヤーのアルファ × opacity × マスク重み
+αo = αs + αb × (1 − αs)
+Co = ( αs × (1 − αb) × Cs + αs × αb × B(Cb, Cs) + (1 − αs) × αb × Cb ) / αo
+```
+
+- `αo == 0` は RGBA すべて 0(仕様上 Co は未定義)
+- 固定順序の f32、FMA 禁止(§ops/mod.rs の決定論規約)。
+  `soft_light` の `sqrt` だけは **IEEE-754 で厳密に丸められる**演算なので
+  画素ループ内で呼んでよい(libm 依存の exp / pow とは扱いが違う)
+- **端点は式ではなく分岐で確定させる**(§9.6 のマスクブレンドと同じ理由):
+  `αs == 0` なら backdrop をそのまま残す。`(αb × Cb) / αb` は f32 で `Cb` に
+  戻らないことがあり、式のままでは「opacity 0 = 恒等」がバイト同一にならない。
+  一方 `αs == 1 かつ αb == 1` は式のままで厳密に `B(Cb, Cs)` になるので分岐不要
+- ブレンド関数の入力は 0..1 へクランプしてから渡す
+  (`color_burn` の除算や `soft_light` の sqrt が定義域外の値で NaN を出さないため)
+
+**W3C 準拠の担保は表駆動のユニットテスト**(`src/ops/blend.rs`)。
+12 モードそれぞれについて `(Cb, Cs) → 期待 B` を**仕様本文から手で導いて**表に置き、
+各行に代入式をコメントで残している(実装を読み直して作った表ではないことが
+レビューで確認できる)。0 / 1 / 0.5 の端点、`color_dodge` / `color_burn` の
+0 除算分岐(分岐順は仕様どおり Cb が先)、`hard_light` の 0.5 境界、
+`soft_light` の `Cb <= 0.25` 多項式ブランチと sqrt ブランチの境界を含む
+55 行。許容差 1e-6。
+
+#### 寸法ルール
+
+合成後のレイヤーは backdrop(先頭レイヤーの ops 適用後)と**同寸法**でなければならない。
+自動リサイズはしない — 「勝手に伸ばした」より「どう合わせるかを書け」の方が
+エージェントにとって直しやすいため。エラーはレイヤー番号・両方の寸法・
+「そのレイヤーの `ops` に resize / crop を足せ」という提案を含む構造化メッセージを返す。
+マスクだけは例外で、op マスク(§9.6)と同じ双線形リサイズで backdrop 寸法へ合わせる
+(マスクは低周波の重み平面で、画素そのものではないため)。
+
+#### エンジンの構造(op ループの共通化)
+
+レイヤーの `ops` は「ネストしたパイプライン」なので、**op ループの本体を
+`OpRunner::run_ops(&mut PipelineState, &[Operation])` に括り出して共有した**
+(複製せず 1 実装)。これにより:
+
+- レイヤー内でも v0.5 の op マスク・LUT 等のアセット参照がそのまま使える
+- マスク解決キャッシュ(§9.6)は `OpRunner` が持つのでレイヤーを跨いで効く
+- デコードも `decode_normalized()` に括り出し、入力画像とレイヤーソース revision が
+  **同じ EXIF orientation 正規化経路**を通る(レイヤーに載せた写真も向きが直る)
+- 仕上げパスへ引き継ぐアフィン変換(`coordinate_space: "source"` 用)は
+  **backdrop レイヤーのもの**。キャンバスの幾何は backdrop が決めるため
+- ICC / EXIF / 出力フォーマット判定は従来どおり**入力画像**由来。
+  出力アルファは全レイヤーソースの論理和
+
+`ENGINE_VERSION` は据え置き(`atx-core/2`)。`layers` を書かないレシピの
+出力バイト列は 1 ビットも動いていない(既存ゴールデン 8 本すべて green)。
+
+#### テスト実績
+
+- `cargo test -p atx-core` green(既存スイート・ゴールデンすべて据え置きのまま)、
+  `cargo clippy -p atx-core --all-targets -- -D warnings` クリーン
+- 新設 `crates/atx-core/tests/layers.rs`(20 本):
+  - v1 レシピの `recipe_hash 884ea169…` 不変 + canonical に `"layers"` が出ないこと
+  - レイヤー付きレシピの canonical JSON をピン留め(atx-mcp との契約)
+  - `source` の 2 形の serde 往復、未知キー / 未知バリアントの拒否
+  - validate マトリクス(空 layers、backdrop の blend/opacity/mask、
+    レイヤー内 encode / strip_metadata、opacity 範囲、`rev_` 始まり、
+    レイヤー内 op の値域、`operations` 空の可否)
+  - 寸法不一致エラーがレイヤー番号・両寸法・resize 提案を含むこと、
+    レイヤー内 resize で解消できること
+  - **multiply 50% の画素値をテスト内で f64 で独立計算**した期待値と ±1 で一致
+  - normal / opacity 1 / 不透明レイヤーは「そのレイヤー単体」とバイト同一
+  - opacity 0 は backdrop とバイト同一
+  - レイヤー内 `blur` + 合成マスクで、マスク 0 の帯は backdrop がビット単位で残り、
+    マスク 1 の帯はぼけたエッジ(単調)になる
+  - 未解決 revision がレイヤー番号を名指しする
+  - 3 レイヤー合成の 2 回実行がバイト同一(決定論)
+- ゴールデン: 3 レイヤー(base 縮小 / 単色 × 放射グラデーションマスク feather 3px ×
+  screen 0.75 / エッジ画像 × blur × multiply 0.4)+ 仕上げ adjust + jpeg85 の
+  出力 sha256 と `recipe_hash` を同時にピン留め

@@ -183,6 +183,47 @@ Masks are referenced by revision id exactly like LUTs, so the same caveat
 applies: the recipe hash includes the id, and the recipe only reproduces inside
 a workspace that holds that mask.
 
+### Layers
+
+A recipe may carry a `layers` stack instead of (or in addition to) a flat
+`operations` list. Layers composite bottom-to-top, each layer's `ops` run
+against its own source before it is blended onto the running composite:
+
+```json
+{
+  "layers": [
+    { "source": "base", "ops": [] },
+    {
+      "source": { "revision_id": "rev_..." },
+      "ops": [{ "op": "blur", "sigma": 8 }],
+      "blend_mode": "multiply",
+      "opacity": 0.6
+    }
+  ],
+  "operations": [
+    { "op": "resize", "width": 1600 },
+    { "op": "encode", "format": "webp", "quality": 82 }
+  ]
+}
+```
+
+- `source` is either `"base"` (the input revision passed to `apply_transform`
+  / `render_preview`) or `{"revision_id": "rev_..."}` (any other revision
+  already in the workspace). Every layer's source must match the base image's
+  dimensions exactly, or the recipe fails with a structured error before any
+  pixel work happens.
+- `ops` is a normal operations list, applied to that layer's source alone.
+- `mask`, `blend_mode` (default `"normal"`) and `opacity` (default `1.0`)
+  control how the layer composites onto the layers below it.
+- Blend mode is one of the 12 W3C separable modes: `normal`, `multiply`,
+  `screen`, `overlay`, `darken`, `lighten`, `color_dodge`, `color_burn`,
+  `hard_light`, `soft_light`, `difference`, `exclusion`.
+- When `layers` is present, the top-level `operations` becomes the
+  **finishing pass**, applied once to the composited result — this is where
+  `resize` and the final `encode` belong (`encode` must still be last and
+  appear at most once).
+- Call `explain_operation {"operation":"layers"}` for the full reference.
+
 ## Presets
 
 `apply_transform` and `render_preview` take either `recipe` (the raw DSL) or

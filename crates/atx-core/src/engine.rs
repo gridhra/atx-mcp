@@ -175,340 +175,58 @@ pub fn apply_recipe_with_assets(
     crate::recipe::validate(recipe)?;
     check_byte_limit(bytes, limits)?;
 
-    let mut warnings = Vec::new();
-
-    // --- デコード ---
-    let reader = build_reader(bytes, limits)?;
-    let input_format = reader.format();
-    let mut decoder = reader
-        .into_decoder()
-        .map_err(|e| AtxError::Decode(e.to_string()))?;
-    let (width, height) = decoder.dimensions();
-    check_pixel_limit(width, height, limits)?;
-    let mut has_alpha = decoder.color_type().has_alpha();
-    let mut icc = decoder
-        .icc_profile()
-        .ok()
-        .flatten()
-        .filter(|p| !p.is_empty());
-    let decoded =
-        DynamicImage::from_decoder(decoder).map_err(|e| AtxError::Decode(e.to_string()))?;
-    // 16bit 入力(PNG16 等)は 65536 エントリの EOTF テーブルで線形化する。
-    // 8bit へ落としてから線形化すると、そもそも 16bit で受け取った意味が無くなる。
-    let is_16bit = matches!(
-        decoded.color(),
-        image::ColorType::L16
-            | image::ColorType::La16
-            | image::ColorType::Rgb16
-            | image::ColorType::Rgba16
-    );
     // 作業空間の遅延決定: **最初に現れる空間依存 op が要求する空間**へ直接デコードする。
     // こうすると「トーン系 op だけのレシピ」では伝達関数を一度も通さずに済み、
     // 符号値が u8 のビット精度のまま最後まで運ばれる(空間依存 op が無い
     // = クロップ/エンコードだけのレシピも同様に無損失)。
-    let mut space = recipe
-        .operations
-        .iter()
-        .find_map(op_space)
-        .unwrap_or(Space::Srgb);
-    let mut img = match (is_16bit, space) {
-        (true, Space::Linear) => LinearImage::from_rgba16(&decoded.to_rgba16()),
-        (true, Space::Srgb) => LinearImage::from_rgba16_srgb(&decoded.to_rgba16()),
-        (false, Space::Linear) => LinearImage::from_rgba8(&decoded.to_rgba8()),
-        (false, Space::Srgb) => LinearImage::from_rgba8_srgb(&decoded.to_rgba8()),
+    //
+    // ただし **layers があるときは常に sRGB 符号値空間**でデコードする。
+    // 合成が sRGB 符号値空間で定義されている(`ops::blend` 参照)ためで、
+    // u8 → sRGB f32 は伝達関数を通さない厳密な `/255` なので情報は落ちない。
+    let initial_space = if recipe.layers.is_some() {
+        Space::Srgb
+    } else {
+        recipe
+            .operations
+            .iter()
+            .find_map(op_space)
+            .unwrap_or(Space::Srgb)
     };
-    drop(decoded);
+    let input = decode_normalized(bytes, limits, initial_space)?;
+    let input_format = input.format;
+    let mut icc = input.icc.clone();
+    let exif_has_any = input.exif_has_any;
 
-    // SOURCE 画素座標 → CURRENT パイプライン座標 のアフィン変換。
-    // 幾何 op ごとに合成し、`Crop { coordinate_space: Source }` で使う。
-    let mut xf = Affine::IDENTITY;
-
-    // --- Orientation の正規化(常時) ---
-    let exif = read_exif(bytes);
-    if let Some(orientation) = exif.orientation {
-        if orientation != 1 {
-            let (w, h) = img.dimensions();
-            xf = xf.then(pixel_ops::orientation_affine(w, h, orientation));
-            img = pixel_ops::apply_orientation(img, orientation);
-        }
-    }
-
-    // --- op を順次適用 ---
-    let mut strip: Option<StripScope> = None;
     // 1 回の apply_recipe 内でのマスク解決キャッシュ(同じ MaskRef + 同じ寸法は 1 回だけ)。
-    let mut masks = crate::ops::mask::MaskCache::new();
-    for (index, op) in recipe.operations.iter().enumerate() {
-        let fail = |message: String| AtxError::Operation {
-            index,
-            op: op_name(op).to_string(),
-            message,
-        };
+    let mut runner = OpRunner {
+        assets,
+        masks: crate::ops::mask::MaskCache::new(),
+    };
 
-        // --- 局所適用マスク(v0.5): op ループ 1 箇所だけの汎用処理 ---
-        //
-        // マスクが付いていれば、**その op の作業空間へ先に移してから**適用前の状態を
-        // 退避しておく(空間変換を挟んだ後の値どうしを混ぜないと意味が変わる)。
-        // op 本体の `ensure_space` はここで既に目的の空間なので no-op になる。
-        let masked = op.mask().cloned();
-        let before = if masked.is_some() {
-            if let Some(want) = op_space(op) {
-                ensure_space(&mut img, &mut space, want);
-            }
-            Some(img.clone())
-        } else {
-            None
-        };
+    // --- レイヤー合成(v0.6)/ 単一パイプライン(v1)---
+    let mut st = match &recipe.layers {
+        Some(layers) => composite_layers(&mut runner, layers, &input, limits)?,
+        None => PipelineState {
+            img: input.img,
+            space: initial_space,
+            xf: input.xf,
+            warnings: Vec::new(),
+            strip: None,
+            has_alpha: input.has_alpha,
+        },
+    };
 
-        match op {
-            // Orientation はデコード直後に正規化済みのため、ここでは何もしない。
-            Operation::AutoOrient => {}
-            Operation::Rotate {
-                angle_degrees,
-                crop,
-            } => {
-                ensure_space(&mut img, &mut space, Space::Linear);
-                let (rotated, warning, step) =
-                    pixel_ops::rotate(&img, *angle_degrees, *crop, pad_to_linear(DEFAULT_PAD));
-                img = rotated;
-                xf = xf.then(step);
-                if let Some(w) = warning {
-                    warnings.push(w);
-                }
-            }
-            Operation::Crop {
-                aspect_ratio,
-                rect,
-                anchor,
-                mode,
-                pad_color,
-                coordinate_space,
-            } => {
-                let pad_u8 = match pad_color {
-                    Some(c) => parse_hex_color(c)
-                        .ok_or_else(|| fail(format!("invalid pad_color {c:?}")))?,
-                    None => DEFAULT_PAD,
-                };
-                // crop / pad は添字操作なので作業空間を選ばない(v2 では余計な
-                // 空間往復を避けるため、現在の空間のまま実行する)。pad 色だけを
-                // 現在の空間へ写す。
-                let pad = match space {
-                    Space::Linear => pad_to_linear(pad_u8),
-                    Space::Srgb => pad_to_srgb(pad_u8),
-                };
-                if let Some(ratio) = aspect_ratio {
-                    let ratio = parse_aspect_ratio(ratio)
-                        .ok_or_else(|| fail(format!("invalid aspect_ratio {ratio:?}")))?;
-                    let (fitted, step) = pixel_ops::fit_aspect(&img, ratio, *anchor, *mode, pad);
-                    img = fitted;
-                    xf = xf.then(step);
-                    if *mode == crate::recipe::CropMode::Pad && pad_u8[3] < 255 {
-                        has_alpha = true;
-                    }
-                } else if let Some(rect) = rect {
-                    // source 座標指定なら、ここまでの幾何変換で矩形を現在の座標系へ写す。
-                    let effective = match coordinate_space {
-                        CoordinateSpace::Current => *rect,
-                        CoordinateSpace::Source => {
-                            let (cw, ch) = img.dimensions();
-                            let mapped = map_source_rect(&xf, *rect, cw, ch).map_err(fail)?;
-                            if mapped.clamped {
-                                warnings.push(format!(
-                                    "operations[{index}] (crop): source-space rect \
-                                     {}x{}+{}+{} mapped to [{}, {}]x[{}, {}] and was clamped to \
-                                     {}x{}+{}+{} inside the current {cw}x{ch} image",
-                                    rect.width,
-                                    rect.height,
-                                    rect.x,
-                                    rect.y,
-                                    mapped.raw.0,
-                                    mapped.raw.2,
-                                    mapped.raw.1,
-                                    mapped.raw.3,
-                                    mapped.rect.width,
-                                    mapped.rect.height,
-                                    mapped.rect.x,
-                                    mapped.rect.y,
-                                ));
-                            }
-                            mapped.rect
-                        }
-                    };
-                    img = pixel_ops::crop_rect(&img, effective).map_err(fail)?;
-                    xf = xf.then(Affine::translate(
-                        -(effective.x as f64),
-                        -(effective.y as f64),
-                    ));
-                }
-            }
-            Operation::Resize {
-                width,
-                height,
-                fit,
-                without_enlargement,
-            } => {
-                ensure_space(&mut img, &mut space, Space::Linear);
-                let (iw, ih) = img.dimensions();
-                let ((sw, sh), (cw, ch)) =
-                    pixel_ops::resize_targets(iw, ih, *width, *height, *fit, *without_enlargement);
-                img = pixel_ops::resize_lanczos3(&img, sw, sh).map_err(fail)?;
-                // 連続座標では拡縮は原点固定の純粋なスケール。
-                xf = xf.then(Affine::scale(sw as f64 / iw as f64, sh as f64 / ih as f64));
-                if (cw, ch) != (sw, sh) {
-                    let x = (sw - cw) / 2;
-                    let y = (sh - ch) / 2;
-                    img = pixel_ops::crop_view(&img, x, y, cw, ch);
-                    // fit=cover の内部中央クロップぶんの平行移動。
-                    xf = xf.then(Affine::translate(-(x as f64), -(y as f64)));
-                }
-            }
-            Operation::Adjust {
-                brightness,
-                contrast,
-                saturation,
-                sharpness,
-                ..
-            } => {
-                ensure_space(&mut img, &mut space, Space::Srgb);
-                img = pixel_ops::adjust(&img, *brightness, *contrast, *saturation, *sharpness);
-            }
-            Operation::Perspective {
-                quad,
-                vertical_degrees,
-                horizontal_degrees,
-                pad_color,
-            } => {
-                ensure_space(&mut img, &mut space, Space::Linear);
-                let (out, warns, step) = crate::ops::perspective::apply(
-                    &img,
-                    quad,
-                    vertical_degrees,
-                    horizontal_degrees,
-                    pad_color,
-                )
-                .map_err(|e| fail(e.to_string()))?;
-                img = out;
-                // 射影ステップ。これ以降 `coordinate_space: "source"` の矩形は
-                // 3x3 射影行列を経由して写像される(`crate::transform` 参照)。
-                xf = xf.then(step);
-                warnings.extend(
-                    warns
-                        .into_iter()
-                        .map(|w| format!("operations[{index}] (perspective): {w}")),
-                );
-            }
-            Operation::ColorMatrix { matrix, .. } => {
-                ensure_space(&mut img, &mut space, Space::Srgb);
-                img = crate::ops::color::color_matrix(&img, matrix);
-            }
-            Operation::Curves {
-                master,
-                red,
-                green,
-                blue,
-                ..
-            } => {
-                ensure_space(&mut img, &mut space, Space::Srgb);
-                img = crate::ops::color::curves(&img, master, red, green, blue);
-            }
-            Operation::Levels {
-                in_black,
-                in_white,
-                gamma,
-                out_black,
-                out_white,
-                ..
-            } => {
-                ensure_space(&mut img, &mut space, Space::Srgb);
-                img = crate::ops::color::levels(
-                    &img, *in_black, *in_white, *gamma, *out_black, *out_white,
-                );
-            }
-            Operation::Blur { sigma, .. } => {
-                ensure_space(&mut img, &mut space, Space::Linear);
-                img = crate::ops::blur::gaussian_blur(&img, *sigma);
-            }
-            Operation::Median { radius, .. } => {
-                ensure_space(&mut img, &mut space, Space::Linear);
-                img = crate::ops::blur::median(&img, *radius);
-            }
-            Operation::UnsharpMask {
-                amount,
-                radius,
-                threshold,
-                ..
-            } => {
-                ensure_space(&mut img, &mut space, Space::Linear);
-                img = crate::ops::blur::unsharp_mask(&img, *amount, *radius, *threshold);
-            }
-            Operation::Lut {
-                lut_revision_id,
-                strength,
-                ..
-            } => {
-                let lut_bytes = assets
-                    .read_revision(lut_revision_id)
-                    .map_err(|e| fail(e.to_string()))?;
-                let text = std::str::from_utf8(&lut_bytes).map_err(|_| {
-                    fail(format!("asset {lut_revision_id} is not a text .cube file"))
-                })?;
-                let lut = crate::ops::lut::parse_cube(text).map_err(|e| fail(e.to_string()))?;
-                ensure_space(&mut img, &mut space, Space::Srgb);
-                img = crate::ops::lut::apply(&img, &lut, *strength);
-            }
-            Operation::WhiteBalance {
-                temperature, tint, ..
-            } => {
-                ensure_space(&mut img, &mut space, Space::Linear);
-                img = crate::ops::wb::apply(&img, *temperature, *tint);
-            }
-            Operation::Hsl {
-                red,
-                orange,
-                yellow,
-                green,
-                aqua,
-                blue,
-                purple,
-                magenta,
-                ..
-            } => {
-                let bands = [
-                    *red, *orange, *yellow, *green, *aqua, *blue, *purple, *magenta,
-                ];
-                ensure_space(&mut img, &mut space, Space::Srgb);
-                img = crate::ops::hsl::apply(&img, &bands);
-            }
-            Operation::Convolve {
-                kernel,
-                size,
-                divisor,
-                offset,
-                ..
-            } => {
-                ensure_space(&mut img, &mut space, Space::Linear);
-                img = crate::ops::convolve::apply(&img, kernel, *size, *divisor, *offset);
-            }
-            Operation::StripMetadata { scope } => {
-                strip = Some(*scope);
-            }
-            // エンコード指定は最後にまとめて処理する(validate により最後の op であることが保証される)。
-            Operation::Encode { .. } => {}
-        }
+    // --- op を順次適用(layers があるときは合成結果への仕上げパス)---
+    runner.run_ops(&mut st, &recipe.operations)?;
 
-        // --- マスクブレンド(現在の作業空間、RGBA 4 チャンネル) ---
-        if let (Some(mask), Some(before)) = (masked, before) {
-            let (w, h) = img.dimensions();
-            if before.dimensions() != (w, h) {
-                return Err(fail(
-                    "mask is only supported for ops that preserve the image dimensions".to_string(),
-                ));
-            }
-            let weights = masks
-                .resolve(&mask, w, h, assets)
-                .map_err(|e| fail(e.to_string()))?;
-            img = crate::ops::mask::blend(&before, &img, weights);
-        }
-    }
+    let PipelineState {
+        mut img,
+        mut space,
+        mut warnings,
+        strip,
+        has_alpha,
+        ..
+    } = st;
 
     // 出口の空間確定: 常に sRGB 符号値へ移してから量子化する。
     // 最後の op が sRGB 空間だった場合は変換が 0 回で済み、丸め直前に
@@ -557,7 +275,7 @@ pub fn apply_recipe_with_assets(
                 .to_string(),
         );
     }
-    if exif.has_any {
+    if exif_has_any {
         warnings.push(
             "EXIF metadata was dropped on re-encode; orientation is normalized into pixel data"
                 .to_string(),
@@ -593,6 +311,503 @@ pub fn apply_recipe_with_assets(
         height: h,
         warnings,
     })
+}
+
+/// デコード済み入力(EXIF orientation 正規化済み)。
+struct DecodedInput {
+    img: LinearImage,
+    /// SOURCE 画素座標 → 正規化後座標 のアフィン変換(orientation ぶん)。
+    xf: Affine,
+    has_alpha: bool,
+    icc: Option<Vec<u8>>,
+    format: Option<ImageFormat>,
+    exif_has_any: bool,
+}
+
+/// バイト列を `space` の `LinearImage` へデコードし、EXIF orientation を画素へ焼き込む。
+///
+/// 入力画像とレイヤーソース(revision)の両方がこの同じ経路を通る
+/// = レイヤーに載せた画像も向きが正規化される。
+fn decode_normalized(bytes: &[u8], limits: &Limits, space: Space) -> Result<DecodedInput> {
+    check_byte_limit(bytes, limits)?;
+
+    let reader = build_reader(bytes, limits)?;
+    let format = reader.format();
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|e| AtxError::Decode(e.to_string()))?;
+    let (width, height) = decoder.dimensions();
+    check_pixel_limit(width, height, limits)?;
+    let has_alpha = decoder.color_type().has_alpha();
+    let icc = decoder
+        .icc_profile()
+        .ok()
+        .flatten()
+        .filter(|p| !p.is_empty());
+    let decoded =
+        DynamicImage::from_decoder(decoder).map_err(|e| AtxError::Decode(e.to_string()))?;
+    // 16bit 入力(PNG16 等)は 65536 エントリの EOTF テーブルで線形化する。
+    // 8bit へ落としてから線形化すると、そもそも 16bit で受け取った意味が無くなる。
+    let is_16bit = matches!(
+        decoded.color(),
+        image::ColorType::L16
+            | image::ColorType::La16
+            | image::ColorType::Rgb16
+            | image::ColorType::Rgba16
+    );
+    let mut img = match (is_16bit, space) {
+        (true, Space::Linear) => LinearImage::from_rgba16(&decoded.to_rgba16()),
+        (true, Space::Srgb) => LinearImage::from_rgba16_srgb(&decoded.to_rgba16()),
+        (false, Space::Linear) => LinearImage::from_rgba8(&decoded.to_rgba8()),
+        (false, Space::Srgb) => LinearImage::from_rgba8_srgb(&decoded.to_rgba8()),
+    };
+    drop(decoded);
+
+    // SOURCE 画素座標 → CURRENT パイプライン座標 のアフィン変換。
+    // 幾何 op ごとに合成し、`Crop { coordinate_space: Source }` で使う。
+    let mut xf = Affine::IDENTITY;
+
+    // --- Orientation の正規化(常時) ---
+    let exif = read_exif(bytes);
+    if let Some(orientation) = exif.orientation {
+        if orientation != 1 {
+            let (w, h) = img.dimensions();
+            xf = xf.then(pixel_ops::orientation_affine(w, h, orientation));
+            img = pixel_ops::apply_orientation(img, orientation);
+        }
+    }
+
+    Ok(DecodedInput {
+        img,
+        xf,
+        has_alpha,
+        icc,
+        format,
+        exif_has_any: exif.has_any,
+    })
+}
+
+/// パイプラインの可変状態(単一パイプラインでも、レイヤー内のネストパイプラインでも同じ)。
+struct PipelineState {
+    img: LinearImage,
+    space: Space,
+    xf: Affine,
+    warnings: Vec<String>,
+    strip: Option<StripScope>,
+    has_alpha: bool,
+}
+
+/// op ループの実行器。アセット解決とマスクキャッシュを全パイプラインで共有する
+/// (同じ `MaskRef` + 同じ寸法はレイヤーをまたいでも 1 回しか解決しない)。
+struct OpRunner<'a> {
+    assets: &'a dyn AssetResolver,
+    masks: crate::ops::mask::MaskCache,
+}
+
+/// レイヤー列を合成し、仕上げパスの入力となるキャンバスを返す(v0.6)。
+///
+/// - 先頭レイヤーが backdrop。以降のレイヤーは backdrop と**同寸法**でなければならない
+/// - 各レイヤーは自分のソース画素に自分の `ops` を適用してから合成される
+/// - 合成は sRGB 符号値空間・ストレートアルファ(`ops::blend`)
+/// - 仕上げパスへ引き継ぐアフィン変換は **backdrop レイヤーのもの**
+///   (キャンバスの幾何は backdrop が決めるため)
+fn composite_layers(
+    runner: &mut OpRunner,
+    layers: &[crate::recipe::Layer],
+    input: &DecodedInput,
+    limits: &Limits,
+) -> Result<PipelineState> {
+    use crate::recipe::LayerSource;
+
+    let mut canvas: Option<PipelineState> = None;
+    for (i, layer) in layers.iter().enumerate() {
+        // --- ソース画素 ---
+        let (img, xf, src_alpha) = match &layer.source {
+            LayerSource::Base(_) => (input.img.clone(), input.xf, input.has_alpha),
+            LayerSource::Revision { revision_id } => {
+                let bytes = runner.assets.read_revision(revision_id).map_err(|e| {
+                    AtxError::InvalidRecipe(format!(
+                        "layers[{i}] (source): revision {revision_id} could not be read: {e}"
+                    ))
+                })?;
+                let decoded = decode_normalized(&bytes, limits, Space::Srgb).map_err(|e| {
+                    AtxError::InvalidRecipe(format!(
+                        "layers[{i}] (source): revision {revision_id} could not be decoded: {e}"
+                    ))
+                })?;
+                (decoded.img, decoded.xf, decoded.has_alpha)
+            }
+        };
+
+        // --- レイヤー内のネストパイプライン ---
+        let mut st = PipelineState {
+            img,
+            space: Space::Srgb,
+            xf,
+            warnings: Vec::new(),
+            strip: None,
+            has_alpha: src_alpha,
+        };
+        runner
+            .run_ops(&mut st, &layer.ops)
+            .map_err(|e| layer_error(i, e))?;
+        // 合成は sRGB 符号値空間で行う。
+        ensure_space(&mut st.img, &mut st.space, Space::Srgb);
+        let warnings: Vec<String> = st
+            .warnings
+            .drain(..)
+            .map(|w| format!("layers[{i}]: {w}"))
+            .collect();
+        st.warnings = warnings;
+
+        // --- 合成 ---
+        match canvas {
+            None => canvas = Some(st),
+            Some(ref mut cv) => {
+                let (bw, bh) = cv.img.dimensions();
+                let (lw, lh) = st.img.dimensions();
+                if (lw, lh) != (bw, bh) {
+                    return Err(AtxError::InvalidRecipe(format!(
+                        "layers[{i}]: after its ops the layer is {lw}x{lh} but the backdrop \
+                         (layers[0]) is {bw}x{bh}; every layer must match the backdrop \
+                         dimensions — add a resize or crop to layers[{i}].ops to bring it to \
+                         {bw}x{bh}"
+                    )));
+                }
+                let weights = match &layer.mask {
+                    Some(mask) => Some(
+                        runner
+                            .masks
+                            .resolve(mask, bw, bh, runner.assets)
+                            .map_err(|e| layer_error(i, e))?
+                            .to_vec(),
+                    ),
+                    None => None,
+                };
+                crate::ops::blend::composite(
+                    &mut cv.img,
+                    &st.img,
+                    layer.blend_mode,
+                    layer.opacity as f32,
+                    weights.as_deref(),
+                );
+                cv.has_alpha = cv.has_alpha || st.has_alpha;
+                cv.warnings.extend(st.warnings);
+            }
+        }
+    }
+    // validate がレイヤー非空を保証している。
+    canvas.ok_or_else(|| AtxError::InvalidRecipe("layers must not be empty".into()))
+}
+
+/// レイヤー内で出たエラーにレイヤー番号を付ける。
+fn layer_error(i: usize, e: AtxError) -> AtxError {
+    match e {
+        AtxError::Operation { index, op, message } => AtxError::Operation {
+            index,
+            op,
+            message: format!("in layers[{i}]: {message}"),
+        },
+        AtxError::InvalidRecipe(m) => AtxError::InvalidRecipe(format!("layers[{i}]: {m}")),
+        other => other,
+    }
+}
+
+impl OpRunner<'_> {
+    /// op 列を順に適用する(単一パイプラインとレイヤー内で完全に同じコード)。
+    fn run_ops(&mut self, st: &mut PipelineState, ops: &[Operation]) -> Result<()> {
+        for (index, op) in ops.iter().enumerate() {
+            let fail = |message: String| AtxError::Operation {
+                index,
+                op: op_name(op).to_string(),
+                message,
+            };
+
+            // --- 局所適用マスク(v0.5): op ループ 1 箇所だけの汎用処理 ---
+            //
+            // マスクが付いていれば、**その op の作業空間へ先に移してから**適用前の状態を
+            // 退避しておく(空間変換を挟んだ後の値どうしを混ぜないと意味が変わる)。
+            // op 本体の `ensure_space` はここで既に目的の空間なので no-op になる。
+            let masked = op.mask().cloned();
+            let before = if masked.is_some() {
+                if let Some(want) = op_space(op) {
+                    ensure_space(&mut st.img, &mut st.space, want);
+                }
+                Some(st.img.clone())
+            } else {
+                None
+            };
+
+            match op {
+                // Orientation はデコード直後に正規化済みのため、ここでは何もしない。
+                Operation::AutoOrient => {}
+                Operation::Rotate {
+                    angle_degrees,
+                    crop,
+                } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Linear);
+                    let (rotated, warning, step) = pixel_ops::rotate(
+                        &st.img,
+                        *angle_degrees,
+                        *crop,
+                        pad_to_linear(DEFAULT_PAD),
+                    );
+                    st.img = rotated;
+                    st.xf = st.xf.then(step);
+                    if let Some(w) = warning {
+                        st.warnings.push(w);
+                    }
+                }
+                Operation::Crop {
+                    aspect_ratio,
+                    rect,
+                    anchor,
+                    mode,
+                    pad_color,
+                    coordinate_space,
+                } => {
+                    let pad_u8 = match pad_color {
+                        Some(c) => parse_hex_color(c)
+                            .ok_or_else(|| fail(format!("invalid pad_color {c:?}")))?,
+                        None => DEFAULT_PAD,
+                    };
+                    // crop / pad は添字操作なので作業空間を選ばない(v2 では余計な
+                    // 空間往復を避けるため、現在の空間のまま実行する)。pad 色だけを
+                    // 現在の空間へ写す。
+                    let pad = match st.space {
+                        Space::Linear => pad_to_linear(pad_u8),
+                        Space::Srgb => pad_to_srgb(pad_u8),
+                    };
+                    if let Some(ratio) = aspect_ratio {
+                        let ratio = parse_aspect_ratio(ratio)
+                            .ok_or_else(|| fail(format!("invalid aspect_ratio {ratio:?}")))?;
+                        let (fitted, step) =
+                            pixel_ops::fit_aspect(&st.img, ratio, *anchor, *mode, pad);
+                        st.img = fitted;
+                        st.xf = st.xf.then(step);
+                        if *mode == crate::recipe::CropMode::Pad && pad_u8[3] < 255 {
+                            st.has_alpha = true;
+                        }
+                    } else if let Some(rect) = rect {
+                        // source 座標指定なら、ここまでの幾何変換で矩形を現在の座標系へ写す。
+                        let effective = match coordinate_space {
+                            CoordinateSpace::Current => *rect,
+                            CoordinateSpace::Source => {
+                                let (cw, ch) = st.img.dimensions();
+                                let mapped =
+                                    map_source_rect(&st.xf, *rect, cw, ch).map_err(fail)?;
+                                if mapped.clamped {
+                                    st.warnings.push(format!(
+                                        "operations[{index}] (crop): source-space rect \
+                                     {}x{}+{}+{} mapped to [{}, {}]x[{}, {}] and was clamped to \
+                                     {}x{}+{}+{} inside the current {cw}x{ch} image",
+                                        rect.width,
+                                        rect.height,
+                                        rect.x,
+                                        rect.y,
+                                        mapped.raw.0,
+                                        mapped.raw.2,
+                                        mapped.raw.1,
+                                        mapped.raw.3,
+                                        mapped.rect.width,
+                                        mapped.rect.height,
+                                        mapped.rect.x,
+                                        mapped.rect.y,
+                                    ));
+                                }
+                                mapped.rect
+                            }
+                        };
+                        st.img = pixel_ops::crop_rect(&st.img, effective).map_err(fail)?;
+                        st.xf = st.xf.then(Affine::translate(
+                            -(effective.x as f64),
+                            -(effective.y as f64),
+                        ));
+                    }
+                }
+                Operation::Resize {
+                    width,
+                    height,
+                    fit,
+                    without_enlargement,
+                } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Linear);
+                    let (iw, ih) = st.img.dimensions();
+                    let ((sw, sh), (cw, ch)) = pixel_ops::resize_targets(
+                        iw,
+                        ih,
+                        *width,
+                        *height,
+                        *fit,
+                        *without_enlargement,
+                    );
+                    st.img = pixel_ops::resize_lanczos3(&st.img, sw, sh).map_err(fail)?;
+                    // 連続座標では拡縮は原点固定の純粋なスケール。
+                    st.xf = st
+                        .xf
+                        .then(Affine::scale(sw as f64 / iw as f64, sh as f64 / ih as f64));
+                    if (cw, ch) != (sw, sh) {
+                        let x = (sw - cw) / 2;
+                        let y = (sh - ch) / 2;
+                        st.img = pixel_ops::crop_view(&st.img, x, y, cw, ch);
+                        // fit=cover の内部中央クロップぶんの平行移動。
+                        st.xf = st.xf.then(Affine::translate(-(x as f64), -(y as f64)));
+                    }
+                }
+                Operation::Adjust {
+                    brightness,
+                    contrast,
+                    saturation,
+                    sharpness,
+                    ..
+                } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Srgb);
+                    st.img =
+                        pixel_ops::adjust(&st.img, *brightness, *contrast, *saturation, *sharpness);
+                }
+                Operation::Perspective {
+                    quad,
+                    vertical_degrees,
+                    horizontal_degrees,
+                    pad_color,
+                } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Linear);
+                    let (out, warns, step) = crate::ops::perspective::apply(
+                        &st.img,
+                        quad,
+                        vertical_degrees,
+                        horizontal_degrees,
+                        pad_color,
+                    )
+                    .map_err(|e| fail(e.to_string()))?;
+                    st.img = out;
+                    // 射影ステップ。これ以降 `coordinate_space: "source"` の矩形は
+                    // 3x3 射影行列を経由して写像される(`crate::transform` 参照)。
+                    st.xf = st.xf.then(step);
+                    st.warnings.extend(
+                        warns
+                            .into_iter()
+                            .map(|w| format!("operations[{index}] (perspective): {w}")),
+                    );
+                }
+                Operation::ColorMatrix { matrix, .. } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Srgb);
+                    st.img = crate::ops::color::color_matrix(&st.img, matrix);
+                }
+                Operation::Curves {
+                    master,
+                    red,
+                    green,
+                    blue,
+                    ..
+                } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Srgb);
+                    st.img = crate::ops::color::curves(&st.img, master, red, green, blue);
+                }
+                Operation::Levels {
+                    in_black,
+                    in_white,
+                    gamma,
+                    out_black,
+                    out_white,
+                    ..
+                } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Srgb);
+                    st.img = crate::ops::color::levels(
+                        &st.img, *in_black, *in_white, *gamma, *out_black, *out_white,
+                    );
+                }
+                Operation::Blur { sigma, .. } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Linear);
+                    st.img = crate::ops::blur::gaussian_blur(&st.img, *sigma);
+                }
+                Operation::Median { radius, .. } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Linear);
+                    st.img = crate::ops::blur::median(&st.img, *radius);
+                }
+                Operation::UnsharpMask {
+                    amount,
+                    radius,
+                    threshold,
+                    ..
+                } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Linear);
+                    st.img = crate::ops::blur::unsharp_mask(&st.img, *amount, *radius, *threshold);
+                }
+                Operation::Lut {
+                    lut_revision_id,
+                    strength,
+                    ..
+                } => {
+                    let lut_bytes = self
+                        .assets
+                        .read_revision(lut_revision_id)
+                        .map_err(|e| fail(e.to_string()))?;
+                    let text = std::str::from_utf8(&lut_bytes).map_err(|_| {
+                        fail(format!("asset {lut_revision_id} is not a text .cube file"))
+                    })?;
+                    let lut = crate::ops::lut::parse_cube(text).map_err(|e| fail(e.to_string()))?;
+                    ensure_space(&mut st.img, &mut st.space, Space::Srgb);
+                    st.img = crate::ops::lut::apply(&st.img, &lut, *strength);
+                }
+                Operation::WhiteBalance {
+                    temperature, tint, ..
+                } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Linear);
+                    st.img = crate::ops::wb::apply(&st.img, *temperature, *tint);
+                }
+                Operation::Hsl {
+                    red,
+                    orange,
+                    yellow,
+                    green,
+                    aqua,
+                    blue,
+                    purple,
+                    magenta,
+                    ..
+                } => {
+                    let bands = [
+                        *red, *orange, *yellow, *green, *aqua, *blue, *purple, *magenta,
+                    ];
+                    ensure_space(&mut st.img, &mut st.space, Space::Srgb);
+                    st.img = crate::ops::hsl::apply(&st.img, &bands);
+                }
+                Operation::Convolve {
+                    kernel,
+                    size,
+                    divisor,
+                    offset,
+                    ..
+                } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Linear);
+                    st.img = crate::ops::convolve::apply(&st.img, kernel, *size, *divisor, *offset);
+                }
+                Operation::StripMetadata { scope } => {
+                    st.strip = Some(*scope);
+                }
+                // エンコード指定は最後にまとめて処理する(validate により最後の op であることが保証される)。
+                Operation::Encode { .. } => {}
+            }
+
+            // --- マスクブレンド(現在の作業空間、RGBA 4 チャンネル) ---
+            if let (Some(mask), Some(before)) = (masked, before) {
+                let (w, h) = st.img.dimensions();
+                if before.dimensions() != (w, h) {
+                    return Err(fail(
+                        "mask is only supported for ops that preserve the image dimensions"
+                            .to_string(),
+                    ));
+                }
+                let weights = self
+                    .masks
+                    .resolve(&mask, w, h, self.assets)
+                    .map_err(|e| fail(e.to_string()))?;
+                st.img = crate::ops::mask::blend(&before, &st.img, weights);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// op が要求する作業空間(`ops/mod.rs` の表)。

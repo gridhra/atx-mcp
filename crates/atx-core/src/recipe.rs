@@ -7,9 +7,22 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// 変換レシピ。operations を順に適用し、最後に(暗黙または明示の)encode で確定する。
+///
+/// v0.6 で **レイヤーグラフ**(`layers`)が加わった。`layers` を書くと:
+///
+/// 1. 各レイヤーが自分のソース画素(`base` = 入力画像 / `revision_id` = 別 revision)に
+///    自分の `ops` を適用し、
+/// 2. 先頭レイヤー(= backdrop)のキャンバスへ上から順に合成され、
+/// 3. 最後に **トップレベルの `operations` が合成結果に対する仕上げパス**として走る。
+///
+/// `layers` を書かない v1 レシピは正規化 JSON がバイト単位で従来と一致し、
+/// `recipe_hash` も不変(`skip_serializing_if = "Option::is_none"`)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TransformRecipe {
     pub operations: Vec<Operation>,
+    /// レイヤーグラフ(v0.6)。省略時は従来どおり単一パイプライン。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layers: Option<Vec<Layer>>,
 }
 
 /// パイプラインの1オペレーション。
@@ -267,6 +280,130 @@ pub struct MaskRef {
     /// 境界のフェザ量。0 = なし。0.0..=200.0(ガウスぼかしの σ [px]、現在の画像座標)。
     #[serde(default)]
     pub feather_px: f64,
+}
+
+/// レイヤーグラフの 1 レイヤー(v0.6)。
+///
+/// ソース画素へ `ops` を適用し、その結果を(`mask` の重み × `opacity` × 画素アルファ)を
+/// ソースアルファとして `blend_mode` で下のキャンバスへ合成する。
+///
+/// - 先頭レイヤー(index 0)は **backdrop** で、`blend_mode: normal` /
+///   `opacity: 1.0` / `mask` 無しでなければならない(合成相手がまだ無いため)。
+/// - `ops` に `encode` / `strip_metadata` は書けない(仕上げパス専用の op)。
+/// - 合成後のレイヤー寸法は backdrop と一致していなければならない
+///   (合わせるための resize / crop は `ops` に書く)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Layer {
+    /// このレイヤーの画素ソース。
+    pub source: LayerSource,
+    /// 合成前にこのレイヤーへ適用する op 列(通常のパイプラインと同じ語彙。
+    /// `encode` / `strip_metadata` を除く)。
+    #[serde(default)]
+    pub ops: Vec<Operation>,
+    /// 合成マスク。重みは「このレイヤーをどれだけ乗せるか」で、backdrop の寸法で解決する。
+    /// 重み平面の作り方は op マスク(§9.6)と同一。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<MaskRef>,
+    /// separable ブレンドモード(W3C compositing-1)。既定 `normal`。
+    #[serde(default)]
+    pub blend_mode: BlendMode,
+    /// レイヤー不透明度 0.0..=1.0。既定 1.0。
+    #[serde(default = "default_one")]
+    pub opacity: f64,
+}
+
+/// レイヤーの画素ソース。
+///
+/// # serde 表現(atx-mcp との契約)
+///
+/// ```jsonc
+/// {"source": "base"}                          // 入力画像そのもの
+/// {"source": {"revision_id": "rev_abc123"}}   // ワークスペースの別 revision
+/// ```
+///
+/// **untagged** を選んだ理由:
+/// - 2 つの表現が JSON の**型レベルで排他**(string か object か)なので曖昧さが無い
+/// - `{"source": {"kind": "base"}}` のようなラッパを増やさずに済み、
+///   エージェントが書く JSON が短い(トークン規律)
+/// - JSON Schema は `anyOf: [{enum: ["base"]}, {object with revision_id}]` に落ち、
+///   スキーマ生成でも表現できる
+/// - 正規化 JSON は「文字列」か「キー 1 個のオブジェクト」で、キー順の揺れが無い
+///   = canonical 安定
+///
+/// `base` は untagged のユニットバリアントが serde では `null` としか往復しないため、
+/// **1 バリアントだけの文字列 enum** [`BaseKeyword`] で表現している(表現は `"base"`)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum LayerSource {
+    /// 入力画像(EXIF orientation 正規化後)。JSON では `"base"`。
+    Base(BaseKeyword),
+    /// 別アセットの revision。JSON では `{"revision_id": "rev_..."}`。
+    Revision {
+        /// 画像アセットの revision id("rev_...")。
+        revision_id: String,
+    },
+}
+
+impl LayerSource {
+    /// `{"source": "base"}` を作る。
+    pub fn base() -> Self {
+        LayerSource::Base(BaseKeyword::Base)
+    }
+
+    /// 入力画像を指すか。
+    pub fn is_base(&self) -> bool {
+        matches!(self, LayerSource::Base(_))
+    }
+
+    /// revision 参照ならその id。
+    pub fn revision_id(&self) -> Option<&str> {
+        match self {
+            LayerSource::Revision { revision_id } => Some(revision_id),
+            LayerSource::Base(_) => None,
+        }
+    }
+}
+
+/// `LayerSource::Base` の JSON 表現(文字列 `"base"`)を担う 1 バリアント enum。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BaseKeyword {
+    #[default]
+    Base,
+}
+
+/// separable ブレンドモード 12 種(W3C Compositing and Blending Level 1)。
+///
+/// 非 separable 系(hue / saturation / color / luminosity)は v0.7。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BlendMode {
+    /// `B(Cb, Cs) = Cs`
+    #[default]
+    Normal,
+    /// `B = Cb × Cs`
+    Multiply,
+    /// `B = Cb + Cs − Cb × Cs`
+    Screen,
+    /// `B = HardLight(Cs, Cb)`(引数を入れ替えた hard_light)
+    Overlay,
+    /// `B = min(Cb, Cs)`
+    Darken,
+    /// `B = max(Cb, Cs)`
+    Lighten,
+    /// `B = Cb == 0 ? 0 : Cs == 1 ? 1 : min(1, Cb / (1 − Cs))`
+    ColorDodge,
+    /// `B = Cb == 1 ? 1 : Cs == 0 ? 0 : 1 − min(1, (1 − Cb) / Cs)`
+    ColorBurn,
+    /// `B = Cs <= 0.5 ? Multiply(Cb, 2×Cs) : Screen(Cb, 2×Cs − 1)`
+    HardLight,
+    /// W3C の D(Cb) 区分(Cb <= 0.25 で多項式、それ以外は sqrt)を使う式
+    SoftLight,
+    /// `B = |Cb − Cs|`
+    Difference,
+    /// `B = Cb + Cs − 2 × Cb × Cs`
+    Exclusion,
 }
 
 /// 色相域ごとの HSL シフト量。各値 -100..=100(0 = 変更なし)。
@@ -531,12 +668,131 @@ pub fn recipe_hash(recipe: &TransformRecipe) -> crate::Result<String> {
 pub fn validate(recipe: &TransformRecipe) -> crate::Result<()> {
     use crate::AtxError::InvalidRecipe;
 
-    if recipe.operations.is_empty() {
+    // トップレベルの `operations` は合成結果に対する**仕上げパス**。
+    // layers がある場合に限り空を許す(合成しただけで出したいケース)。
+    if recipe.operations.is_empty() && recipe.layers.is_none() {
         return Err(InvalidRecipe("operations must not be empty".into()));
     }
-    let last_index = recipe.operations.len() - 1;
+    validate_operations(&recipe.operations)?;
 
-    for (index, op) in recipe.operations.iter().enumerate() {
+    if let Some(layers) = &recipe.layers {
+        validate_layers(layers)?;
+    }
+    Ok(())
+}
+
+/// レイヤー列の静的検証(v0.6)。
+fn validate_layers(layers: &[Layer]) -> crate::Result<()> {
+    use crate::AtxError::InvalidRecipe;
+
+    if layers.is_empty() {
+        return Err(InvalidRecipe(
+            "layers must not be empty when present (omit the key entirely for a \
+             single-pipeline recipe)"
+                .into(),
+        ));
+    }
+
+    for (i, layer) in layers.iter().enumerate() {
+        // ソース参照。
+        if let Some(id) = layer.source.revision_id() {
+            if id.is_empty() {
+                return Err(InvalidRecipe(format!(
+                    "layers[{i}] (source): revision_id must not be empty"
+                )));
+            }
+            if !id.starts_with("rev_") {
+                return Err(InvalidRecipe(format!(
+                    "layers[{i}] (source): revision_id must start with \"rev_\", got {id:?}"
+                )));
+            }
+        }
+
+        // 不透明度。
+        if !layer.opacity.is_finite() || !(0.0..=1.0).contains(&layer.opacity) {
+            return Err(InvalidRecipe(format!(
+                "layers[{i}]: opacity must be within 0.0..=1.0, got {}",
+                layer.opacity
+            )));
+        }
+
+        // 合成マスク(op マスクと同じ静的制約)。
+        if let Some(mask) = &layer.mask {
+            crate::ops::mask::validate(i, mask).map_err(|e| prefix_layer(i, e))?;
+        }
+
+        // 先頭レイヤーは backdrop: 合成相手がまだ無いので合成パラメータを持てない。
+        if i == 0 {
+            if layer.blend_mode != BlendMode::Normal {
+                return Err(InvalidRecipe(format!(
+                    "layers[0] is the backdrop (there is nothing underneath it to blend with), \
+                     so blend_mode must be \"normal\", got {:?}",
+                    layer.blend_mode
+                )));
+            }
+            if layer.opacity != 1.0 {
+                return Err(InvalidRecipe(format!(
+                    "layers[0] is the backdrop (there is nothing underneath it to blend with), \
+                     so opacity must be 1.0, got {}",
+                    layer.opacity
+                )));
+            }
+            if layer.mask.is_some() {
+                return Err(InvalidRecipe(
+                    "layers[0] is the backdrop (there is nothing underneath it to blend with), \
+                     so it must not carry a mask; put the mask on a layer above it"
+                        .into(),
+                ));
+            }
+        }
+
+        // レイヤー ops は仕上げパス専用 op を含めない。
+        for (j, op) in layer.ops.iter().enumerate() {
+            match op {
+                Operation::Encode { .. } => {
+                    return Err(InvalidRecipe(format!(
+                        "layers[{i}].ops[{j}] (encode): encode is a finishing-pass-only operation; \
+                         put it in the top-level operations, which run on the composite"
+                    )));
+                }
+                Operation::StripMetadata { .. } => {
+                    return Err(InvalidRecipe(format!(
+                        "layers[{i}].ops[{j}] (strip_metadata): strip_metadata is a \
+                         finishing-pass-only operation; put it in the top-level operations, \
+                         which run on the composite"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        validate_operations(&layer.ops).map_err(|e| prefix_layer(i, e))?;
+    }
+    Ok(())
+}
+
+/// レイヤー文脈で出たエラーメッセージにレイヤー番号を前置する。
+///
+/// 個々の op バリデータは `operations[j] (op): ...` という書式を共有しているので、
+/// ここで包むだけで「どのレイヤーの何番目の op か」が両方名指しされる。
+fn prefix_layer(i: usize, e: crate::AtxError) -> crate::AtxError {
+    match e {
+        crate::AtxError::InvalidRecipe(m) => {
+            crate::AtxError::InvalidRecipe(format!("layers[{i}].ops: {m}"))
+        }
+        other => other,
+    }
+}
+
+/// op 列の静的検証(トップレベルの `operations` とレイヤーの `ops` で共有)。
+fn validate_operations(operations: &[Operation]) -> crate::Result<()> {
+    use crate::AtxError::InvalidRecipe;
+
+    if operations.is_empty() {
+        return Ok(());
+    }
+    let last_index = operations.len() - 1;
+
+    for (index, op) in operations.iter().enumerate() {
         // 局所適用マスクは op 種別に依らず同じ静的制約なので、まとめて検証する。
         if let Some(mask) = op.mask() {
             crate::ops::mask::validate(index, mask)?;
@@ -729,8 +985,7 @@ pub fn validate(recipe: &TransformRecipe) -> crate::Result<()> {
         }
     }
 
-    let encode_count = recipe
-        .operations
+    let encode_count = operations
         .iter()
         .filter(|op| matches!(op, Operation::Encode { .. }))
         .count();

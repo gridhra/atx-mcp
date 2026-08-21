@@ -95,7 +95,10 @@ fn arb_pipeline_recipe() -> impl Strategy<Value = TransformRecipe> {
                     quality,
                     bit_depth: None,
                 });
-                TransformRecipe { operations: ops }
+                TransformRecipe {
+                    operations: ops,
+                    layers: None,
+                }
             },
         )
 }
@@ -171,7 +174,7 @@ proptest! {
         // 前段だけを適用したときの寸法(= crop 実行時点の「現在の寸法」)。
         let mut base_ops = chain.clone();
         base_ops.push(encode.clone());
-        let base = apply_recipe(&bytes, &TransformRecipe { operations: base_ops }, &limits).unwrap();
+        let base = apply_recipe(&bytes, &TransformRecipe { operations: base_ops, layers: None }, &limits).unwrap();
 
         // 同じ前段 + SOURCE 全域を指す矩形。
         let mut ops = chain;
@@ -184,7 +187,7 @@ proptest! {
             coordinate_space: CoordinateSpace::Source,
         });
         ops.push(encode);
-        let out = apply_recipe(&bytes, &TransformRecipe { operations: ops }, &limits)
+        let out = apply_recipe(&bytes, &TransformRecipe { operations: ops, layers: None }, &limits)
             .expect("a source-space rect covering the whole source image must never fail");
 
         prop_assert!(out.width <= base.width, "{} > {}", out.width, base.width);
@@ -227,6 +230,7 @@ proptest! {
     ) {
         let bytes = encode_png(&img);
         let recipe = TransformRecipe {
+            layers: None,
             operations: vec![
                 Operation::Resize {
                     width: Some(bw),
@@ -247,6 +251,7 @@ proptest! {
     fn crop_aspect_ratio_matches_target(img in arb_image(), rw in 1u32..=32, rh in 1u32..=32) {
         let bytes = encode_png(&img);
         let recipe = TransformRecipe {
+            layers: None,
             operations: vec![
                 Operation::Crop {
                     aspect_ratio: Some(format!("{rw}:{rh}")),
@@ -278,6 +283,7 @@ proptest! {
         let (iw, ih) = img.dimensions();
         let bytes = encode_png(&img);
         let recipe = TransformRecipe {
+            layers: None,
             operations: vec![
                 Operation::Rotate { angle_degrees: angle, crop: RotateCrop::LargestInscribedRect },
                 Operation::Encode { format: OutputFormat::Png, quality: None, bit_depth: None },
@@ -310,9 +316,11 @@ proptest! {
             coordinate_space: CoordinateSpace::Current,
         };
         let once = TransformRecipe {
+            layers: None,
             operations: vec![crop_op(), Operation::Encode { format: OutputFormat::Png, quality: None, bit_depth: None }],
         };
         let twice = TransformRecipe {
+            layers: None,
             operations: vec![
                 crop_op(),
                 crop_op(),

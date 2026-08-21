@@ -175,7 +175,10 @@ fn arb_recipe() -> impl Strategy<Value = TransformRecipe> {
                 None if ops.is_empty() => ops.push(Operation::AutoOrient),
                 None => {}
             }
-            TransformRecipe { operations: ops }
+            TransformRecipe {
+                operations: ops,
+                layers: None,
+            }
         })
 }
 
@@ -275,7 +278,10 @@ fn arb_any_op() -> impl Strategy<Value = Operation> {
 
 /// 値域外・多重 encode・空 operations などを含みうる、堅牢性確認用のレシピ生成器。
 fn arb_any_recipe() -> impl Strategy<Value = TransformRecipe> {
-    prop::collection::vec(arb_any_op(), 0..10).prop_map(|operations| TransformRecipe { operations })
+    prop::collection::vec(arb_any_op(), 0..10).prop_map(|operations| TransformRecipe {
+        operations,
+        layers: None,
+    })
 }
 
 // -------------------------------------------------------- canonical helper

@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 fn minimal_recipe() -> TransformRecipe {
     TransformRecipe {
+        layers: None,
         operations: vec![Operation::AutoOrient],
     }
 }
