@@ -1,0 +1,12 @@
+{
+  "id": "t11_masked_adjustment",
+  "prompt": "この写真、空(画像上部)だけ少し暗くして落ち着いた印象にしたい。下半分にはできるだけ影響が出ないようにして。",
+  "input_fixture": "tests/fixtures/synthetic_scene.jpg",
+  "success_criteria": {
+    "expect_revision": {
+      "recipe_contains_ops": [{"fields_present": ["mask"]}],
+      "min_matches": 1
+    }
+  },
+  "max_turns": 11
+}

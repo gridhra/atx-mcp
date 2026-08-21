@@ -58,24 +58,47 @@ def op_names(recipe: dict[str, Any] | None) -> list[str]:
 def recipe_has_op(recipe: dict[str, Any] | None, spec: str | dict[str, Any]) -> bool:
     """recipe が spec を満たす operation を含むか。
 
-    spec が文字列なら op 名一致のみ。dict なら {"op": "...", "fields": {...}} の形式で、
-    fields の各 key/value が該当 operation のフィールドと一致することも要求する
-    (フィールドが無いオペレーションはデフォルト値が serde 側で決まるため、値の比較は
-    台帳に保存された recipe のフィールドそのものと突き合わせる = 実際に serialize
-    された値。デフォルト省略と明示指定を区別したい場合は呼び出し側で注意)。
+    spec が文字列なら op 名一致のみ。dict なら {"op": "...", "fields": {...},
+    "fields_present": [...]} の形式:
+    - "op" は省略可(省略時は op 名を問わず走査する。マスク付きトーン系 op のように
+      エージェントがどの op を選ぶか事前に決め打てないケース用)。
+    - "fields" の各 key/value が該当 operation のフィールドと一致することを要求する
+      (フィールドが無いオペレーションはデフォルト値が serde 側で決まるため、値の比較は
+      台帳に保存された recipe のフィールドそのものと突き合わせる = 実際に serialize
+      された値。デフォルト省略と明示指定を区別したい場合は呼び出し側で注意)。
+    - "fields_present" は、値を問わずそのフィールドが(null でなく)存在することだけを
+      要求する(`mask` の revision_id のように事前に値がわからないフィールド用。
+      Option フィールドは skip_serializing_if で None なら省略されるので、
+      存在すること自体がエージェントが実際にその機能を使った証跡になる)。
     """
     if not recipe:
         return False
     if isinstance(spec, str):
         return any(op.get("op") == spec for op in recipe.get("operations", []))
-    want_op = spec["op"]
+    want_op = spec.get("op")
     fields = spec.get("fields", {})
+    fields_present = spec.get("fields_present", [])
     for op in recipe.get("operations", []):
-        if op.get("op") != want_op:
+        if want_op is not None and op.get("op") != want_op:
             continue
-        if all(op.get(k) == v for k, v in fields.items()):
-            return True
+        if not all(op.get(k) == v for k, v in fields.items()):
+            continue
+        if not all(op.get(k) is not None for k in fields_present):
+            continue
+        return True
     return False
+
+
+def recipe_contains_text(recipe: dict[str, Any] | None, needle: str) -> bool:
+    """recipe を JSON 文字列化したものに needle(部分文字列)が含まれるか。
+
+    layers/blend_mode のように、op 名ベースの recipe_has_op では表現しづらい
+    構造(トップレベル "layers" キーの存在、特定ブレンドモード名の使用など)を
+    ざっくり確認するための最小限のフォールバック。厳密な構造検証ではない点に注意。
+    """
+    if not recipe:
+        return False
+    return needle in json.dumps(recipe, ensure_ascii=False)
 
 
 def aspect_ratio_matches(width: int, height: int, target: str, tol: float = 0.02) -> bool:
@@ -118,6 +141,13 @@ def _eval_expect_revision(spec: dict[str, Any], ledger: list[dict[str, Any]]) ->
                 ops_ok = False
                 break
         if not ops_ok:
+            continue
+        text_ok = True
+        for needle in spec.get("recipe_contains_text", []):
+            if not recipe_contains_text(rev.get("recipe"), needle):
+                text_ok = False
+                break
+        if not text_ok:
             continue
         matched.append(rev)
 
@@ -465,6 +495,104 @@ def run_selftests() -> None:
     ok, detail = evaluate(criteria_idempotent, ledger_duplicated)
     assert not ok, "expected fail when a second (non-reused) derivation appears"
     assert detail["expect_revision"]["derived_total"] == 2
+
+    # --- fields_present / op-name-agnostic matching (t11 相当: masked adjustment) ---
+    criteria_masked = {
+        "expect_revision": {
+            "recipe_contains_ops": [{"fields_present": ["mask"]}],
+            "min_matches": 1,
+        }
+    }
+    ledger_masked_ok = [
+        _mk_import(),
+        _mk_derived(
+            "rev_derived08",
+            "rev_import01",
+            1477,
+            1108,
+            "image/jpeg",
+            [
+                {
+                    "op": "curves",
+                    "master": [[0, 0], [128, 100], [255, 255]],
+                    "mask": {"revision_id": "rev_mask01", "invert": False, "feather_px": 8.0},
+                }
+            ],
+        ),
+    ]
+    ok, detail = evaluate(criteria_masked, ledger_masked_ok)
+    assert ok, f"expected pass for op carrying a mask field: {detail}"
+
+    # generate_mask 自体の revision(recipe なし)や、mask を使わない通常の adjust だけでは
+    # 満たされないこと。
+    ledger_masked_missing = [
+        _mk_import(),
+        _mk_derived(
+            "rev_derived09",
+            "rev_import01",
+            1477,
+            1108,
+            "image/jpeg",
+            [{"op": "adjust", "brightness": -10, "contrast": 0, "saturation": 0, "sharpness": 0}],
+        ),
+    ]
+    ok, _ = evaluate(criteria_masked, ledger_masked_missing)
+    assert not ok, "expected fail when no op carries a mask field"
+
+    # --- recipe_contains_text (t12 相当: layered composite with a named blend mode) ---
+    criteria_layers = {
+        "expect_revision": {
+            "mime_type": "image/webp",
+            "width": 1200,
+            "recipe_contains_text": ["layers", "screen"],
+            "min_matches": 1,
+        }
+    }
+    layered_recipe_ok = {
+        "operations": [{"op": "resize", "width": 1200}, {"op": "encode", "format": "webp"}],
+        "layers": [
+            {"source": "base", "ops": []},
+            {
+                "source": {"revision_id": "rev_blur01"},
+                "ops": [{"op": "blur", "sigma": 8}],
+                "blend_mode": "screen",
+                "opacity": 0.5,
+            },
+        ],
+    }
+    ledger_layers_ok = [
+        _mk_import(),
+        {
+            "asset_id": "ast_01",
+            "revision_id": "rev_derived10",
+            "source_revision_id": "rev_import01",
+            "width": 1200,
+            "height": 675,
+            "mime_type": "image/webp",
+            "byte_size": 4321,
+            "sha256": "d" * 64,
+            "rel_path": "objects/dd/" + "d" * 64 + ".webp",
+            "recipe": layered_recipe_ok,
+            "recipe_hash": "h_rev_derived10",
+            "origin": {},
+            "created_at": "2026-08-21T00:02:00Z",
+        },
+    ]
+    ok, detail = evaluate(criteria_layers, ledger_layers_ok)
+    assert ok, f"expected pass for layers recipe containing 'screen': {detail}"
+
+    # blend_mode が multiply のように別モードだと "screen" テキストが無いので fail する。
+    layered_recipe_wrong_mode = json.loads(json.dumps(layered_recipe_ok).replace("screen", "multiply"))
+    ledger_layers_wrong_mode = [
+        _mk_import(),
+        {
+            **ledger_layers_ok[1],
+            "revision_id": "rev_derived11",
+            "recipe": layered_recipe_wrong_mode,
+        },
+    ]
+    ok, _ = evaluate(criteria_layers, ledger_layers_wrong_mode)
+    assert not ok, "expected fail when recipe text does not contain 'screen'"
 
     # --- aspect_ratio tolerance ---
     assert aspect_ratio_matches(1600, 900, "16:9")

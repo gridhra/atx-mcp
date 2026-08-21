@@ -1,0 +1,14 @@
+{
+  "id": "t12_layer_composite",
+  "prompt": "この画像の上に、同じ画像をぼかしたものを screen 50% で重ねてふんわりさせて、1200px幅 WebPで書き出す準備をして。",
+  "input_fixture": "tests/fixtures/synthetic_scene.jpg",
+  "success_criteria": {
+    "expect_revision": {
+      "mime_type": "image/webp",
+      "width": 1200,
+      "recipe_contains_text": ["layers", "screen"],
+      "min_matches": 1
+    }
+  },
+  "max_turns": 12
+}
