@@ -171,44 +171,35 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      id-token: write # required for --provenance
+      id-token: write # OIDC: trusted publishing + provenance
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.release.outputs.tag }}
 
-      # `secrets` is not available in job-level `if`, so gate on a step output.
-      - id: gate
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -n "$NPM_TOKEN" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::NPM_TOKEN is not set; skipping npm publish."
-          fi
-
       - uses: actions/setup-node@v4
-        if: steps.gate.outputs.enabled == 'true'
         with:
-          node-version: "22"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
+      # Trusted publishing (OIDC) requires npm >= 11.5.1.
+      - name: Update npm for trusted publishing
+        run: npm install -g npm@latest && npm --version
+
       - uses: actions/download-artifact@v4
-        if: steps.gate.outputs.enabled == 'true'
         with:
           pattern: npmbin-*
           path: npmbins
 
       - name: Assemble npm packages
-        if: steps.gate.outputs.enabled == 'true'
         run: node npm/scripts/build-packages.mjs --version "${{ needs.release.outputs.version }}" --bins npmbins
 
+      # Auth: npm trusted publishing via GitHub OIDC — no token, no secret.
+      # Each package must have this repo + workflow registered as its
+      # Trusted Publisher on npmjs.com (see RELEASING.md). A package without
+      # that registration fails here; first-time packages are published
+      # manually via scripts/publish-npm-local.sh.
       - name: Publish
-        if: steps.gate.outputs.enabled == 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           # Platform packages first: the main package's optionalDependencies

@@ -25,25 +25,41 @@ grep -rl gridhra . --exclude-dir=target --exclude-dir=.git --exclude-dir=node_mo
 > 置換を忘れても npm publish は壊れない。ただし README とインストーラの URL は
 > 直らないので、上記の置換は必ず行うこと。
 
-## 1. リポジトリ Secrets
+## 1. npm 認証 — Trusted Publishing(OIDC、トークン不要)
 
-| Secret | 必須 | 用途 |
-|---|---|---|
-| `NPM_TOKEN` | 任意 | npm publish。未設定なら npm ジョブはスキップされ、GitHub Release だけ作られる |
-| `GITHUB_TOKEN` | 自動 | Release 作成。設定不要 |
+npm の Classic トークンは 2025-12 に全廃されたため、CI からの publish は
+**Trusted Publishing(OIDC)** を使う。リポジトリ Secrets は不要
+(`GITHUB_TOKEN` は自動供給。Release 作成のみに使用)。
 
-`NPM_TOKEN` は npmjs.com の **Automation** トークン(2FA をバイパスできる種別)を使う。
-Granular access token の場合は、以下 6 パッケージへの write 権限が必要:
+### 一度だけの設定(パッケージごと)
 
-- `atx-mcp`
-- `atx-mcp-darwin-arm64`
-- `atx-mcp-darwin-x64`
-- `atx-mcp-linux-x64`
-- `atx-mcp-linux-arm64`
-- `atx-mcp-win32-x64`
+npmjs.com の各パッケージページ → **Settings → Trusted Publisher** に登録する:
 
-初回 publish 前は「まだ存在しないパッケージ」なので、granular token ではなく
-Automation (classic) token を使うのが確実。
+- Organization or user: `gridhra`
+- Repository: `atx-mcp`
+- Workflow filename: `release.yml`
+- Environment: 空欄
+- Allowed actions: `npm publish`
+
+対象パッケージ(6個): `atx-mcp`, `atx-mcp-darwin-arm64`, `atx-mcp-darwin-x64`,
+`atx-mcp-linux-x64`, `atx-mcp-linux-arm64`, `atx-mcp-win32-x64`
+
+### 初回 publish(パッケージがまだ存在しない場合)
+
+Trusted Publisher はパッケージ単位の設定で既存パッケージが前提。
+新パッケージ追加時の初回だけ、npm login 済みのローカルから手動 publish する:
+
+```sh
+# GitHub Release の成果物から npm/dist を組み立てた上で
+sh scripts/publish-npm-local.sh          # Passkey/WebAuthn(通常のターミナルで実行 — ブラウザ認証が開く)
+sh scripts/publish-npm-local.sh 123456   # TOTP の場合
+```
+
+publish 後、上記の Trusted Publisher を登録すれば以後のバージョンは CI が自動 publish する。
+
+既知の落とし穴: 類似名パッケージを連続 publish すると npm のスパム検知
+(`Package name triggered spam detection`)に当たることがある。
+その場合は https://npmjs.com/support に解除依頼を出す(名前変更は別名でも再検知されがちで非推奨)。
 
 ## 2. リリース手順
 
@@ -65,7 +81,7 @@ git push origin v0.2.0
    (バイナリ + LICENSE + README を同梱)を作成
 2. **release** — 全アーカイブを集めて `SHA256SUMS` を生成し、GitHub Release を作成
 3. **npm** — アーティファクトから npm パッケージ群を組み立て、
-   `npm publish --provenance --access public` する(`NPM_TOKEN` がある場合のみ)
+   `npm publish --provenance --access public` する(認証は Trusted Publishing / OIDC)
 
 npm パッケージのバージョンは常にタグ(先頭 `v` を除いたもの)。
 Cargo の version とタグは手動で一致させる必要がある — **不一致のままタグを打たないこと**
