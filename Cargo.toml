@@ -43,7 +43,7 @@ sha2 = "0.10"
 hex = "0.4"
 thiserror = "2"
 anyhow = "1"
-ulid = "1"
+ulid = "3"
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
 tracing = "0.1"
