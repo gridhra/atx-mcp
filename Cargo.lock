@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "atx-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "atx-geometry",
  "fast_image_resize",
@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "atx-geometry"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "image",
  "imageproc",
@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "atx-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "atx-core",
@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "atx-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "atx-core",
  "hex",
