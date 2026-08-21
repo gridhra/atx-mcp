@@ -20,7 +20,8 @@
 `optionalDependencies` 自动安装。
 
 ```sh
-claude mcp add asset-transform -- npx -y atx-mcp --workspace /path/to/asset-workspace
+# --scope user 使其在所有项目中可用(省略则仅限当前项目)
+claude mcp add --scope user asset-transform -- npx -y atx-mcp --workspace /path/to/asset-workspace
 ```
 
 也可以直接写入 MCP 客户端的配置文件:

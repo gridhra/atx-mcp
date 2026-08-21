@@ -19,7 +19,8 @@ Node.js 18+ があれば他に何も要らない。プラットフォーム対�
 `optionalDependencies` 経由で自動的に入る。
 
 ```sh
-claude mcp add asset-transform -- npx -y atx-mcp --workspace /path/to/asset-workspace
+# --scope user で全プロジェクトから利用可能になる(省略時はカレントプロジェクト限定)
+claude mcp add --scope user asset-transform -- npx -y atx-mcp --workspace /path/to/asset-workspace
 ```
 
 MCP クライアントの設定ファイルに直接書く場合:

@@ -21,7 +21,8 @@ Node.js 18+ is all you need. The prebuilt native binary for your platform is
 pulled in automatically via `optionalDependencies`.
 
 ```sh
-claude mcp add asset-transform -- npx -y atx-mcp --workspace /path/to/asset-workspace
+# --scope user makes it available in every project (omit for current-project only)
+claude mcp add --scope user asset-transform -- npx -y atx-mcp --workspace /path/to/asset-workspace
 ```
 
 Or add it directly to your MCP client config:
