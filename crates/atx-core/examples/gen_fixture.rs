@@ -474,6 +474,7 @@ fn tilt_recipe() -> TransformRecipe {
             Operation::Encode {
                 format: OutputFormat::Jpeg,
                 quality: Some(QUALITY),
+                bit_depth: None,
             },
         ],
     }

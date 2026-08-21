@@ -111,12 +111,41 @@ fn wb_identity_is_byte_identical() {
     assert_eq!(pixels(&out2), pixels(&src));
 }
 
+/// sRGB EOTF(符号値 0..1 → 線形光)。
+fn eotf(c: f64) -> f64 {
+    if c <= 0.040_45 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// sRGB OETF(線形光 → 符号値 0..1)。
+fn oetf(l: f64) -> f64 {
+    if l <= 0.003_130_8 {
+        l * 12.92
+    } else {
+        1.055 * l.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// 「u8 符号値にゲインを **線形光で** 掛けた結果」の u8 符号値。
+fn gained_u8(v: u8, gain: f64) -> u8 {
+    let linear = (eotf(v as f64 / 255.0) * gain).clamp(0.0, 1.0);
+    (oetf(linear) * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
 /// 暖色方向(temperature > 0)は R を上げ B を下げる。無彩色ランプで読む。
 ///
 /// 期待値はモデルから手計算: t=100 →
 /// g_r=1.35, g_g=1.0, g_b=0.65 / mean = 0.2126*1.35 + 0.7152*1.0 + 0.0722*0.65
 /// = 0.28701 + 0.7152 + 0.04693 = 1.04914 →
 /// G_r ≈ 1.286671, G_g ≈ 0.953165, G_b ≈ 0.619554。
+///
+/// **v2 の変更点**: このゲインは **線形光の倍率**として掛かる(ops/wb.rs 参照)。
+/// スライダ写像は 1 も変えていないが、同じ +100 でも符号値への効き方は緩やかになる
+/// (符号値 128 に対して v1 は R=165 だったが、v2 は R=144)。
+/// 物理的に正しいのは v2 のほうで、これがこのリリースの目的そのものである。
 #[test]
 fn wb_warm_raises_red_and_lowers_blue() {
     let out = run(
@@ -127,9 +156,14 @@ fn wb_warm_raises_red_and_lowers_blue() {
     );
     // 128 の画素で手計算値と一致すること。
     let px = out.get_pixel(128, 0).0;
-    assert_eq!(px[0], (128.0f64 * 1.286671).round() as u8);
-    assert_eq!(px[1], (128.0f64 * 0.953165).round() as u8);
-    assert_eq!(px[2], (128.0f64 * 0.619554).round() as u8);
+    assert_eq!(px[0], gained_u8(128, 1.286671));
+    assert_eq!(px[1], gained_u8(128, 0.953165));
+    assert_eq!(px[2], gained_u8(128, 0.619554));
+    assert_eq!(
+        [px[0], px[1], px[2]],
+        [144, 125, 102],
+        "v2 (linear-light gains); v1 was [165, 122, 79]"
+    );
     assert!(px[0] > 128 && px[2] < 128, "warm: R up, B down, got {px:?}");
     assert_eq!(px[3], 255, "alpha untouched");
 
@@ -481,10 +515,11 @@ fn golden_white_balance_pipeline_sha256() {
         ]}"#,
     );
     let out = apply_recipe(FIXTURE, &r, &Limits::default()).unwrap();
-    assert_eq!(atx_core::ENGINE_VERSION, "atx-core/1");
+    assert_eq!(atx_core::ENGINE_VERSION, "atx-core/2");
     assert_eq!(
         sha256_hex(&out.bytes),
-        "bc5348305c094479e20f2397eefc0a863754dff19532393cc8d0ce97d3673604",
+        // v2 (f32 linear) golden; v1 value was bc5348305c094479e20f2397eefc0a863754dff19532393cc8d0ce97d3673604
+        "4e3214225a06c45440d773d7fd31ee7d4e183509ffa2840fbd9c8ea494591629",
         "white_balance golden"
     );
 }
@@ -502,10 +537,11 @@ fn golden_hsl_pipeline_sha256() {
         ]}"#,
     );
     let out = apply_recipe(FIXTURE, &r, &Limits::default()).unwrap();
-    assert_eq!(atx_core::ENGINE_VERSION, "atx-core/1");
+    assert_eq!(atx_core::ENGINE_VERSION, "atx-core/2");
     assert_eq!(
         sha256_hex(&out.bytes),
-        "054f3dbc85e629067dd26e635c723b9e7d222d2faad9d4c008ccbd52a2757e4f",
+        // v2 (f32 linear) golden; v1 value was 054f3dbc85e629067dd26e635c723b9e7d222d2faad9d4c008ccbd52a2757e4f
+        "245cff9e4e1153f635aa2e460daaf9d680dd791ca2fcd5137ac7486f1185f609",
         "hsl golden"
     );
 }

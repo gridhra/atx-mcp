@@ -3,7 +3,9 @@
 
 mod codec;
 pub mod engine;
+pub(crate) mod linear;
 pub(crate) mod ops;
+pub(crate) mod parallel;
 mod pixel_ops;
 pub mod recipe;
 pub(crate) mod transform;

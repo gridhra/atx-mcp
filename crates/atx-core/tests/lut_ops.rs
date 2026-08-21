@@ -549,7 +549,8 @@ fn golden_warm_lut_jpeg() {
         .expect("should succeed");
     assert_eq!(
         sha256_hex(&out.bytes),
-        "181bd614df27d30e970e928391d2090e52ab7d3583ab1311da74a52a73d9708e",
+        // v2 (f32 linear) golden; v1 value was 181bd614df27d30e970e928391d2090e52ab7d3583ab1311da74a52a73d9708e
+        "18fa1d0a75ad649c8d7fb385abe86329114b77bb98834983ed34ced1e95b1d6f",
         "lut golden changed"
     );
 }

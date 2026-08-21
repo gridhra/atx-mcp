@@ -625,10 +625,16 @@ pub const OPERATIONS: &[OpDoc] = &[
                 requirement: "optional",
                 semantics: "Lossy quality; ignored for png.",
             },
+            ParamDoc {
+                name: "bit_depth",
+                type_hint: "u8 8|16",
+                requirement: "default: 8",
+                semantics: "Output bit depth. 16 is valid for png only (preserves the f32 engine's precision).",
+            },
         ],
         examples: &[
             r#"{"op": "encode", "format": "webp", "quality": 82}"#,
-            r#"{"op": "encode", "format": "png"}"#,
+            r#"{"op": "encode", "format": "png", "bit_depth": 16}"#,
         ],
         warnings: &[
             "encode must be the LAST operation and may appear at most once; omitting it keeps the input format.",

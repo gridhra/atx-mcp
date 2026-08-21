@@ -252,3 +252,56 @@ fn unknown_fields_are_rejected_at_parse_time() {
     );
     assert!(err.is_err());
 }
+
+// ---------------------------------------------------------------------------
+// v0.4: encode.bit_depth(16bit 出力)
+// ---------------------------------------------------------------------------
+
+/// `bit_depth` は 8 / 16 のみ。16 は png 出力に限る。
+#[test]
+fn validate_checks_bit_depth() {
+    assert_invalid(
+        r#"{"operations":[{"op":"encode","format":"png","bit_depth":12}]}"#,
+        "bit_depth must be 8 or 16",
+    );
+    assert_invalid(
+        r#"{"operations":[{"op":"encode","format":"jpeg","bit_depth":16}]}"#,
+        "bit_depth 16 is only supported for png output",
+    );
+    // 有効な組み合わせ。
+    for json in [
+        r#"{"operations":[{"op":"encode","format":"png","bit_depth":16}]}"#,
+        r#"{"operations":[{"op":"encode","format":"png","bit_depth":8}]}"#,
+        r#"{"operations":[{"op":"encode","format":"jpeg","bit_depth":8}]}"#,
+    ] {
+        recipe::validate(&parse(json)).expect("should be valid");
+    }
+}
+
+/// **`bit_depth` を書かないレシピの canonical JSON / hash は v0.3 以前と 1 バイトも変わらない。**
+///
+/// `#[serde(default, skip_serializing_if = "Option::is_none")]` なので、
+/// 既定値のときはフィールドが正規化 JSON に現れない(v0.3 の `coordinate_space` と同じ手口)。
+/// 既存 revision の冪等キーが壊れないことのゲート。
+#[test]
+fn omitted_bit_depth_is_invisible_to_the_canonical_form() {
+    let without = parse(r#"{"operations":[{"op":"encode","format":"png"}]}"#);
+    let explicit_default =
+        parse(r#"{"operations":[{"op":"encode","format":"png","bit_depth":8}]}"#);
+    let sixteen = parse(r#"{"operations":[{"op":"encode","format":"png","bit_depth":16}]}"#);
+
+    let canonical = recipe::canonical_json(&without).unwrap();
+    assert_eq!(
+        canonical, r#"{"operations":[{"format":"png","op":"encode"}]}"#,
+        "omitting bit_depth must keep the pre-v0.4 canonical form"
+    );
+    // 明示した場合は当然フィールドが出るので、別ハッシュになる(意味が違うので正しい)。
+    assert_ne!(
+        recipe::recipe_hash(&without).unwrap(),
+        recipe::recipe_hash(&explicit_default).unwrap()
+    );
+    assert_ne!(
+        recipe::recipe_hash(&without).unwrap(),
+        recipe::recipe_hash(&sixteen).unwrap()
+    );
+}

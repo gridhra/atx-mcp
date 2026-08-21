@@ -1,13 +1,23 @@
 //! 3D LUT(.cube)適用。
 //!
+//! **作業空間: sRGB 符号値**(`ops/mod.rs` の表を参照)。`.cube` LUT は業界慣習として
+//! **符号化済みの信号**(ディスプレイ参照の 0..1)に対して定義されるため、
+//! 線形光で引くと制作者の意図と全く違うルックになる。
+//!
 //! - パース: Adobe Cube LUT Specification 1.0(LUT_1D_SIZE / LUT_3D_SIZE、
 //!   DOMAIN_MIN/MAX、TITLE、# コメント)に従う
 //! - 補間: 3D は四面体補間(業界標準・回転対称性が良い)、1D は線形補間
 //! - 決定論: LUT 値は f64 でパース後 1e-6 グリッドへ量子化。補間は固定順序の四則演算
-//! - strength: 出力 = lerp(元, LUT適用後, strength) を f64 で計算し half-away-from-zero 丸め
+//! - strength: 出力 = lerp(元, LUT適用後, strength) を f64 で計算し f32 へ戻す
+//!
+//! # v2 の変更点
+//!
+//! 入出力が u8 から sRGB 符号値の f32 になった。LUT の格子引きに渡す値が
+//! 256 段に量子化されなくなったため、**格子間の補間が本来の連続分解能で効く**
+//! (17 格子や 33 格子の LUT で v1 に見えていた微妙なバンディングが消える)。
 
-use image::RgbaImage;
-
+use crate::linear::LinearImage;
+use crate::parallel;
 use crate::{AtxError, Result};
 
 /// 3D LUT の格子サイズ上限(仕様上は 2..=256 だが、メモリ実効性から 129 に制限)。
@@ -87,17 +97,6 @@ fn parse_triple(fields: &[&str], line: usize, what: &str) -> Result<[f64; 3]> {
 /// f64 を 1e-6 グリッドへ量子化する(決定論規約。mod.rs 参照)。
 fn quantize(v: f64) -> f64 {
     (v * 1e6).round() / 1e6
-}
-
-/// half-away-from-zero で f64 を u8(0..=255)へ丸める。
-/// ops::blur 等と同じ規約だが、モジュール間結合を避けるためここで独自に持つ。
-fn round_to_u8(v: f64) -> u8 {
-    let r = if v >= 0.0 {
-        (v + 0.5).floor()
-    } else {
-        (v - 0.5).ceil()
-    };
-    r.clamp(0.0, 255.0) as u8
 }
 
 /// .cube テキストをパースする。エラーは行番号付き。
@@ -249,32 +248,35 @@ fn expected_entries(size: u32, is_3d: bool) -> usize {
     }
 }
 
-pub fn apply(img: &RgbaImage, lut: &CubeLut, strength: f64) -> RgbaImage {
+pub fn apply(img: &LinearImage, lut: &CubeLut, strength: f64) -> LinearImage {
     let mut out = img.clone();
     if strength == 0.0 {
         return out;
     }
-    for px in out.pixels_mut() {
-        let orig = [px[0] as f64, px[1] as f64, px[2] as f64];
-        // domain 正規化(0..1 へクランプ)。
-        let mut v01 = [0.0f64; 3];
-        for ch in 0..3 {
-            let min = lut.domain_min[ch];
-            let max = lut.domain_max[ch];
-            let t = (orig[ch] / 255.0 - min) / (max - min);
-            v01[ch] = t.clamp(0.0, 1.0);
+    parallel::for_each_chunk(&mut out.data, |chunk| {
+        for px in chunk.iter_mut() {
+            let orig = [px[0] as f64, px[1] as f64, px[2] as f64];
+            // domain 正規化(0..1 へクランプ)。
+            let mut v01 = [0.0f64; 3];
+            for ch in 0..3 {
+                let min = lut.domain_min[ch];
+                let max = lut.domain_max[ch];
+                let t = (orig[ch] - min) / (max - min);
+                v01[ch] = t.clamp(0.0, 1.0);
+            }
+            let mapped = if lut.is_3d {
+                sample_3d(lut, v01)
+            } else {
+                sample_1d(lut, v01)
+            };
+            for ch in 0..3 {
+                let target = mapped[ch].clamp(0.0, 1.0);
+                let blended = orig[ch] + (target - orig[ch]) * strength;
+                px[ch] = blended.clamp(0.0, 1.0) as f32;
+            }
+            // アルファは不変。
         }
-        let mapped = if lut.is_3d {
-            sample_3d(lut, v01)
-        } else {
-            sample_1d(lut, v01)
-        };
-        for ch in 0..3 {
-            let target = (mapped[ch].clamp(0.0, 1.0)) * 255.0;
-            px[ch] = round_to_u8(orig[ch] + (target - orig[ch]) * strength);
-        }
-        // アルファは不変。
-    }
+    });
     out
 }
 
