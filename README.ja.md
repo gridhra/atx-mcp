@@ -170,6 +170,45 @@ op 一覧はツールのスキーマにあえて埋め込んでいない。最�
 マスクの参照は LUT と同じ仕組みなので、注意点も同じ: 参照 id は `recipe_hash` に
 含まれ、そのレシピの再現はそのマスクを持つワークスペース内でのみ保証される。
 
+### レイヤー
+
+レシピは、直列の `operations` の代わりに(または併用で)`layers` スタックを
+持てる。レイヤーは下から上へ合成され、各レイヤーの `ops` はまず自分のソース
+に対して適用され、その結果が現在の合成結果へブレンドされる:
+
+```json
+{
+  "layers": [
+    { "source": "base", "ops": [] },
+    {
+      "source": { "revision_id": "rev_..." },
+      "ops": [{ "op": "blur", "sigma": 8 }],
+      "blend_mode": "multiply",
+      "opacity": 0.6
+    }
+  ],
+  "operations": [
+    { "op": "resize", "width": 1600 },
+    { "op": "encode", "format": "webp", "quality": 82 }
+  ]
+}
+```
+
+- `source` は `"base"`(`apply_transform` / `render_preview` に渡した入力
+  revision)か `{"revision_id": "rev_..."}`(ワークスペース内の他の revision)
+  のどちらか。全レイヤーのソースは base 画像と寸法が完全一致していなければ
+  ならず、そうでなければ画素処理に入る前に構造化エラーで返る。
+- `ops` は通常の operations 列で、そのレイヤーのソースだけに適用される。
+- `mask` / `blend_mode`(既定 `"normal"`)/ `opacity`(既定 `1.0`)が、
+  下のレイヤーへの合成のされ方を決める。
+- ブレンドモードは W3C の separable 12 種のいずれか: `normal` / `multiply` /
+  `screen` / `overlay` / `darken` / `lighten` / `color_dodge` / `color_burn` /
+  `hard_light` / `soft_light` / `difference` / `exclusion`。
+- `layers` がある場合、トップレベルの `operations` は合成結果に対する
+  **仕上げパス**になる。`resize` や最後の `encode` はここに置く
+  (`encode` は従来どおり最後に1回だけ)。
+- 完全なリファレンスは `explain_operation {"operation":"layers"}` を呼ぶこと。
+
 ## プリセット
 
 `apply_transform` / `render_preview` は `recipe`(生の DSL)と

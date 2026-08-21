@@ -466,6 +466,7 @@ fn gen_tilted_fixture(base_jpeg: &[u8]) {
 
 fn tilt_recipe() -> TransformRecipe {
     TransformRecipe {
+        layers: None,
         operations: vec![
             Operation::Rotate {
                 angle_degrees: TILT_ROTATE_DEGREES,

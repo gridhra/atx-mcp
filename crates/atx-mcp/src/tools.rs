@@ -946,25 +946,32 @@ impl AtxTools {
 
     /// 1つの op の完全な仕様(パラメータ表・例・落とし穴)を返す(read-only)。
     pub fn explain_operation(&self, params: &ExplainOperationParams) -> CallToolResult {
-        let doc = match crate::vocab::find(params.operation.trim()) {
-            Some(doc) => doc,
-            None => {
-                let valid = crate::vocab::operation_names();
-                let suggestions = crate::vocab::did_you_mean(&params.operation);
-                return tool_error(
-                    "unknown_operation",
-                    format!(
-                        "unknown operation {:?}; valid operations are {}",
-                        params.operation,
-                        valid.join(", ")
-                    ),
-                    serde_json::json!({
-                        "given": params.operation,
-                        "valid_values": valid,
-                        "did_you_mean": suggestions,
-                        "recovery": "call explain_operation again with one of valid_values, or list_operations for the catalog",
-                    }),
-                );
+        // `layers`(v0.6)はレシピ構造のリファレンスであって op ではないので、
+        // カタログ(`crate::vocab::OPERATIONS` / `find`)には入れず、ここで別経路で拾う。
+        let trimmed = params.operation.trim();
+        let doc = if trimmed == crate::vocab::LAYERS_DOC.name {
+            &crate::vocab::LAYERS_DOC
+        } else {
+            match crate::vocab::find(trimmed) {
+                Some(doc) => doc,
+                None => {
+                    let valid = crate::vocab::operation_names();
+                    let suggestions = crate::vocab::did_you_mean(&params.operation);
+                    return tool_error(
+                        "unknown_operation",
+                        format!(
+                            "unknown operation {:?}; valid operations are {}",
+                            params.operation,
+                            valid.join(", ")
+                        ),
+                        serde_json::json!({
+                            "given": params.operation,
+                            "valid_values": valid,
+                            "did_you_mean": suggestions,
+                            "recovery": "call explain_operation again with one of valid_values, or list_operations for the catalog",
+                        }),
+                    );
+                }
             }
         };
 
@@ -1746,7 +1753,15 @@ fn preview_recipe_of(recipe: &TransformRecipe) -> TransformRecipe {
         quality: Some(PREVIEW_JPEG_QUALITY),
         bit_depth: None,
     });
-    TransformRecipe { operations }
+    // v0.6: `layers` はそのまま素通しする。トップレベル `operations` は
+    // (layers があってもなくても)合成結果に対する仕上げパスなので、
+    // ここで差し替えた「長辺 768 リサイズ + jpeg q80 encode」がそのまま
+    // レイヤー合成後の縮小プレビューになる。layers を落とすと、
+    // ユーザが layers で意図した合成そのものがプレビューから消えてしまう。
+    TransformRecipe {
+        operations,
+        layers: recipe.layers.clone(),
+    }
 }
 
 /// プレビューのキャッシュキー:
@@ -2006,6 +2021,7 @@ mod tests {
                     bit_depth: None,
                 },
             ],
+            layers: None,
         };
         let preview = preview_recipe_of(&recipe);
         assert_eq!(preview.operations.len(), 3);
@@ -2017,6 +2033,42 @@ mod tests {
                 ..
             }
         ));
+        assert!(atx_core::recipe::validate(&preview).is_ok());
+    }
+
+    /// v0.6: `layers` を持つレシピをプレビュー用に書き換えても `layers` が
+    /// 落ちないこと(仕上げパスの差し替えだけを行い、合成そのものは保つ)。
+    #[test]
+    fn preview_recipe_keeps_layers() {
+        use atx_core::recipe::{Layer, LayerSource};
+
+        let recipe = TransformRecipe {
+            operations: vec![],
+            layers: Some(vec![
+                Layer {
+                    source: LayerSource::base(),
+                    ops: vec![],
+                    mask: None,
+                    blend_mode: Default::default(),
+                    opacity: 1.0,
+                },
+                Layer {
+                    source: LayerSource::base(),
+                    ops: vec![],
+                    mask: None,
+                    blend_mode: Default::default(),
+                    opacity: 0.5,
+                },
+            ]),
+        };
+        let preview = preview_recipe_of(&recipe);
+        assert!(
+            preview.layers.is_some(),
+            "preview_recipe_of must not drop layers"
+        );
+        assert_eq!(preview.layers.as_ref().unwrap().len(), 2);
+        // finishing pass(resize + encode)は普段どおり足される。
+        assert_eq!(preview.operations.len(), 2);
         assert!(atx_core::recipe::validate(&preview).is_ok());
     }
 

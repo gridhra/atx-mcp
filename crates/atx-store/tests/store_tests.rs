@@ -5,6 +5,7 @@ use atx_store::{AssetStore, StoreError};
 
 fn minimal_recipe() -> TransformRecipe {
     TransformRecipe {
+        layers: None,
         operations: vec![Operation::AutoOrient],
     }
 }

@@ -736,7 +736,64 @@ fn mark_enum_default(type_hint: &str, default: &str) -> Option<String> {
     Some(format!("enum {}", marked.join("|")))
 }
 
-/// 名前から op を引く。
+/// `layers`(recipe-structure、v0.6)の擬似エントリ。
+///
+/// これは op ではない: `{"op": "..."}` の名前ではなく、レシピ自体の形
+/// (`{"layers": [...]}`)を説明するリファレンスである。したがって
+/// **[`OPERATIONS`] には含めない**(`list_operations` のカタログは op のみを
+/// 保つ、`unknown_operation` エラーの `valid_values` にも出さない — instructions の
+/// 一文と、この `explain_operation("layers")` から発見できれば十分)。
+/// `tools::explain_operation` が [`find`] より先にこの名前を特別扱いする。
+pub const LAYERS_DOC: OpDoc = OpDoc {
+    name: "layers",
+    category: "structure",
+    summary: "Recipe structure (not an op): a bottom-to-top layer stack composited before the top-level operations run as a finishing pass.",
+    params: &[
+        ParamDoc {
+            name: "layers[].source",
+            type_hint: "\"base\" | {revision_id}",
+            requirement: "required",
+            semantics: "\"base\" means the input revision passed to apply_transform/render_preview. {\"revision_id\": \"rev_...\"} references any other revision already in this workspace. Every layer's source must have EXACTLY the same dimensions as the base image; a mismatch is a structured error before any pixel work happens.",
+        },
+        ParamDoc {
+            name: "layers[].ops",
+            type_hint: "Operation[]",
+            requirement: "required",
+            semantics: "A normal operations list (any op except a second-level layers stack), applied to this layer's own source before it is composited. May be empty (use the source unchanged).",
+        },
+        ParamDoc {
+            name: "layers[].mask",
+            type_hint: "{revision_id,invert,feather_px}",
+            requirement: "optional",
+            semantics: "Same shape and semantics as the per-op mask (white = this layer contributes fully at that pixel, black = the backdrop shows through unchanged there), applied at composite time on top of blend_mode/opacity.",
+        },
+        ParamDoc {
+            name: "layers[].blend_mode",
+            type_hint: "enum, 12 separable modes",
+            requirement: "default: normal",
+            semantics: "One of normal | multiply | screen | overlay | darken | lighten | color_dodge | color_burn | hard_light | soft_light | difference | exclusion (the W3C separable blend modes). Applied per-channel against the composite of the layers below.",
+        },
+        ParamDoc {
+            name: "layers[].opacity",
+            type_hint: "f64 0..1",
+            requirement: "default: 1.0",
+            semantics: "Overall strength of this layer's contribution after blend_mode, linearly blended with the backdrop. 0 = invisible, 1 = full strength.",
+        },
+    ],
+    examples: &[
+        r#"{"layers": [{"source": "base", "ops": []}, {"source": {"revision_id": "rev_01J000000000000000000000"}, "ops": [{"op": "blur", "sigma": 8}], "blend_mode": "multiply", "opacity": 0.6}], "operations": [{"op": "resize", "width": 1600}, {"op": "encode", "format": "webp", "quality": 82}]}"#,
+    ],
+    warnings: &[
+        "layers is a top-level recipe field, not something you put inside \"operations\" - a recipe has EITHER a flat operations pipeline OR a layers stack (with operations as its finishing pass), never a \"layers\" op tag.",
+        "The bottom layer is the backdrop: its blend_mode/opacity are still honored against whatever is beneath the stack (nothing, i.e. treated as normal/opaque, for the first layer).",
+        "When layers is present, the top-level \"operations\" list runs ONCE on the composited result as the finishing pass - this is where resize and the final encode belong. encode must still be the last operation and appear at most once.",
+        "The 12 blend modes here are the separable set only (normal, multiply, screen, overlay, darken, lighten, color_dodge, color_burn, hard_light, soft_light, difference, exclusion); the non-separable set (hue/saturation/color/luminosity) is not implemented yet (ROADMAP v0.7).",
+        "recipe_hash covers the whole recipe including every layer's ops and any referenced revision ids (same rule as lut/mask references), so a layered recipe reproduces only inside a workspace holding every referenced revision.",
+    ],
+};
+
+/// 名前から op を引く。`layers`(構造リファレンス)はここには含まれない -
+/// `tools::explain_operation` が別経路で扱う。
 pub fn find(name: &str) -> Option<&'static OpDoc> {
     OPERATIONS.iter().find(|op| op.name == name)
 }

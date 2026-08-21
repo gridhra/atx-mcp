@@ -6,6 +6,7 @@
 //! - `blur`: blur / median / unsharp_mask(カーネル系)
 //! - `convolve` / `hsl` / `lut` / `wb`
 //! - `mask`: 局所適用マスク(重み平面の解決とブレンド。v0.5、DESIGN.md §9.6)
+//! - `blend`: レイヤー合成(W3C separable ブレンド 12 種。v0.6、DESIGN.md §9.7)
 //!
 //! # 画素エンジン v2: op ごとの作業空間(v0.4 の中核設計)
 //!
@@ -42,6 +43,7 @@
 //! - 総和は走査順そのままの左結合で書く(再結合禁止)
 //! - 行分割の並列化は画素間の実行順序しか変えないので出力に影響しない
 
+pub mod blend;
 pub mod blur;
 pub mod color;
 pub mod convolve;

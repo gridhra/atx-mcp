@@ -359,6 +359,7 @@ fn convolve_rejects_non_finite_kernel_value() {
     let mut kernel = vec![0.0f64; 9];
     kernel[4] = f64::NAN;
     let recipe = TransformRecipe {
+        layers: None,
         operations: vec![Operation::Convolve {
             kernel,
             size: 3,
