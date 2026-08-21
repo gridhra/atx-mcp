@@ -319,3 +319,5 @@ crate 结构:`atx-core`(配方与变换引擎)/ `atx-geometry`(倾斜检测)/
 ## 许可证
 
 MIT。详见 [LICENSE](LICENSE)。
+
+如果 atx-mcp 帮你节省了时间,欢迎 [请我喝杯咖啡](https://buymeacoffee.com/gridhra) ☕

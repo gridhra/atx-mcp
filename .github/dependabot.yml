@@ -1,0 +1,52 @@
+version: 2
+
+updates:
+  # Rust workspace (Cargo.toml / Cargo.lock at the repo root).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - rust
+    commit-message:
+      prefix: "deps"
+      include: scope
+    groups:
+      # Roll every semver-compatible bump into a single PR to keep the noise
+      # low; majors stay separate so they get reviewed one at a time.
+      cargo-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+      # Security fixes must never be held back by grouping with unrelated bumps,
+      # but grouping them by severity-free single group is still fine and keeps
+      # a batch of advisories to one PR.
+      cargo-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # Actions pinned in .github/workflows/*.yml.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions-all:
+        patterns:
+          - "*"

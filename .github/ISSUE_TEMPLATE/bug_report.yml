@@ -1,0 +1,137 @@
+name: Bug report
+description: Something atx-mcp did wrong — a crash, a wrong image, a broken guarantee.
+title: "[bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug.
+
+        **atx-mcp is deterministic: the same input plus the same recipe produces
+        byte-identical output on every machine.** That is the project's
+        superpower for bug reports — a recipe JSON plus a description of the
+        input is a *perfect* reproducer, not an approximation. Please fill in
+        the recipe field carefully; with it, a bug that took you an hour to hit
+        usually reproduces here on the first try.
+
+        Found a *security* problem instead? Do not file it here — see
+        [SECURITY.md](https://github.com/gridhra/atx-mcp/blob/main/SECURITY.md)
+        and report it privately.
+
+  - type: input
+    id: version
+    attributes:
+      label: atx-mcp version
+      description: Output of `atx-mcp --version`.
+      placeholder: "atx-mcp 0.2.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: channel
+    attributes:
+      label: Install channel
+      description: How did you install atx-mcp?
+      options:
+        - npx / npm (atx-mcp package)
+        - Prebuilt binary (installer script or GitHub Release asset)
+        - Built from source (cargo)
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: OS and architecture
+      description: Operating system, version, and CPU architecture.
+      placeholder: "macOS 15.4, arm64 / Ubuntu 24.04, x86_64 / Windows 11, x86_64"
+    validations:
+      required: true
+
+  - type: textarea
+    id: recipe
+    attributes:
+      label: Full recipe JSON
+      description: |
+        The **complete** recipe you passed to `apply_transform` — every op, every
+        parameter, unedited. Do not trim it down to "the part that matters":
+        determinism means the whole recipe is the reproducer, and a removed op
+        can be the one that changes the result. If you used a preset name, paste
+        the preset name and, if you can, the expanded recipe.
+
+        Wrap it in a ```json fence so it stays readable.
+      placeholder: |
+        {
+          "ops": [
+            { "op": "rotate", "degrees": -1.4 },
+            { "op": "crop", "aspect": "16:9" },
+            { "op": "resize", "width": 1600 },
+            { "op": "encode", "format": "webp", "quality": 82 }
+          ]
+        }
+    validations:
+      required: true
+
+  - type: textarea
+    id: inspect
+    attributes:
+      label: "`inspect_image` output for the input asset"
+      description: |
+        Run `inspect_image` on the input and paste the full result. This pins
+        down the dimensions, format, color profile, orientation and metadata
+        that the recipe was applied to — usually the other half of the
+        reproducer. A ```json fence keeps it readable.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+      description: What you expected atx-mcp to produce or report.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+      description: |
+        What actually happened. Include the exact error message if there was
+        one, and attach or describe the output image if it is visually wrong.
+    validations:
+      required: true
+
+  - type: textarea
+    id: warnings
+    attributes:
+      label: Warnings returned
+      description: |
+        Any `warnings` entries returned by the tool call (from
+        `apply_transform`, `import_asset`, `export_asset`, …). Paste them
+        verbatim, or write "none".
+    validations:
+      required: true
+
+  - type: textarea
+    id: input-source
+    attributes:
+      label: Input image (optional)
+      description: |
+        If the bug needs a specific image, describe how to obtain or generate
+        it. A fully synthetic fixture
+        (`cargo run -p atx-core --example gen_fixture`) is ideal. **Please do
+        not attach photos containing personal data** — check `has_gps` in the
+        `inspect_image` output above before uploading anything.
+    validations:
+      required: false
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Client used (Claude Code, Claude Desktop, …), logs, workarounds found.
+    validations:
+      required: false

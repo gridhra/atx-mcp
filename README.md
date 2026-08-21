@@ -348,3 +348,5 @@ has no relation to the PC ATX form factor or Markdown ATX-style headings.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+If atx-mcp saves you time, you can [buy me a coffee](https://buymeacoffee.com/gridhra) ☕

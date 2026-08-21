@@ -1,0 +1,17 @@
+# cargo-audit(RustSec)設定。
+# 無視する advisory の判断根拠は deny.toml の [advisories].ignore に詳述してある。
+# 両者は必ず同じ内容に保つこと(片方だけ消すと CI がすり抜ける)。
+
+[advisories]
+ignore = []
+
+# unmaintained / unsound は情報として出すだけにして CI は止めない
+# (推移的依存のメンテ停止通知で不定期にビルドが落ちるのを避けるため)。
+# (`[output] deny` は空のまま = warning では終了コードを立てない。
+#  脆弱性が見つかった場合は既定で exit != 0 になるので、そちらが CI のゲート。)
+informational_warnings = ["unmaintained", "unsound", "notice"]
+
+[output]
+quiet = false
+format = "terminal"
+show_tree = true

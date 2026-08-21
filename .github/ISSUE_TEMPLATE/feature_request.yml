@@ -1,0 +1,101 @@
+name: Feature request
+description: Propose a new op, preset, or capability.
+title: "[feat] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before writing: atx-mcp deliberately keeps the **number of MCP tools
+        small** (working verbs only). New capability normally arrives as a new
+        **op inside a recipe** or a new **preset**, not as a new tool. New tools
+        are only considered for detection, validation, or vocabulary lookup.
+        See `docs/ROADMAP.md` ("Agent UX の規律") for the reasoning.
+
+        Also out of scope by design: generative editing, RAW development, and
+        ML-based automatic subject extraction.
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: |
+        What are you actually trying to do? Describe it as the request you would
+        make to the agent ("straighten this and make a 16:9 eyecatch") plus what
+        currently blocks you. Concrete beats abstract.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: shape
+    attributes:
+      label: What shape does this take?
+      options:
+        - New op in a recipe
+        - New preset
+        - New parameter on an existing op
+        - New MCP tool (detection / validation / vocabulary only)
+        - New output format or codec option
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed op / tool shape
+      description: |
+        Sketch the JSON. Name the op, list its parameters with types and
+        defaults, and show it used in a recipe. A rough sketch is fine — the
+        point is to make the surface concrete enough to argue about.
+        A ```json fence keeps it readable.
+      placeholder: |
+        {
+          "op": "vignette",
+          "amount": -0.3,
+          "midpoint": 0.5,
+          "roundness": 0.0,
+          "feather": 0.5
+        }
+    validations:
+      required: true
+
+  - type: textarea
+    id: determinism
+    attributes:
+      label: Determinism notes
+      description: |
+        Every atx op must be deterministic: the same input plus the same recipe
+        must produce byte-identical output on every platform. If your proposal
+        involves randomness, iteration counts, floating-point accumulation,
+        system fonts, or anything environment-dependent, say how it can be
+        pinned down (fixed seed, fixed iteration count, integer math, …).
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: |
+        Can this already be expressed with existing ops? What do other tools
+        (Lightroom, ImageMagick, a `.cube` LUT) call it, and how do they
+        parameterize it? Prior art helps a lot.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: pr
+    attributes:
+      label: Would you be willing to open a PR?
+      description: |
+        No wrong answer — this is a solo-maintained project, so knowing whether
+        a proposal comes with hands attached genuinely affects scheduling.
+      options:
+        - "Yes, I would like to implement it"
+        - "Yes, with guidance on the design and tests"
+        - "I could help with tests or fixtures, not the implementation"
+        - "No, just proposing"
+    validations:
+      required: true

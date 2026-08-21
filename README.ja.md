@@ -324,3 +324,5 @@ ATX 見出しとは関係ない。
 ## ライセンス
 
 MIT。[LICENSE](LICENSE) を参照。
+
+atx-mcp が役に立ったら [コーヒーをおごって](https://buymeacoffee.com/gridhra) もらえると励みになります ☕
