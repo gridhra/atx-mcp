@@ -26,3 +26,6 @@ hex.workspace = true
 serde_json.workspace = true
 image.workspace = true
 proptest = "1"
+# gen_fixture example のみ: 生成した tilted_scene.jpg を detect_tilt で自己検証するため。
+# atx-core 本体は atx-geometry に依存しない(依存方向は変えない、examples/dev-deps 限定)。
+atx-geometry.workspace = true

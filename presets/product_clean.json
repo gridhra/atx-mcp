@@ -1,0 +1,11 @@
+{
+  "name": "product_clean",
+  "description": "Clean e-commerce product look: near-neutral white balance, a small levels lift, and a light final sharpen (no resize/encode).",
+  "recipe": {
+    "operations": [
+      { "op": "white_balance", "temperature": 3, "tint": -2 },
+      { "op": "levels", "in_black": 6, "in_white": 249, "gamma": 1.05 },
+      { "op": "unsharp_mask", "amount": 0.6, "radius": 1.0, "threshold": 3 }
+    ]
+  }
+}

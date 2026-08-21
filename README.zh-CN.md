@@ -108,11 +108,29 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 }
 ```
 
-支持的操作(op):`auto_orient` / `rotate` / `perspective` / `crop`(crop、pad)/
+支持的操作(op,共 18 个):`auto_orient` / `rotate` / `perspective` / `crop`(crop、pad)/
 `resize`(cover、contain、fill)/ `adjust` / `color_matrix` / `curves` / `levels` /
-`blur` / `median` / `unsharp_mask` / `encode`(jpeg、png、webp、avif)/ `strip_metadata`。
+`lut` / `white_balance` / `hsl` / `blur` / `median` / `unsharp_mask` / `convolve` /
+`encode`(jpeg、png、webp、avif)/ `strip_metadata`。
 操作清单刻意不写进工具的 schema:请调用 `list_operations` 获取最新目录,
 调用 `explain_operation` 获取单个操作的完整 schema、示例与注意事项。
+
+### LUT(.cube)
+
+`.cube` 3D/1D LUT 是**素材**而非图像:先导入,再让配方引用它生成的修订版本。
+
+1. 对 `.cube` 文件调用 `import_asset`。它会以 `mime_type: "application/x-cube"`
+   存为不可变修订版本(它不是图像,因此 `inspect_image` 会有意返回结构化错误)。
+2. 在配方中引用返回的 `revision_id`:
+
+```json
+{ "op": "lut", "lut_revision_id": "rev_...", "strength": 0.8 }
+```
+
+`strength`(0..1,默认 1.0)与原图线性混合。由于修订版本不可变,把被引用的 id
+计入 `recipe_hash` 即可保持完全确定性;但这也意味着该配方只能在持有该 LUT 的
+工作区内复现,跨机器搬运风格时请连同 `.cube` 一起搬。引用不存在的 id 会在任何
+像素处理开始之前以结构化错误返回。
 
 ## 预设
 
@@ -122,6 +140,8 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 | 预设 | 作用 |
 |---|---|
 | `eyecatch_16_9` | 居中裁剪为 16:9 → 宽 1600px → WebP q82 |
+| `film_soft` | 柔和胶片感:平缓 S 形曲线 + 向亮度拉近 15% 的去饱和 |
+| `product_clean` | 干净的电商产品风:接近中性的白平衡 + 色阶提亮 + 轻度锐化 |
 | `thumbnail_square` | 居中裁剪为 1:1 → 800x800 → WebP q80 |
 | `web_optimize` | 不放大地收进 2000x2000 → WebP q80 |
 | `grayscale` | 通过 BT.709 亮度 `color_matrix` 转黑白 |

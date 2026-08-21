@@ -32,6 +32,16 @@ pub const COMPARE_LONG_EDGE: u32 = 640;
 pub const COMPARE_GAP_PX: u32 = 8;
 /// `render_preview` の overlay で使う有効値。
 pub const OVERLAY_VALUES: [&str; 3] = ["grid", "thirds", "horizon"];
+/// .cube 3D LUT アセットの MIME type(v0.3「レシピ → アセット参照」)。
+///
+/// 画像ではないアセットをストアの台帳上で区別するための擬似 MIME。
+/// atx-store の `ext_for_mime` がこれを `.cube` 拡張子に写す。
+pub const CUBE_MIME: &str = "application/x-cube";
+/// .cube 取り込みのサイズ上限。33^3 の 3D LUT でも 1MiB に満たないので、
+/// 16MiB は「テキスト LUT としてありえない大きさ」を弾く実務的なサニティ上限。
+pub const MAX_CUBE_BYTES: u64 = 16 * 1024 * 1024;
+/// .cube 判定でヘッダとして読むバイト数の上限。
+const CUBE_SNIFF_BYTES: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // 入力パラメータ(tool inputSchema はこれらから生成される)
@@ -464,6 +474,80 @@ fn atx_error(err: AtxError) -> CallToolResult {
     }
 }
 
+/// 画像でない revision に画像ツールを向けたときの構造化エラー。
+fn not_an_image(revision_id: &str, mime_type: &str) -> CallToolResult {
+    let hint = if mime_type == CUBE_MIME {
+        "this is an imported .cube 3D LUT asset, not an image; reference it from a recipe as {\"op\": \"lut\", \"lut_revision_id\": \"...\"} instead of inspecting it"
+    } else {
+        "call list_assets and pick a revision whose mime_type starts with \"image/\""
+    };
+    tool_error(
+        "not_an_image",
+        format!(
+            "revision {revision_id:?} has mime_type {mime_type:?} and is not an image, so it cannot be inspected"
+        ),
+        serde_json::json!({
+            "revision_id": revision_id,
+            "mime_type": mime_type,
+            "recovery": hint,
+        }),
+    )
+}
+
+/// ファイルが .cube 3D LUT かどうかを判定する。
+///
+/// 判定規則(どちらか一方を満たせば LUT とみなす):
+/// 1. 拡張子が `.cube`(大文字小文字を無視)
+/// 2. 先頭 64KiB のうち、コメント(`#`)と空行を除いた最初の数行に
+///    `LUT_1D_SIZE` / `LUT_3D_SIZE` キーワードがある(Adobe Cube LUT Spec 1.0)
+///
+/// 画像のマジックバイト判定より**先に**呼ぶ。テキストである .cube は
+/// `inspect_bytes` に渡すと「未知フォーマット」エラーになるため。
+fn looks_like_cube(path: &Path, bytes: &[u8]) -> bool {
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cube"))
+    {
+        return true;
+    }
+    let head = &bytes[..bytes.len().min(CUBE_SNIFF_BYTES)];
+    let text = String::from_utf8_lossy(head);
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        // ヘッダは先頭付近にあるので、無関係なテキストを深追いしない。
+        .take(16)
+        .any(|line| {
+            let upper = line.to_ascii_uppercase();
+            upper.starts_with("LUT_1D_SIZE") || upper.starts_with("LUT_3D_SIZE")
+        })
+}
+
+/// レシピが参照するアセット(v0.3 では `lut` の `lut_revision_id`)を
+/// ワークスペースの [`AssetStore`] から解決する [`atx_core::AssetResolver`]。
+///
+/// revision は不変なので、レシピが id を参照するだけで決定論が保たれる
+/// (ROADMAP v0.3 §設計判断)。参照先が無い場合は「ワークスペースに存在しない」ことを
+/// 明示し、回復手順(import_asset / list_assets)を含むメッセージにする。
+/// engine 側でこのメッセージは `AtxError::Operation { index, op }` に包まれるので、
+/// ホスト AI には「どの op の、どの参照が壊れているか」が両方届く。
+struct StoreAssets<'a>(&'a AssetStore);
+
+impl atx_core::AssetResolver for StoreAssets<'_> {
+    fn read_revision(&self, revision_id: &str) -> atx_core::Result<Vec<u8>> {
+        self.0.read_bytes(revision_id).map_err(|e| match e {
+            StoreError::RevisionNotFound(id) => AtxError::InvalidRecipe(format!(
+                "referenced asset {id:?} was not found in this workspace; \
+                 import the .cube file with import_asset first and use the revision_id it \
+                 returns, or call list_assets to see the available revision_ids"
+            )),
+            other => AtxError::InvalidRecipe(format!(
+                "referenced asset {revision_id:?} could not be read: {other}"
+            )),
+        })
+    }
+}
+
 /// `Result` を早期 return するための小さなマクロ代替。
 macro_rules! tri {
     ($expr:expr, $map:expr) => {
@@ -529,7 +613,33 @@ impl AtxTools {
             serde_json::Value::Null
         ));
 
-        let info = tri!(atx_core::inspect_bytes(&bytes, &self.limits), atx_error);
+        // 画像ではないアセット(v0.3: レシピから参照される .cube 3D LUT)は
+        // 画像としての検査を行わず、寸法 0x0 の擬似 MIME で台帳に載せる。
+        let is_cube = looks_like_cube(&path, &bytes);
+        if is_cube && bytes.len() as u64 > MAX_CUBE_BYTES {
+            return tool_error(
+                "limit_exceeded",
+                format!(
+                    "{} looks like a .cube LUT but is {} bytes, over the {MAX_CUBE_BYTES} byte limit for LUT assets",
+                    path.display(),
+                    bytes.len()
+                ),
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "byte_size": bytes.len(),
+                    "max_bytes": MAX_CUBE_BYTES,
+                    "recovery": "a .cube file this large is almost certainly not a LUT; check the file, or use a smaller LUT size",
+                }),
+            );
+        }
+        let (mime_type, width, height) = if is_cube {
+            (CUBE_MIME.to_string(), 0, 0)
+        } else {
+            let info = tri!(atx_core::inspect_bytes(&bytes, &self.limits), atx_error);
+            // 寸法は EXIF Orientation 適用後の実効値を記録する(atx-core はデコード時に
+            // 必ず Orientation を焼き込むため、以降の変換もこの向きが基準)。
+            (info.mime_type, info.oriented_width, info.oriented_height)
+        };
 
         let mut origin = BTreeMap::new();
         origin.insert(
@@ -542,38 +652,46 @@ impl AtxTools {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         );
+        if is_cube {
+            origin.insert("asset_kind".to_string(), "lut".to_string());
+        }
 
         let known_before = tri!(self.known_revision_ids(), store_error);
-        // 寸法は EXIF Orientation 適用後の実効値を記録する
-        // (atx-core はデコード時に必ず Orientation を焼き込むため、以降の変換もこの向きが基準)。
         let revision = tri!(
-            self.store.import_bytes(
-                &bytes,
-                &info.mime_type,
-                info.oriented_width,
-                info.oriented_height,
-                origin,
-            ),
+            self.store
+                .import_bytes(&bytes, &mime_type, width, height, origin),
             store_error
         );
         let reused = known_before.contains(&revision.revision_id);
         let summary = RevisionSummary::new(&self.store, &revision);
 
-        let text = format!(
-            "{} {} as {} ({}x{} {}, {} bytes)\npath: {}",
-            if reused {
-                "Reused existing import of"
-            } else {
-                "Imported"
-            },
-            path.display(),
-            summary.revision_id,
-            summary.width,
-            summary.height,
-            summary.mime_type,
-            summary.byte_size,
-            summary.path,
-        );
+        let verb = if reused {
+            "Reused existing import of"
+        } else {
+            "Imported"
+        };
+        let text = if is_cube {
+            format!(
+                "{verb} {} as {} (.cube LUT asset, {}, {} bytes). It is not an image: reference it from a recipe as {{\"op\": \"lut\", \"lut_revision_id\": \"{}\"}}.\npath: {}",
+                path.display(),
+                summary.revision_id,
+                summary.mime_type,
+                summary.byte_size,
+                summary.revision_id,
+                summary.path,
+            )
+        } else {
+            format!(
+                "{verb} {} as {} ({}x{} {}, {} bytes)\npath: {}",
+                path.display(),
+                summary.revision_id,
+                summary.width,
+                summary.height,
+                summary.mime_type,
+                summary.byte_size,
+                summary.path,
+            )
+        };
         ok_result(
             text,
             &ImportOutput {
@@ -589,6 +707,10 @@ impl AtxTools {
     /// revision の寸法・フォーマット・EXIF 要約・色情報・容量を返す(read-only)。
     pub fn inspect_image(&self, params: &RevisionParams) -> CallToolResult {
         let revision = tri!(self.store.get_revision(&params.revision_id), store_error);
+        // 画像でない revision(.cube LUT 等)はデコードを試みず、構造化エラーで返す。
+        if !revision.mime_type.starts_with("image/") {
+            return not_an_image(&params.revision_id, &revision.mime_type);
+        }
         let bytes = tri!(self.store.read_bytes(&params.revision_id), store_error);
         let info = tri!(atx_core::inspect_bytes(&bytes, &self.limits), atx_error);
         let path = self
@@ -902,7 +1024,12 @@ impl AtxTools {
 
         let bytes = tri!(self.store.read_bytes(&params.revision_id), store_error);
         let output = tri!(
-            atx_core::apply_recipe(&bytes, &recipe, &self.limits),
+            atx_core::apply_recipe_with_assets(
+                &bytes,
+                &recipe,
+                &self.limits,
+                &StoreAssets(&self.store)
+            ),
             atx_error
         );
         let revision = tri!(
@@ -985,7 +1112,12 @@ impl AtxTools {
         let preview_recipe = preview_recipe_of(&recipe);
         let bytes = tri!(self.store.read_bytes(&params.revision_id), store_error);
         let output = tri!(
-            atx_core::apply_recipe(&bytes, &preview_recipe, &self.limits),
+            atx_core::apply_recipe_with_assets(
+                &bytes,
+                &preview_recipe,
+                &self.limits,
+                &StoreAssets(&self.store)
+            ),
             atx_error
         );
 
@@ -1657,6 +1789,25 @@ mod tests {
         assert_ne!(base, grid);
         assert_ne!(base, thirds);
         assert_ne!(grid, thirds);
+    }
+
+    #[test]
+    fn cube_detection_uses_the_extension_or_the_lut_size_header() {
+        let image_path = Path::new("/tmp/photo.jpg");
+        let cube_path = Path::new("/tmp/look.CUBE");
+
+        // 1. 拡張子だけで判定する(中身がまだ読めなくても LUT 扱い)。
+        assert!(looks_like_cube(cube_path, b"whatever"));
+
+        // 2. 拡張子が違っても、コメント・空行を飛ばしたヘッダに LUT_*_SIZE があれば LUT。
+        let body = b"# a comment\n\nTITLE \"x\"\nLUT_3D_SIZE 2\n0 0 0\n";
+        assert!(looks_like_cube(image_path, body));
+        assert!(looks_like_cube(image_path, b"lut_1d_size 16\n"));
+
+        // 3. ただの画像・ただのテキストは LUT ではない。
+        assert!(!looks_like_cube(image_path, &[0xFF, 0xD8, 0xFF, 0xE0]));
+        assert!(!looks_like_cube(image_path, b"hello world\n"));
+        assert!(!looks_like_cube(image_path, b""));
     }
 
     #[test]

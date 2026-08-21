@@ -40,6 +40,7 @@ Example:
   {"op": "encode", "format": "webp", "quality": 82}
 ]}
 EXIF orientation is always normalized into the pixels at decode time, so auto_orient is an explicit no-op.
+LUT workflow: a .cube 3D LUT is an asset, not an image - import_asset the .cube file first, then reference the revision_id it returns from the recipe as {"op": "lut", "lut_revision_id": "rev_...", "strength": 1.0}.
 
 Discovering the vocabulary (the ops are deliberately NOT enumerated in the tool schemas)
 - list_operations  - compact catalog of every operation (name, one-line summary, parameter names with type/range hints) plus the built-in preset names. Start here.

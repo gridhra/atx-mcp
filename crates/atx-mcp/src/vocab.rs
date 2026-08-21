@@ -378,6 +378,126 @@ pub const OPERATIONS: &[OpDoc] = &[
         ],
     },
     OpDoc {
+        name: "lut",
+        category: "color",
+        summary: "Apply an imported .cube 3D/1D LUT to the image.",
+        params: &[
+            ParamDoc {
+                name: "lut_revision_id",
+                type_hint: "\"rev_...\"",
+                requirement: "required",
+                semantics: "Revision id of a .cube LUT already imported into THIS workspace. Workflow: call import_asset on the .cube file first (it becomes a revision with mime_type application/x-cube), then put the returned revision_id here.",
+            },
+            ParamDoc {
+                name: "strength",
+                type_hint: "f64 0..1",
+                requirement: "default: 1.0",
+                semantics: "Linear blend between the original (0.0) and the fully LUT-mapped image (1.0).",
+            },
+        ],
+        examples: &[
+            r#"{"op": "lut", "lut_revision_id": "rev_01J000000000000000000000"}"#,
+            r#"{"op": "lut", "lut_revision_id": "rev_01J000000000000000000000", "strength": 0.6}"#,
+        ],
+        warnings: &[
+            "The LUT must be in the workspace: import_asset the .cube file FIRST, then reference the revision_id it returns. A recipe pointing at an unknown id fails with a structured error before any pixel work happens.",
+            "inspect_image refuses a .cube revision on purpose - it is an asset, not an image.",
+            "The recipe hash includes the referenced revision id, so a recipe is only reproducible inside a workspace that holds that LUT. Export/import the .cube alongside the recipe to move a look between machines.",
+            "3D LUTs use tetrahedral interpolation; 1D LUTs are interpolated linearly.",
+        ],
+    },
+    OpDoc {
+        name: "white_balance",
+        category: "color",
+        summary: "White balance: temperature and tint shift.",
+        params: &[
+            ParamDoc {
+                name: "temperature",
+                type_hint: "f64 -100..100",
+                requirement: "default: 0",
+                semantics: "0 = unchanged; positive warms the image (towards amber), negative cools it (towards blue).",
+            },
+            ParamDoc {
+                name: "tint",
+                type_hint: "f64 -100..100",
+                requirement: "default: 0",
+                semantics: "0 = unchanged; positive shifts towards magenta, negative towards green.",
+            },
+        ],
+        examples: &[
+            r#"{"op": "white_balance", "temperature": 12, "tint": -4}"#,
+            r#"{"op": "white_balance", "temperature": -20}"#,
+        ],
+        warnings: &[
+            "This is an sRGB channel-gain approximation of the Lightroom sliders, not a colorimetric chromatic-adaptation transform; it is monotonic and deterministic but not physically exact.",
+            "Large shifts clip highlights in the boosted channels. Preview before committing.",
+        ],
+    },
+    OpDoc {
+        name: "hsl",
+        category: "color",
+        summary: "Per-hue-band HSL shifts (Lightroom HSL panel).",
+        params: &[
+            ParamDoc {
+                name: "red",
+                type_hint: "{hue,saturation,luminance}",
+                requirement: "optional",
+                semantics: "Shifts for the red band; each field is -100..100 and defaults to 0. Omitting the band leaves it untouched.",
+            },
+            ParamDoc {
+                name: "orange",
+                type_hint: "{hue,saturation,luminance}",
+                requirement: "optional",
+                semantics: "Same shape as red, for the orange band (skin tones live mostly here).",
+            },
+            ParamDoc {
+                name: "yellow",
+                type_hint: "{hue,saturation,luminance}",
+                requirement: "optional",
+                semantics: "Same shape as red, for the yellow band.",
+            },
+            ParamDoc {
+                name: "green",
+                type_hint: "{hue,saturation,luminance}",
+                requirement: "optional",
+                semantics: "Same shape as red, for the green band (foliage).",
+            },
+            ParamDoc {
+                name: "aqua",
+                type_hint: "{hue,saturation,luminance}",
+                requirement: "optional",
+                semantics: "Same shape as red, for the aqua/cyan band.",
+            },
+            ParamDoc {
+                name: "blue",
+                type_hint: "{hue,saturation,luminance}",
+                requirement: "optional",
+                semantics: "Same shape as red, for the blue band (sky, water).",
+            },
+            ParamDoc {
+                name: "purple",
+                type_hint: "{hue,saturation,luminance}",
+                requirement: "optional",
+                semantics: "Same shape as red, for the purple band.",
+            },
+            ParamDoc {
+                name: "magenta",
+                type_hint: "{hue,saturation,luminance}",
+                requirement: "optional",
+                semantics: "Same shape as red, for the magenta band.",
+            },
+        ],
+        examples: &[
+            r#"{"op": "hsl", "blue": {"saturation": 15, "luminance": -8}}"#,
+            r#"{"op": "hsl", "orange": {"hue": -6, "saturation": -10}, "green": {"saturation": -20}}"#,
+        ],
+        warnings: &[
+            "Every field of every band is -100..100; out-of-range values are a validation error, not a clamp.",
+            "Band boundaries are feathered, so a shift on one band bleeds slightly into its neighbours. For a global change use adjust or color_matrix instead.",
+            "hue is a shift towards the neighbouring hue, not an absolute hue value.",
+        ],
+    },
+    OpDoc {
         name: "blur",
         category: "filter",
         summary: "Gaussian blur with a given sigma.",
@@ -446,6 +566,46 @@ pub const OPERATIONS: &[OpDoc] = &[
         warnings: &[
             "threshold compares per-channel differences, not luminance (a deliberate simplification for determinism).",
             "Sharpen LAST, after the final resize; sharpening before downscaling produces halos.",
+        ],
+    },
+    OpDoc {
+        name: "convolve",
+        category: "filter",
+        summary: "Arbitrary NxN convolution kernel (edges, emboss, sharpen).",
+        params: &[
+            ParamDoc {
+                name: "kernel",
+                type_hint: "f64[size*size]",
+                requirement: "required",
+                semantics: "Row-major kernel weights; exactly size*size entries, each finite with |v| <= 256.",
+            },
+            ParamDoc {
+                name: "size",
+                type_hint: "u32 3|5|7|9",
+                requirement: "required",
+                semantics: "Kernel edge length; only odd sizes 3, 5, 7 and 9 are allowed.",
+            },
+            ParamDoc {
+                name: "divisor",
+                type_hint: "f64 |v|>=1e-6",
+                requirement: "default: 1.0",
+                semantics: "The weighted sum is divided by this before offset is added; use the sum of the kernel to keep brightness.",
+            },
+            ParamDoc {
+                name: "offset",
+                type_hint: "f64 -255..255",
+                requirement: "default: 0",
+                semantics: "Constant added after the division, in 0..255 units; typically 128 for emboss/edge kernels that center on zero.",
+            },
+        ],
+        examples: &[
+            r#"{"op": "convolve", "kernel": [0,-1,0, -1,5,-1, 0,-1,0], "size": 3}"#,
+            r#"{"op": "convolve", "kernel": [-2,-1,0, -1,1,1, 0,1,2], "size": 3, "offset": 128}"#,
+        ],
+        warnings: &[
+            "kernel.len() must equal size*size and divisor must not be ~0; both are validation errors.",
+            "Only RGB is convolved; the alpha channel passes through untouched. Borders replicate the edge pixel.",
+            "For plain sharpening prefer unsharp_mask (radius/threshold control); convolve is the escape hatch for W3C feConvolveMatrix-style effects.",
         ],
     },
     OpDoc {
@@ -550,7 +710,7 @@ mod tests {
     #[test]
     fn catalog_covers_every_operation_exactly_once() {
         let names = operation_names();
-        assert_eq!(names.len(), 14, "v0.2 has 14 operations");
+        assert_eq!(names.len(), 18, "v0.3 has 18 operations");
         let mut sorted = names.clone();
         sorted.sort_unstable();
         sorted.dedup();

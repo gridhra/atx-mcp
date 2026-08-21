@@ -96,8 +96,12 @@ python3 evals/score.py --selftest
 | `t09_preset_use` | ビルトインプリセット名での指定 |
 | `t10_error_self_correction` | 意図的に不整合なレシピ(aspect_ratio と rect の同時指定)を投げ、構造化エラーの `recovery` に従って1往復で自己修復する |
 
-各タスクの `input_fixture` は共通で `tests/fixtures/synthetic_scene.jpg`
+各タスクの `input_fixture` は基本的に共通で `tests/fixtures/synthetic_scene.jpg`
 (完全合成・決定論的に再生成可能なフィクスチャ。docs/DESIGN.md §9.2 参照)。
+例外は `t01_straighten_eyecatch`: `synthetic_scene.jpg` はほぼ水平なため「まっすぐにして」で
+`rotate` を省く正しい振る舞いが誤って失敗扱いになっていた。`evals/fixtures/tilted_scene.jpg`
+(同じ合成シーンを `-2.4°` 回転させた、客観的に傾いたフィクスチャ。`crates/atx-core/examples/gen_fixture.rs`
+が `synthetic_scene.jpg` と同時に生成し、`detect_tilt` の推奨補正角 ~+2.4° を自己検証する)を使う。
 
 ## タスクの追加方法
 
