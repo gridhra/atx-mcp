@@ -10,6 +10,42 @@
 
 完整设计请参见 [docs/DESIGN.md](docs/DESIGN.md)。
 
+## 使用场景
+
+1. **制作文章题图**
+   > "把这张照片扶正,裁成 16:9 的 1600px 题图,导出 WebP。"
+   `import_asset` → `detect_tilt`(接近水平时 AI 会判断无需校正)→ `apply_transform`(rotate → crop → resize → encode)→ `export_asset`。原始文件不会被修改,同一配方随时可复现同一结果。
+
+2. **社交/CMS 多尺寸分发**
+   > "从这张照片生成 OGP、Instagram 方图和缩略图。"
+   从同一张原图并行生成 OGP 1200×630、Instagram 1080 正方形、400px 缩略图。同一配方 = 同一修订版本的幂等性,确保重复执行也不会重复生成;只写一个预设名也能跑。
+
+3. **发布前的安全处理**
+   > "务必去掉定位信息,但颜色不要动。"
+   `strip_metadata`(`exif`)会移除包含 GPS 的 EXIF,同时保留 ICC 配置文件。AI 也可以先通过 `inspect_image` 的 `has_gps` 提前预警。
+
+4. **色调与风格调整**
+   > "只把天空的蓝调深一点,其他不要变。"
+   覆盖 `curves` / `levels` / `hsl` / `white_balance`、`film_soft` 预设,以及导入自有 `.cube` LUT(`import_asset` 后用 `lut` 应用)。
+
+5. **局部调整**
+   > "天空稍微压暗一点,地面保持不变。"
+   `generate_mask` 生成渐变/亮度区间/色相区间蒙版,接入调整后先用 `render_preview` 的 `overlay:"mask"` 目视确认作用范围,再正式应用。
+
+6. **图层合成**
+   > "把这张照片模糊一份,以 screen 50% 叠加上去,做出柔焦效果。"
+   `layers` 图层栈组合 16 种混合模式、不透明度与蒙版,搭建可复现的柔焦一类合成效果。
+
+7. **水印、修复与透视校正**
+   > "在右下角烧录 Logo,去掉电线,再修一下透视变形。"
+   `svg_overlay` 烧录 Logo,`clone`/`heal` 通过合成质感与色调去除污点或电线,`perspective` 校正会聚的竖线。
+
+8. **核验与可追责**
+   > "把这张图修改前后并排给我看看。"
+   `compare_revisions` 并排展示前后对比,或返回像素差异热力图及 `mean_abs_diff` 等统计值。每个修订版本都保留完整谱系,文章所用图片的加工历史可被完整追踪与复现——在任何机器上都是字节级一致。
+
+atx 不做的事(生成式编辑、RAW 显影、基于机器学习的自动裁切等)不在范围内,路线图参见 [docs/DESIGN.md](docs/DESIGN.md)。
+
 ## 安装
 
 无需 Rust 工具链。可任选以下一种方式。
