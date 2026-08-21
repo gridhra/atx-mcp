@@ -81,6 +81,10 @@ fn ext_for_mime(mime_type: &str) -> &'static str {
         "image/avif" => "avif",
         // 画像ではないアセット(v0.3: レシピから参照される .cube 3D LUT)。
         "application/x-cube" => "cube",
+        // ベクタアセット(v0.8: `svg_overlay` から参照される SVG)。
+        // ラスタ画像ではないが MIME は image/ で始まるので、寸法検査や
+        // デコードの対象にはならない(atx-mcp 側で分岐する)。
+        "image/svg+xml" => "svg",
         _ => "bin",
     }
 }
@@ -354,5 +358,10 @@ mod ext_tests {
         assert_eq!(ext_for_mime("application/x-cube"), "cube");
         assert_eq!(ext_for_mime("image/jpeg"), "jpg");
         assert_eq!(ext_for_mime("application/whatever"), "bin");
+    }
+
+    #[test]
+    fn svg_assets_keep_their_extension() {
+        assert_eq!(ext_for_mime("image/svg+xml"), "svg");
     }
 }

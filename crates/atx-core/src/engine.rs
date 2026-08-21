@@ -761,6 +761,42 @@ impl OpRunner<'_> {
                     )
                     .map_err(fail)?;
                 }
+                Operation::SvgOverlay {
+                    svg_revision_id,
+                    x,
+                    y,
+                    width,
+                    height,
+                    opacity,
+                    blend_mode,
+                } => {
+                    let svg_bytes = self
+                        .assets
+                        .read_revision(svg_revision_id)
+                        .map_err(|e| fail(e.to_string()))?;
+                    let raster =
+                        crate::ops::svg::rasterize(&svg_bytes, *width, *height).map_err(fail)?;
+                    // ラスタは sRGB 符号値・ストレートアルファなので、
+                    // 合成もその空間で行う(`layers` と同じ判断。DESIGN.md §9.7)。
+                    ensure_space(&mut st.img, &mut st.space, Space::Srgb);
+                    crate::ops::svg::apply(
+                        &mut st.img,
+                        &raster.img,
+                        *x,
+                        *y,
+                        *blend_mode,
+                        *opacity as f32,
+                    );
+                    st.warnings.extend(
+                        raster
+                            .warnings
+                            .into_iter()
+                            .map(|w| format!("operations[{index}] (svg_overlay): {w}")),
+                    );
+                    // 出力アルファは変えない: 不透明な backdrop へ何を載せても
+                    // αo = αs + αb(1 − αs) = 1 のままで、透明部分は元から
+                    // `has_alpha` に反映されている。
+                }
                 Operation::Median { radius, .. } => {
                     ensure_space(&mut st.img, &mut st.space, Space::Linear);
                     st.img = crate::ops::blur::median(&st.img, *radius);
@@ -876,7 +912,10 @@ fn op_space(op: &Operation) -> Option<Space> {
         | Operation::Curves { .. }
         | Operation::Levels { .. }
         | Operation::Lut { .. }
-        | Operation::Hsl { .. } => Some(Space::Srgb),
+        | Operation::Hsl { .. }
+        // ラスタライズされた SVG は sRGB 符号値の RGBA。合成式もレイヤーと同じ
+        // (DESIGN.md §9.7 / §9.9)。
+        | Operation::SvgOverlay { .. } => Some(Space::Srgb),
     }
 }
 
@@ -918,6 +957,7 @@ fn op_name(op: &Operation) -> &'static str {
         Operation::Convolve { .. } => "convolve",
         Operation::Clone { .. } => "clone",
         Operation::Heal { .. } => "heal",
+        Operation::SvgOverlay { .. } => "svg_overlay",
         Operation::StripMetadata { .. } => "strip_metadata",
     }
 }

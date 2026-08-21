@@ -879,3 +879,160 @@ ROADMAP は `clone` / `heal` を「PatchMatch、シード・反復固定で決�
   - 2 回実行のバイト同一(決定論)
   - ゴールデン: フィクスチャ → 320×240 → clone(r24 / feather 6)→
     heal(r18 / feather 4)→ jpeg85 の出力 sha256 と `recipe_hash`
+
+### 9.9 v0.8 追補(2026-08-22): `svg_overlay`(SVG の焼き込み)
+
+ROADMAP の Phase E(入出力の翼)から「resvg 焼き込み」を先に取った。
+レシピ語彙に **`svg_overlay`** が加わり、ワークスペースへ import した
+**SVG ベクタアセット**(ロゴ・ウォーターマーク・クレジット)を
+ラスタライズして画像の任意位置へ合成できるようになった。実装は
+`crates/atx-core/src/ops/svg.rs`、依存は **`resvg` 0.48.1**(usvg / tiny-skia 同梱、
+純 Rust)。`ENGINE_VERSION` は据え置き(`atx-core/2`)、**既存ゴールデンはすべて据え置きのまま green**
+(このリリースで 1 本追加)。
+
+#### レシピ形状(atx-mcp との契約)
+
+```jsonc
+{"op": "svg_overlay", "svg_revision_id": "rev_logo",
+ "x": 24, "y": 24, "width": 320, "opacity": 0.25, "blend_mode": "screen"}
+```
+
+- `svg_revision_id`(必須)/ `x` / `y`(必須、**i64**)/ `width` / `height`
+  (`Option<u32>`、`skip_serializing_if`)/ `opacity`(既定 1.0)/
+  `blend_mode`(既定 `normal`)。**enum バリアントの追加**なので既存の値の serde
+  表現は 1 文字も変わらず、**既存レシピの `recipe_hash` は不変**
+  (v0.1 のピン `884ea169…` は据え置きで green)
+- `opacity` / `blend_mode` は既定値でも正規化 JSON に**必ず現れる**
+  (`skip_serializing_if` を付けていない)。`width` / `height` は省略時に現れない。
+  canonical は
+  `{"blend_mode":"normal","op":"svg_overlay","opacity":1.0,"svg_revision_id":"…","x":12,"y":34}`
+- **`x` / `y` は左上隅**で、**その時点のパイプライン画像**の座標系。**負でよい**
+  (画像外はクリップ。エラーにしないのは「右端から少しはみ出したロゴ」が
+  正当な意図だから)
+- **マスクは付けられない**。`x` / `y` / `width` / `height` + ラスタのアルファが
+  そのまま適用領域なので、`mask` と併用すると二重定義になる
+  (`clone` / `heal` と同じ判断)。`Operation::mask()` は常に `None`
+- validate: id は `rev_` 始まり、`opacity` は有限かつ 0..=1、
+  `width` / `height` は与えるなら 1..=32768。**寸法の妥当性(固有サイズの有無)は
+  実行時**の構造化エラー — SVG のバイト列を読むまで分からないため
+
+#### 決定論とフォント(このリリースの中核判断)
+
+`resvg` を **`default-features = false`** で入れた。既定で有効な
+`text` / `system-fonts` は **システムにインストールされたフォントを読みに行く**。
+フォントは OS・バージョン・ユーザのインストール状況で変わり、フォールバックの
+選択やヒンティングまで揺れるので、**同じレシピ・同じ SVG が実行マシンによって
+違うバイト列を出す**ことになり、本プロジェクトの横断規律(バイト同一の再現性)と
+正面から矛盾する。
+
+- 「空の fontdb を渡す」よりも **`text` 機能ごとビルドから外す**方を採った。
+  前者は「たまたま空にしている」設定だが、後者は `Options` に `fontdb` /
+  `font_resolver` フィールドが**存在しない** = システムフォントを読む経路が
+  コンパイル時に消えている、という**型で担保された保証**になる
+- 帰結として **`<text>` は描画されない**。SVG ソースに `<text` が現れたら
+  (素朴な文字列走査で十分)実行時警告
+  `svg contains text elements; text is not rendered (convert text to paths for
+  deterministic output)` を出す。これは制約ではなく**契約**である:
+  パス化された文字はどのマシンでも同じ画素になる。README 3 種と
+  `explain_operation` の warnings、import_asset のテキストサマリの
+  **4 箇所すべてで**この規約を先回りして伝える
+- `svgz`(gzip)と `raster-images`(SVG 内の埋め込み PNG/JPEG)も外して
+  依存を最小に保った(C 依存は増えていない)
+- ラスタライズ本体(tiny-skia)は乱数も反復も持たない f32 の演算なので決定論的。
+  「2 回実行してバイト同一」+ ゴールデンの sha256 でこれを固定する
+
+#### 合成: レイヤーと**同じ関数**を通す
+
+作業空間は **sRGB 符号値**(`ops/mod.rs` の表に追記)。SVG の色指定は CSS の色 =
+符号値であり、tiny-skia が返す RGBA8 もその空間の値である。さらに合成そのものが
+W3C compositing-1 なので、§9.7 の「合成は sRGB 符号値空間で行う」をそのまま引き継ぐ。
+
+実装上は `ops/blend.rs` の合成ループの**内側を 1 画素関数
+`composite_px(dst, src, mode, opacity, w)` に括り出し**、`composite`(レイヤー)と
+`svg::apply`(オーバレイ)が**同じ実装を共有**する。式・演算順・端点分岐
+(`αs == 0` は backdrop をバイト同一で残す等)が 1 箇所に閉じるので、
+「レイヤーと同じ数式である」ことがコード上で自明になる。括り出しは
+呼び出し順を変えていないため、**レイヤー合成の出力は 1 ビットも動いていない**
+(既存ゴールデン据え置きで green)。
+
+`αs = ラスタのアルファ × opacity × 1.0` で、マスク重みの位置に 1.0 を渡す
+(1.0 倍は厳密な恒等なので専用パスを持たなくてもビット同一)。
+tiny-skia の `Pixmap` は**プリマルチプライ済み** RGBA8 なので、
+`a == 0` は RGB を 0 にする規則(`linear.rs` の `unpremultiply` と同じ)で解いてから
+ストレートアルファの中間表現へ載せる。
+
+出力アルファ(`has_alpha`)は**変えない**: 不透明な backdrop へ何を載せても
+`αo = αs + αb(1 − αs) = 1` のままで、透明部分は元から `has_alpha` に出ている。
+
+#### 寸法ルールと「固有サイズが無い SVG」
+
+| `width` | `height` | ラスタ寸法 |
+|---|---|---|
+| なし | なし | SVG の**固有サイズ** |
+| あり | なし | 幅を合わせ、高さは固有サイズの縦横比から導く(half-away-from-zero) |
+| なし | あり | その逆 |
+| あり | あり | 指定どおり(縦横比は無視) |
+
+usvg は固有サイズを解決できないとき `Options::default_size`(100x100)で
+**黙って代替する**。その値に依存した結果を返すのは「決定論的だが意味の無い出力」なので、
+**先にルート要素の属性を見て固有サイズの有無を判定する**
+(`viewBox` があるか、または `width` と `height` が両方とも `%` でない絶対長か —
+usvg の `resolve_svg_size` の裏返し)。固有サイズが無く、かつ `width` と `height` の
+**両方**が与えられていない場合は、`viewBox` を足すか両方指定せよという
+構造化エラーで返す。判定と本体パースは `usvg::roxmltree::Document` を 1 回作って
+`Tree::from_xmltree` へ渡すので、XML パースは 1 回で済む。
+
+#### atx-mcp 側(アセットの入口と出口)
+
+- **`import_asset` が `.svg` を検出する**: 拡張子(大文字小文字無視)**または**
+  先頭 4KiB に `<svg` が現れること。画像のマジックバイト判定より**先に**呼ぶ
+  (テキストである SVG を `inspect_bytes` に渡すと「未知フォーマット」になる。
+  `.cube` と同じ構造)。MIME は `image/svg+xml`、寸法は**固有サイズ**を記録し、
+  持たない SVG は `0x0`(= 「この SVG は自分では大きさを決められない」の記録であり、
+  `svg_overlay` で `width` / `height` を書けというサインになる)
+- 寸法の取得は **`atx_core::svg_intrinsic_size(bytes) -> Option<(u32, u32)>`** という
+  core 側の小さな公開ヘルパ 1 本で行う。atx-mcp / atx-store に resvg を持ち込まず、
+  **ラスタライザへの依存を atx-core 1 箇所に閉じる**ため
+- **`image/` で始まるのにラスタ画像ではない**という新種が生まれたので、
+  判定を `is_raster_image(mime)`(= `image/` 始まり **かつ** SVG でない)という
+  **単一の関数**に集約した。`inspect_image` / `generate_mask` / マスクオーバレイに加え、
+  `apply_transform` / `render_preview` の**入力 revision** もこれで弾く
+  (SVG は「レシピから参照されるもの」であって「変換されるもの」ではない)。
+  エラーは既存の `not_an_image` に SVG 用の recovery 文言を足したもので、
+  `svg_overlay` の使い方を 1 往復で示す
+- atx-store の `ext_for_mime` に `"image/svg+xml" => "svg"` を追加
+
+#### テスト実績
+
+- `cargo test --workspace` green、
+  `cargo clippy --workspace --all-targets -- -D warnings` クリーン
+- `src/ops/svg.rs` ユニット(9 本): 固有サイズの読み取り(width/height 属性 /
+  viewBox 単独 / `%` + viewBox 無しは `None`)、非 XML・非 `<svg>` の区別、
+  片側指定の縦横比保持、不透明塗りのアンプリマルチプライが厳密、
+  `<text>` の警告、validate マトリクス、負座標のクリップ
+- 新設 `crates/atx-core/tests/svg_overlay.rs`(17 本):
+  - canonical JSON のピン留めと既定値の往復、`x` / `y` が i64(負値)
+  - v0.1 のピン `884ea169…` が enum 拡張で動いていないこと
+  - validate マトリクス(空 id / `rev_` 始まり / opacity 範囲 / 寸法 0 / 上限超過)、
+    `mask` が未知フィールドとして弾かれること、必須欠落・未知モードの serde 拒否
+  - **押した画素は SVG の色そのもの、押していない画素は backdrop がバイト同一**
+    (矩形の外を全画素走査)
+  - `width` だけ / `height` だけ / 両方指定の寸法ルール
+  - 負座標のクリップ、完全に画像外なら恒等
+  - opacity 0.5 の期待値を**テスト内で f64 で独立計算**(±1)、opacity 0 は恒等、
+    `multiply` が W3C の式どおり(純青 → R/G が 0、B は厳密に保存)
+  - `<text>` 入り SVG が警告を出し、**図形は描かれ、字形は 1 画素も出ない**
+    (緑の矩形が全域そのまま = 文字が落ちた証拠)。テキスト無しでは警告が出ない
+  - 固有サイズ無しの構造化エラー(op 番号 / op 名 / `viewBox` の提案を含む)と、
+    両方指定での回復
+  - 2 回実行のバイト同一(決定論)
+  - ゴールデン: フィクスチャ → 320×240 → バッジを右下へ(幅 72 / opacity 0.8 /
+    screen)→ jpeg85 の出力 sha256 と `recipe_hash`
+- 新設 `crates/atx-mcp/tests/svg_assets.rs`(6 本): import が固有サイズ 40x20 と
+  `.svg` 拡張子を記録すること・サマリがフォント規約を先に伝えること・冪等再取り込み、
+  `inspect_image` / `apply_transform` の `not_an_image`、未解決参照の構造化エラー、
+  E2E(import → 縮小 → 右下へ 0.35 のウォーターマーク → png)で
+  **押した矩形の外が 1 画素も動かない**こと、カタログ 21 件
+- フィクスチャ `tests/fixtures/badge.svg` は 40x20 の完全な自作
+  (viewBox 全面の不透明な青矩形 + 黄円)。矩形が画素格子に一致するので
+  **全画素が完全不透明** = 厳密な等値でプローブできる
