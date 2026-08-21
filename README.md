@@ -151,10 +151,11 @@ It is created automatically if it doesn't exist.
 }
 ```
 
-Supported ops (21): `auto_orient` / `rotate` / `perspective` / `crop` (crop,
+Supported ops (27): `auto_orient` / `rotate` / `perspective` / `crop` (crop,
 pad) / `resize` (cover, contain, fill) / `adjust` / `color_matrix` / `curves` /
 `levels` / `lut` / `white_balance` / `hsl` / `blur` / `median` /
-`unsharp_mask` / `convolve` / `clone` / `heal` / `svg_overlay` / `encode`
+`unsharp_mask` / `convolve` / `clone` / `heal` / `svg_overlay` / `flip` /
+`vignette` / `grain` / `gradient_map` / `pixelate` / `auto_levels` / `encode`
 (jpeg, png, webp, avif) / `strip_metadata`.
 The operation vocabulary is deliberately kept out of the tool schemas: call
 `list_operations` for the up-to-date catalog and `explain_operation` for one
@@ -218,9 +219,9 @@ uses the same W3C formula and the same 16 `blend_mode` values as
 
 A mask is a *grayscale image revision*: its BT.709 luma is the weight, so white
 means "apply this operation at full strength" and black means "leave the pixel
-alone". Any of the 11 tone/filter ops (`adjust`, `color_matrix`, `curves`,
+alone". Any of the 14 tone/filter ops (`adjust`, `color_matrix`, `curves`,
 `levels`, `hsl`, `lut`, `white_balance`, `blur`, `median`, `unsharp_mask`,
-`convolve`) accepts one.
+`convolve`, `grain`, `gradient_map`, `auto_levels`) accepts one.
 
 1. `generate_mask` builds one deterministically against a reference image, with
    exactly that image's dimensions:
@@ -301,15 +302,38 @@ against its own source before it is blended onto the running composite:
 `preset` (a built-in named recipe from [`presets/`](presets)) — exactly one of
 the two:
 
-| Preset | What it does |
-|---|---|
-| `eyecatch_16_9` | Center-crop to 16:9, resize to 1600px wide, WebP q82 |
-| `film_soft` | Soft film look: gentle S-curve plus a 15% pull towards luma |
-| `product_clean` | Clean product shot: near-neutral white balance, levels lift, light sharpen |
-| `thumbnail_square` | Center-crop to 1:1, resize to 800x800, WebP q80 |
-| `web_optimize` | Fit inside 2000x2000 without upscaling, WebP q80 |
-| `grayscale` | Black and white via a BT.709 luma `color_matrix` |
-| `sepia` | Classic sepia tone via `color_matrix` |
+| Set | Preset | What it does |
+|---|---|---|
+| basics | `eyecatch_16_9` | Center-crop to 16:9, resize to 1600px wide, WebP q82 |
+| basics | `film_soft` | Soft film look: gentle S-curve plus a 15% pull towards luma |
+| basics | `product_clean` | Clean product shot: near-neutral white balance, levels lift, light sharpen |
+| basics | `thumbnail_square` | Center-crop to 1:1, resize to 800x800, WebP q80 |
+| basics | `web_optimize` | Fit inside 2000x2000 without upscaling, WebP q80 |
+| basics | `grayscale` | Black and white via a BT.709 luma `color_matrix` |
+| basics | `sepia` | Classic sepia tone via `color_matrix` |
+| film | `film_warm` | Warm film stock: amber white balance, soft S-curve, light grain |
+| film | `film_cool` | Cool film stock: blue-leaning white balance, soft S-curve, light grain |
+| film | `matte_fade` | Faded matte: lifted blacks via `curves`, slight desaturation |
+| film | `film_grain_strong` | Heavy, coarse grain over a gentle S-curve (pushed/high-ISO look) |
+| film | `cinema_teal_orange` | Teal-and-orange cinematic grade via targeted `hsl` shifts |
+| mono | `bw_neutral` | Neutral black and white via a BT.709 luma `color_matrix` |
+| mono | `bw_high_contrast` | High-contrast black and white: luma conversion plus a strong S-curve |
+| mono | `bw_red_filter` | B&W through a simulated red filter (classic sky darkener) |
+| mono | `bw_soft` | Soft, low-contrast black and white (matte curve) |
+| mono | `duotone_navy_cream` | Navy-to-cream duotone via `gradient_map` |
+| editorial | `product_white` | Auto levels stretch, neutral white balance, final sharpen |
+| editorial | `food_vivid` | Warm orange/yellow saturation boost plus a contrast lift |
+| editorial | `portrait_soft` | Soft matte curve, light desaturation, subtle vignette |
+| editorial | `landscape_punch` | Contrast + saturation lift plus a light vignette |
+| editorial | `architecture_clean` | Auto levels, sharpen, slight desaturation (pair with a manual `perspective` op) |
+| social | `og_1200x630` | Open Graph share image: crop 1200:630, resize to 1200 wide, WebP q82 |
+| social | `x_wide_16_9` | X (Twitter) wide card: crop 16:9, resize to 1600 wide, WebP q82 |
+| social | `instagram_square_1080` | Instagram square post: crop 1:1, resize to 1080x1080, WebP q85 |
+| social | `instagram_portrait_4_5` | Instagram portrait post: crop 4:5, resize to 1080x1350, WebP q85 |
+| social | `youtube_thumb_1280x720` | YouTube thumbnail: crop 16:9, resize to 1280x720, WebP q85 |
+| social | `hero_2400` | Large hero/banner image: fit inside 2400px, WebP q85 |
+| building block | `soft_vignette` | Subtle vignette on its own, for stacking after other looks |
+| building block | `grain_fine` | Light, fine, deterministic grain on its own, for stacking |
 
 A preset is pure sugar: it resolves to its recipe and flows through the normal
 pipeline, and the `recipe_hash` (the idempotency key) is computed on the

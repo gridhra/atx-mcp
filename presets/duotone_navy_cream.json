@@ -1,0 +1,15 @@
+{
+  "name": "duotone_navy_cream",
+  "description": "Duotone: maps luminance from deep navy shadows to warm cream highlights via gradient_map (no resize/encode).",
+  "recipe": {
+    "operations": [
+      {
+        "op": "gradient_map",
+        "stops": [
+          { "position": 0.0, "color": "#0a1f3d" },
+          { "position": 1.0, "color": "#f5ead0" }
+        ]
+      }
+    ]
+  }
+}

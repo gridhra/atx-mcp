@@ -308,6 +308,55 @@ pub enum Operation {
         #[serde(default)]
         blend_mode: BlendMode,
     },
+    /// 水平/垂直反転。
+    Flip { direction: FlipDirection },
+    /// 周辺減光(ビネット)。strength 正=暗く、負=明るく(-1..=1)。
+    /// radius は減光開始位置(0..=1.5、半対角比)、feather は減衰帯(0..=1)。
+    Vignette {
+        strength: f64,
+        #[serde(default = "default_vignette_radius")]
+        radius: f64,
+        #[serde(default = "default_vignette_feather")]
+        feather: f64,
+    },
+    /// フィルム粒状ノイズ。座標ハッシュ由来の決定論的ノイズ(seed で変化)。
+    /// amount 0..=1、size は粒の大きさ 1..=4、monochrome は輝度のみ変調。
+    Grain {
+        amount: f64,
+        #[serde(default = "default_grain_size")]
+        size: u32,
+        #[serde(default = "default_true")]
+        monochrome: bool,
+        #[serde(default)]
+        seed: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mask: Option<MaskRef>,
+    },
+    /// グラデーションマップ(デュオトーン等)。輝度を stops(position 0..=1 昇順、
+    /// color は CSS hex)の線形補間色へ写像する。
+    GradientMap {
+        stops: Vec<GradientStop>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mask: Option<MaskRef>,
+    },
+    /// モザイク(ピクセル化)。region 省略時は全面、指定時はその矩形のみ。
+    /// ブロック平均はリニア光で行う。プライバシー用途(顔・番号標)の staple。
+    Pixelate {
+        block_size: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<Rect>,
+    },
+    /// 自動レベル補正。ヒストグラムの上下 clip_percent% を切り詰めて全域へ伸長。
+    /// per_channel 有効時はチャンネル別(色被り補正)、無効時は輝度基準。
+    /// 入力画像に対して決定論的。
+    AutoLevels {
+        #[serde(default = "default_clip_percent")]
+        clip_percent: f64,
+        #[serde(default)]
+        per_channel: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mask: Option<MaskRef>,
+    },
     /// 出力エンコード指定。レシピ内で最後に1回のみ許可。省略時は入力フォーマット維持。
     Encode {
         format: OutputFormat,
@@ -535,8 +584,14 @@ impl Operation {
             | Operation::Blur { mask, .. }
             | Operation::Median { mask, .. }
             | Operation::UnsharpMask { mask, .. }
-            | Operation::Convolve { mask, .. } => mask.as_ref(),
+            | Operation::Convolve { mask, .. }
+            | Operation::Grain { mask, .. }
+            | Operation::GradientMap { mask, .. }
+            | Operation::AutoLevels { mask, .. } => mask.as_ref(),
             Operation::AutoOrient
+            | Operation::Flip { .. }
+            | Operation::Vignette { .. }
+            | Operation::Pixelate { .. }
             | Operation::Rotate { .. }
             | Operation::Crop { .. }
             | Operation::Resize { .. }
@@ -552,6 +607,40 @@ impl Operation {
 
 fn default_one() -> f64 {
     1.0
+}
+
+/// flip の方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FlipDirection {
+    Horizontal,
+    Vertical,
+}
+
+/// gradient_map の色停止点。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GradientStop {
+    /// 輝度位置 0.0..=1.0(昇順・重複不可)。
+    pub position: f64,
+    /// CSS hex(#rgb / #rrggbb)。
+    pub color: String,
+}
+
+fn default_vignette_radius() -> f64 {
+    0.7
+}
+
+fn default_vignette_feather() -> f64 {
+    0.5
+}
+
+fn default_grain_size() -> u32 {
+    1
+}
+
+fn default_clip_percent() -> f64 {
+    0.5
 }
 
 fn default_255() -> u8 {
@@ -975,6 +1064,24 @@ fn validate_operations(operations: &[Operation]) -> crate::Result<()> {
                 height,
                 ..
             } => crate::ops::svg::validate(index, svg_revision_id, *opacity, *width, *height)?,
+            Operation::Flip { .. } => {}
+            Operation::Vignette {
+                strength,
+                radius,
+                feather,
+            } => crate::ops::finish::validate_vignette(index, *strength, *radius, *feather)?,
+            Operation::Grain { amount, size, .. } => {
+                crate::ops::finish::validate_grain(index, *amount, *size)?
+            }
+            Operation::GradientMap { stops, .. } => {
+                crate::ops::gradient::validate_stops(index, stops)?
+            }
+            Operation::Pixelate { block_size, region } => {
+                crate::ops::pixelate::validate(index, *block_size, region)?
+            }
+            Operation::AutoLevels { clip_percent, .. } => {
+                crate::ops::auto_levels::validate(index, *clip_percent)?
+            }
             Operation::Blur { sigma, .. } => crate::ops::blur::validate_blur(index, *sigma)?,
             Operation::Median { radius, .. } => crate::ops::blur::validate_median(index, *radius)?,
             Operation::UnsharpMask {

@@ -146,10 +146,11 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 }
 ```
 
-支持的操作(op,共 21 个):`auto_orient` / `rotate` / `perspective` / `crop`(crop、pad)/
+支持的操作(op,共 27 个):`auto_orient` / `rotate` / `perspective` / `crop`(crop、pad)/
 `resize`(cover、contain、fill)/ `adjust` / `color_matrix` / `curves` / `levels` /
 `lut` / `white_balance` / `hsl` / `blur` / `median` / `unsharp_mask` / `convolve` /
-`clone` / `heal` / `svg_overlay` / `encode`(jpeg、png、webp、avif)/ `strip_metadata`。
+`clone` / `heal` / `svg_overlay` / `flip` / `vignette` / `grain` / `gradient_map` /
+`pixelate` / `auto_levels` / `encode`(jpeg、png、webp、avif)/ `strip_metadata`。
 操作清单刻意不写进工具的 schema:请调用 `list_operations` 获取最新目录,
 调用 `explain_operation` 获取单个操作的完整 schema、示例与注意事项。
 
@@ -200,9 +201,9 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 ### 蒙版(局部调整)
 
 蒙版是一个**灰度图像修订版本**:其 BT.709 亮度即权重,白色表示该操作全量生效,
-黑色表示该像素保持不变。11 个色调/滤镜类操作(`adjust` / `color_matrix` /
+黑色表示该像素保持不变。14 个色调/滤镜类操作(`adjust` / `color_matrix` /
 `curves` / `levels` / `hsl` / `lut` / `white_balance` / `blur` / `median` /
-`unsharp_mask` / `convolve`)都可以接受蒙版。
+`unsharp_mask` / `convolve` / `grain` / `gradient_map` / `auto_levels`)都可以接受蒙版。
 
 1. `generate_mask` 会基于参考图像确定性地生成一张**尺寸完全一致**的蒙版:
 
@@ -276,15 +277,38 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 `apply_transform` 与 `render_preview` 接受 `recipe`(原始 DSL)或
 `preset`(随包提供的具名配方,见 [`presets/`](presets))之一(二者互斥,且必须有其一):
 
-| 预设 | 作用 |
-|---|---|
-| `eyecatch_16_9` | 居中裁剪为 16:9 → 宽 1600px → WebP q82 |
-| `film_soft` | 柔和胶片感:平缓 S 形曲线 + 向亮度拉近 15% 的去饱和 |
-| `product_clean` | 干净的电商产品风:接近中性的白平衡 + 色阶提亮 + 轻度锐化 |
-| `thumbnail_square` | 居中裁剪为 1:1 → 800x800 → WebP q80 |
-| `web_optimize` | 不放大地收进 2000x2000 → WebP q80 |
-| `grayscale` | 通过 BT.709 亮度 `color_matrix` 转黑白 |
-| `sepia` | 通过 `color_matrix` 实现经典棕褐色调 |
+| 分组 | 预设 | 作用 |
+|---|---|---|
+| basics | `eyecatch_16_9` | 居中裁剪为 16:9 → 宽 1600px → WebP q82 |
+| basics | `film_soft` | 柔和胶片感:平缓 S 形曲线 + 向亮度拉近 15% 的去饱和 |
+| basics | `product_clean` | 干净的电商产品风:接近中性的白平衡 + 色阶提亮 + 轻度锐化 |
+| basics | `thumbnail_square` | 居中裁剪为 1:1 → 800x800 → WebP q80 |
+| basics | `web_optimize` | 不放大地收进 2000x2000 → WebP q80 |
+| basics | `grayscale` | 通过 BT.709 亮度 `color_matrix` 转黑白 |
+| basics | `sepia` | 通过 `color_matrix` 实现经典棕褐色调 |
+| film | `film_warm` | 暖色胶片:偏琥珀色白平衡 + 平缓 S 形曲线 + 轻微颗粒 |
+| film | `film_cool` | 冷色胶片:偏蓝白平衡 + 平缓 S 形曲线 + 轻微颗粒 |
+| film | `matte_fade` | 褪色哑光感:`curves` 提亮黑场 + 轻度去饱和 |
+| film | `film_grain_strong` | 平缓 S 形曲线叠加粗重颗粒(高感光度风格) |
+| film | `cinema_teal_orange` | 通过 `hsl` 定向偏移实现青橙电影感调色 |
+| mono | `bw_neutral` | 通过 BT.709 亮度 `color_matrix` 实现中性黑白 |
+| mono | `bw_high_contrast` | 黑白转换 + 强 S 形曲线,高对比度黑白 |
+| mono | `bw_red_filter` | 模拟红色滤镜的黑白(经典压暗天空手法) |
+| mono | `bw_soft` | 哑光曲线带来的柔和低对比度黑白 |
+| mono | `duotone_navy_cream` | 通过 `gradient_map` 实现藏青到奶油色双色调 |
+| editorial | `product_white` | 自动色阶拉伸 + 中性白平衡 + 最终锐化 |
+| editorial | `food_vivid` | 橙/黄色调饱和度提升,并叠加对比度提升 |
+| editorial | `portrait_soft` | 柔和哑光曲线 + 轻度去饱和 + 淡淡暗角 |
+| editorial | `landscape_punch` | 对比度与饱和度双双提升,叠加淡淡暗角 |
+| editorial | `architecture_clean` | 自动色阶 + 锐化 + 轻度去饱和(需另行手动配 `perspective` 校正) |
+| social | `og_1200x630` | Open Graph 分享图:裁剪 1200:630 → 宽 1200 → WebP q82 |
+| social | `x_wide_16_9` | X(Twitter)宽幅卡片:裁剪 16:9 → 宽 1600 → WebP q82 |
+| social | `instagram_square_1080` | Instagram 方形帖子:裁剪 1:1 → 1080x1080 → WebP q85 |
+| social | `instagram_portrait_4_5` | Instagram 竖版帖子:裁剪 4:5 → 1080x1350 → WebP q85 |
+| social | `youtube_thumb_1280x720` | YouTube 缩略图:裁剪 16:9 → 1280x720 → WebP q85 |
+| social | `hero_2400` | 大幅 Hero/横幅图:收进 2400px → WebP q85 |
+| building block | `soft_vignette` | 单独的柔和暗角,便于叠加在其他风格之后 |
+| building block | `grain_fine` | 单独的细腻确定性颗粒,便于叠加使用 |
 
 预设只是语法糖:解析后作为普通配方走同一条流水线,
 `recipe_hash`(幂等键)基于**解析后的配方**计算 ——

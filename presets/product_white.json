@@ -1,0 +1,11 @@
+{
+  "name": "product_white",
+  "description": "Clean product-on-white shot: auto black/white point stretch, a neutral white balance nudge, and a final sharpen (no resize/encode).",
+  "recipe": {
+    "operations": [
+      { "op": "auto_levels", "clip_percent": 0.3, "per_channel": false },
+      { "op": "white_balance", "temperature": 2, "tint": -1 },
+      { "op": "unsharp_mask", "amount": 0.6, "radius": 1.0, "threshold": 3 }
+    ]
+  }
+}

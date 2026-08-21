@@ -1,0 +1,11 @@
+{
+  "name": "og_1200x630",
+  "description": "Open Graph share image: center-crop 1200:630, exactly 1200 wide, WebP q82.",
+  "recipe": {
+    "operations": [
+      { "op": "crop", "aspect_ratio": "1200:630", "anchor": "center" },
+      { "op": "resize", "width": 1200, "fit": "cover", "without_enlargement": false },
+      { "op": "encode", "format": "webp", "quality": 82 }
+    ]
+  }
+}

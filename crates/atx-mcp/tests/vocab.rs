@@ -56,7 +56,7 @@ fn tools() -> (tempfile::TempDir, AtxTools) {
     (workspace, tools)
 }
 
-const V03_OPERATIONS: [&str; 21] = [
+const V03_OPERATIONS: [&str; 27] = [
     "auto_orient",
     "rotate",
     "crop",
@@ -76,18 +76,47 @@ const V03_OPERATIONS: [&str; 21] = [
     "clone",
     "heal",
     "svg_overlay",
+    "flip",
+    "vignette",
+    "grain",
+    "gradient_map",
+    "pixelate",
+    "auto_levels",
     "encode",
     "strip_metadata",
 ];
 
-const BUILTIN_PRESETS: [&str; 7] = [
+const BUILTIN_PRESETS: [&str; 30] = [
+    "architecture_clean",
+    "bw_high_contrast",
+    "bw_neutral",
+    "bw_red_filter",
+    "bw_soft",
+    "cinema_teal_orange",
+    "duotone_navy_cream",
     "eyecatch_16_9",
+    "film_cool",
+    "film_grain_strong",
     "film_soft",
+    "film_warm",
+    "food_vivid",
+    "grain_fine",
     "grayscale",
+    "hero_2400",
+    "instagram_portrait_4_5",
+    "instagram_square_1080",
+    "landscape_punch",
+    "matte_fade",
+    "og_1200x630",
+    "portrait_soft",
     "product_clean",
+    "product_white",
     "sepia",
+    "soft_vignette",
     "thumbnail_square",
     "web_optimize",
+    "x_wide_16_9",
+    "youtube_thumb_1280x720",
 ];
 
 #[test]
@@ -97,7 +126,7 @@ fn list_operations_returns_every_op_and_the_presets() {
     let out = structured(&result);
     let body = text(&result);
 
-    assert_eq!(out["count"], 21);
+    assert_eq!(out["count"], 27);
     let names: Vec<&str> = out["operations"]
         .as_array()
         .expect("operations must be an array")
@@ -135,9 +164,9 @@ fn list_operations_returns_every_op_and_the_presets() {
     assert!(body.contains("0.1..100"));
 
     // 段階的開示: カタログはトークン的に軽いこと
-    // (v0.8 で 21 op + 11 op に付く mask の1行、目安 ~1150 tokens ≒ 4800 chars)。
+    // (v0.3.0 で 27 op + 14 op に付く mask の1行 + 30 プリセット名、目安 ~2100 tokens ≒ 8700 chars)。
     assert!(
-        body.len() < 4800,
+        body.len() < 8700,
         "the catalog must stay compact, got {} chars",
         body.len()
     );
@@ -165,7 +194,10 @@ fn list_operations_filters_by_category_and_rejects_unknown_ones() {
             "convolve",
             "clone",
             "heal",
-            "svg_overlay"
+            "svg_overlay",
+            "vignette",
+            "grain",
+            "pixelate",
         ]
     );
     // プリセットは分類で絞っても常に出す(語彙の圧縮層は分類に属さない)。
@@ -318,7 +350,7 @@ fn explain_operation_rejects_unknown_names_with_the_valid_list() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert_eq!(valid.len(), 21);
+    assert_eq!(valid.len(), 27);
     for op in V03_OPERATIONS {
         assert!(valid.contains(&op));
     }

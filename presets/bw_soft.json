@@ -1,0 +1,25 @@
+{
+  "name": "bw_soft",
+  "description": "Soft, low-contrast black and white: BT.709 luma conversion plus a matte curve that lifts blacks and pulls in whites (no resize/encode).",
+  "recipe": {
+    "operations": [
+      {
+        "op": "color_matrix",
+        "matrix": [
+          0.2126, 0.7152, 0.0722, 0.0, 0.0,
+          0.2126, 0.7152, 0.0722, 0.0, 0.0,
+          0.2126, 0.7152, 0.0722, 0.0, 0.0,
+          0.0, 0.0, 0.0, 1.0, 0.0
+        ]
+      },
+      {
+        "op": "curves",
+        "master": [
+          [0, 24],
+          [128, 130],
+          [255, 236]
+        ]
+      }
+    ]
+  }
+}

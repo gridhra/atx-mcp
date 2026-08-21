@@ -1,0 +1,15 @@
+{
+  "name": "cinema_teal_orange",
+  "description": "Cinematic teal-and-orange grade: cools shadows/blues, warms skin-tone oranges, and lifts saturation (no resize/encode).",
+  "recipe": {
+    "operations": [
+      {
+        "op": "hsl",
+        "orange": { "hue": 4, "saturation": 18, "luminance": 4 },
+        "blue": { "hue": -6, "saturation": 20, "luminance": -6 },
+        "aqua": { "hue": -4, "saturation": 14, "luminance": -4 }
+      },
+      { "op": "adjust", "contrast": 0.08 }
+    ]
+  }
+}

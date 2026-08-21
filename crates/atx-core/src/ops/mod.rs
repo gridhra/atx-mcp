@@ -46,14 +46,18 @@
 //! - 総和は走査順そのままの左結合で書く(再結合禁止)
 //! - 行分割の並列化は画素間の実行順序しか変えないので出力に影響しない
 
+pub mod auto_levels;
 pub mod blend;
 pub mod blur;
 pub mod clone_heal;
 pub mod color;
 pub mod convolve;
+pub mod finish;
+pub mod gradient;
 pub mod hsl;
 pub mod lut;
 pub mod mask;
 pub mod perspective;
+pub mod pixelate;
 pub mod svg;
 pub mod wb;

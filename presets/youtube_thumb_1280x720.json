@@ -1,0 +1,11 @@
+{
+  "name": "youtube_thumb_1280x720",
+  "description": "YouTube thumbnail: center-crop 16:9, exactly 1280x720, WebP q85.",
+  "recipe": {
+    "operations": [
+      { "op": "crop", "aspect_ratio": "16:9", "anchor": "center" },
+      { "op": "resize", "width": 1280, "height": 720, "fit": "cover", "without_enlargement": false },
+      { "op": "encode", "format": "webp", "quality": 85 }
+    ]
+  }
+}

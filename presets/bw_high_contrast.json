@@ -1,0 +1,26 @@
+{
+  "name": "bw_high_contrast",
+  "description": "High-contrast black and white: BT.709 luma conversion plus a strong S-curve (no resize/encode).",
+  "recipe": {
+    "operations": [
+      {
+        "op": "color_matrix",
+        "matrix": [
+          0.2126, 0.7152, 0.0722, 0.0, 0.0,
+          0.2126, 0.7152, 0.0722, 0.0, 0.0,
+          0.2126, 0.7152, 0.0722, 0.0, 0.0,
+          0.0, 0.0, 0.0, 1.0, 0.0
+        ]
+      },
+      {
+        "op": "curves",
+        "master": [
+          [0, 0],
+          [64, 36],
+          [192, 222],
+          [255, 255]
+        ]
+      }
+    ]
+  }
+}

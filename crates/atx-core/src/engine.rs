@@ -717,6 +717,44 @@ impl OpRunner<'_> {
                         &st.img, *in_black, *in_white, *gamma, *out_black, *out_white,
                     );
                 }
+                Operation::Flip { direction } => {
+                    st.img = crate::ops::finish::flip(&st.img, *direction);
+                }
+                Operation::Vignette {
+                    strength,
+                    radius,
+                    feather,
+                } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Linear);
+                    st.img = crate::ops::finish::vignette(&st.img, *strength, *radius, *feather);
+                }
+                Operation::Grain {
+                    amount,
+                    size,
+                    monochrome,
+                    seed,
+                    ..
+                } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Srgb);
+                    st.img = crate::ops::finish::grain(&st.img, *amount, *size, *monochrome, *seed);
+                }
+                Operation::GradientMap { stops, .. } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Srgb);
+                    st.img = crate::ops::gradient::apply(&st.img, stops);
+                }
+                Operation::Pixelate { block_size, region } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Linear);
+                    st.img = crate::ops::pixelate::apply(&st.img, *block_size, region)
+                        .map_err(|e| fail(e.to_string()))?;
+                }
+                Operation::AutoLevels {
+                    clip_percent,
+                    per_channel,
+                    ..
+                } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Srgb);
+                    st.img = crate::ops::auto_levels::apply(&st.img, *clip_percent, *per_channel);
+                }
                 Operation::Blur { sigma, .. } => {
                     ensure_space(&mut st.img, &mut st.space, Space::Linear);
                     st.img = crate::ops::blur::gaussian_blur(&st.img, *sigma);
@@ -895,6 +933,7 @@ fn op_space(op: &Operation) -> Option<Space> {
     match op {
         Operation::AutoOrient
         | Operation::Crop { .. }
+        | Operation::Flip { .. }
         | Operation::StripMetadata { .. }
         | Operation::Encode { .. } => None,
         Operation::Rotate { .. }
@@ -906,6 +945,8 @@ fn op_space(op: &Operation) -> Option<Space> {
         | Operation::Convolve { .. }
         | Operation::Clone { .. }
         | Operation::Heal { .. }
+        | Operation::Vignette { .. }
+        | Operation::Pixelate { .. }
         | Operation::WhiteBalance { .. } => Some(Space::Linear),
         Operation::Adjust { .. }
         | Operation::ColorMatrix { .. }
@@ -915,7 +956,10 @@ fn op_space(op: &Operation) -> Option<Space> {
         | Operation::Hsl { .. }
         // ラスタライズされた SVG は sRGB 符号値の RGBA。合成式もレイヤーと同じ
         // (DESIGN.md §9.7 / §9.9)。
-        | Operation::SvgOverlay { .. } => Some(Space::Srgb),
+        | Operation::SvgOverlay { .. }
+        | Operation::Grain { .. }
+        | Operation::GradientMap { .. }
+        | Operation::AutoLevels { .. } => Some(Space::Srgb),
     }
 }
 
@@ -958,6 +1002,12 @@ fn op_name(op: &Operation) -> &'static str {
         Operation::Clone { .. } => "clone",
         Operation::Heal { .. } => "heal",
         Operation::SvgOverlay { .. } => "svg_overlay",
+        Operation::Flip { .. } => "flip",
+        Operation::Vignette { .. } => "vignette",
+        Operation::Grain { .. } => "grain",
+        Operation::GradientMap { .. } => "gradient_map",
+        Operation::Pixelate { .. } => "pixelate",
+        Operation::AutoLevels { .. } => "auto_levels",
         Operation::StripMetadata { .. } => "strip_metadata",
     }
 }

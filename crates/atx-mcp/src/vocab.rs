@@ -828,6 +828,186 @@ pub const OPERATIONS: &[OpDoc] = &[
         ],
     },
     OpDoc {
+        name: "flip",
+        category: "geometry",
+        summary: "Mirror the image horizontally or vertically.",
+        params: &[ParamDoc {
+            name: "direction",
+            type_hint: "enum horizontal|vertical",
+            requirement: "required",
+            semantics: "horizontal mirrors left-right (a horizontal flip about the vertical axis); vertical mirrors top-bottom.",
+        }],
+        examples: &[
+            r#"{"op": "flip", "direction": "horizontal"}"#,
+            r#"{"op": "flip", "direction": "vertical"}"#,
+        ],
+        warnings: &[
+            "A pure pixel remap: dimensions are unchanged and nothing is cropped or padded.",
+            "No mask param - flip moves every pixel's position, so a per-pixel weight from the pre-flip layout would not line up with the result.",
+            "Flipping an image that contains readable text or a watermark mirrors it too; svg_overlay/text is not aware of a prior flip and must be positioned after it.",
+        ],
+    },
+    OpDoc {
+        name: "vignette",
+        category: "filter",
+        summary: "Darken (or lighten) the image towards the edges.",
+        params: &[
+            ParamDoc {
+                name: "strength",
+                type_hint: "f64 -1..1",
+                requirement: "required",
+                semantics: "Amount of exposure change at the edge; positive darkens (classic vignette), negative lightens. 0 is a no-op.",
+            },
+            ParamDoc {
+                name: "radius",
+                type_hint: "f64 0..1.5",
+                requirement: "default: 0.7",
+                semantics: "Normalized distance from center (as a fraction of the half-diagonal) where the falloff begins; below this radius the image is untouched. 0 starts the falloff at the center, 1.5 pushes it past the corners.",
+            },
+            ParamDoc {
+                name: "feather",
+                type_hint: "f64 0..1",
+                requirement: "default: 0.5",
+                semantics: "Width of the falloff band (same normalized units as radius) over which the effect ramps from 0 to full strength.",
+            },
+        ],
+        examples: &[
+            r#"{"op": "vignette", "strength": 0.35}"#,
+            r#"{"op": "vignette", "strength": 0.5, "radius": 0.55, "feather": 0.35}"#,
+        ],
+        warnings: &[
+            "Applied in LINEAR light as an exposure falloff, so the same strength reads darker on a bright, high-key image than on an already-dark one.",
+            "No mask param - vignette is already a radial, centered effect; use a low radius/high feather for a tight look instead of trying to mask it into a shape.",
+            "vignette never changes the canvas size (unlike crop): it only darkens/lightens existing pixels, nothing is trimmed.",
+            "radius + feather extending past 1.5/1.0 respectively can leave the effect invisible if it never reaches the visible area; preview before committing.",
+        ],
+    },
+    OpDoc {
+        name: "grain",
+        category: "filter",
+        summary: "Add film-style grain/noise.",
+        params: &[
+            ParamDoc {
+                name: "amount",
+                type_hint: "f64 0..1",
+                requirement: "required",
+                semantics: "Grain intensity; 0 leaves the image unchanged, 1 is heavy.",
+            },
+            ParamDoc {
+                name: "size",
+                type_hint: "u32 1..4",
+                requirement: "default: 1",
+                semantics: "Grain particle size in pixels (coarseness); 1 is fine single-pixel grain, 4 is chunky.",
+            },
+            ParamDoc {
+                name: "monochrome",
+                type_hint: "bool",
+                requirement: "default: true",
+                semantics: "true modulates luminance only (classic film grain, no color speckle); false modulates each channel independently (colored noise).",
+            },
+            ParamDoc {
+                name: "seed",
+                type_hint: "u64",
+                requirement: "default: 0",
+                semantics: "Seed for the deterministic noise pattern. Same seed + same image = pixel-identical grain every run.",
+            },
+        MASK_PARAM,
+        ],
+        examples: &[
+            r#"{"op": "grain", "amount": 0.15}"#,
+            r#"{"op": "grain", "amount": 0.3, "size": 2, "monochrome": false, "seed": 7}"#,
+        ],
+        warnings: &[
+            "Deterministic and reproducible: it is a coordinate+seed hash, not a random-crate RNG, so the same recipe always produces the same grain. Change seed to get a different-looking pattern on purpose.",
+            "Applied in sRGB code-value space (perceptual), not linear light, matching how film grain is normally judged by eye.",
+            "Grain survives resizing awkwardly: apply it AFTER your final resize, or the grain gets scaled/blurred along with the image.",
+                    MASK_WARNING,
+        ],
+    },
+    OpDoc {
+        name: "gradient_map",
+        category: "color",
+        summary: "Map luminance to a color gradient (duotone/tritone looks).",
+        params: &[
+            ParamDoc {
+                name: "stops",
+                type_hint: "[{position,color}] 2..8",
+                requirement: "required",
+                semantics: "2 to 8 stops, each {position: f64 0..1, color: css hex}, position strictly increasing. Each pixel's BT.709 luminance (0=black..1=white) is looked up in this gradient and linearly interpolated between the two nearest stops; outside the first/last stop the end color is clamped.",
+            },
+        MASK_PARAM,
+        ],
+        examples: &[
+            r##"{"op": "gradient_map", "stops": [{"position": 0.0, "color": "#0a1f3d"}, {"position": 1.0, "color": "#f5ead0"}]}"##,
+            r##"{"op": "gradient_map", "stops": [{"position": 0.0, "color": "#1a0d2e"}, {"position": 0.5, "color": "#a3325f"}, {"position": 1.0, "color": "#ffd27f"}]}"##,
+        ],
+        warnings: &[
+            "8-digit hex (#rrggbbaa) is rejected on purpose: stops are opaque colors and a silently-ignored alpha would be a surprise. Use 3/4/6-digit hex; pixel alpha is preserved unchanged separately.",
+            "This REPLACES color entirely - original hue/saturation are discarded, only luminance survives as the lookup key. Run adjust/curves first if you want to shape contrast going into the map.",
+            "Applied in sRGB code-value space; two very different colors of the same code-value luminance map to the same gradient color.",
+                    MASK_WARNING,
+        ],
+    },
+    OpDoc {
+        name: "pixelate",
+        category: "filter",
+        summary: "Mosaic/pixelate blocks of the image (privacy redaction staple).",
+        params: &[
+            ParamDoc {
+                name: "block_size",
+                type_hint: "u32 2..256",
+                requirement: "required",
+                semantics: "Edge length in pixels of each averaged square block. Larger = coarser/more anonymous.",
+            },
+            ParamDoc {
+                name: "region",
+                type_hint: "{x,y,width,height} u32",
+                requirement: "optional",
+                semantics: "Pixel rect to pixelate, in the CURRENT image's coordinates. Omitted pixelates the whole image. The block grid is anchored at the region's top-left corner so a re-run with the same region looks stable.",
+            },
+        ],
+        examples: &[
+            r#"{"op": "pixelate", "block_size": 24}"#,
+            r#"{"op": "pixelate", "block_size": 18, "region": {"x": 400, "y": 220, "width": 260, "height": 260}}"#,
+        ],
+        warnings: &[
+            "The privacy staple for faces/license plates: pick a block_size large enough that no recognizable detail survives (as a rule of thumb, big enough that a face spans well under ~4 blocks across).",
+            "Block averaging is done in LINEAR light, not sRGB code values, so an averaged block's apparent brightness is correct even across a hard light/dark edge - a naive sRGB average would look too dark.",
+            "No mask param - region (a plain rect) already defines the applied area, and pixelate is typically used for hard privacy redaction where a soft/feathered edge would defeat the purpose.",
+            "region is in the CURRENT image's coordinates: place pixelate after any resize/crop that changes where your subject sits, or the redacted area lands in the wrong place.",
+        ],
+    },
+    OpDoc {
+        name: "auto_levels",
+        category: "color",
+        summary: "Automatic black/white point stretch from the image's own histogram.",
+        params: &[
+            ParamDoc {
+                name: "clip_percent",
+                type_hint: "f64 0..10",
+                requirement: "default: 0.5",
+                semantics: "Percent of the histogram clipped at each end before stretching the remainder to 0..1 (per-mille-ish tolerance for outlier pixels). 0 stretches to the true min/max.",
+            },
+            ParamDoc {
+                name: "per_channel",
+                type_hint: "bool",
+                requirement: "default: false",
+                semantics: "false computes one stretch from the BT.709 luminance histogram and applies it to all channels equally (preserves color balance). true computes an independent stretch per R/G/B channel (corrects a color cast, e.g. an underwater or tungsten-lit shot).",
+            },
+        MASK_PARAM,
+        ],
+        examples: &[
+            r#"{"op": "auto_levels"}"#,
+            r#"{"op": "auto_levels", "clip_percent": 1.0, "per_channel": true}"#,
+        ],
+        warnings: &[
+            "per_channel=true SHIFTS HUES: stretching R/G/B independently is exactly what fixes a color cast, but on a scene with no cast it can introduce one. Try per_channel=false first, and only switch on a genuine tungsten/underwater-style tint.",
+            "Deterministic for a given input image: the histogram is a fixed-bin integer count, so the same image always yields the same stretch (no randomness), but the stretch itself depends on the image's own content - it is not a fixed curve like levels.",
+            "clip_percent too high on a small or low-contrast image can clip meaningful highlight/shadow detail along with outliers; start near the default 0.5 and inspect the result.",
+                    MASK_WARNING,
+        ],
+    },
+    OpDoc {
         name: "encode",
         category: "output",
         summary: "Output format/quality. At most one, and it must be last.",
@@ -992,7 +1172,7 @@ mod tests {
     #[test]
     fn catalog_covers_every_operation_exactly_once() {
         let names = operation_names();
-        assert_eq!(names.len(), 21, "v0.8 has 21 operations");
+        assert_eq!(names.len(), 27, "v0.3.0 has 27 operations");
         let mut sorted = names.clone();
         sorted.sort_unstable();
         sorted.dedup();

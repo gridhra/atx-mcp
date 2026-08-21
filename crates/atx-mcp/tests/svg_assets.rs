@@ -245,13 +245,13 @@ fn stamping_an_imported_svg_end_to_end_changes_only_the_stamped_region() {
     );
 }
 
-/// 語彙カタログに `svg_overlay` が 1 件だけ載り、総数が 21 になっていること。
+/// 語彙カタログに `svg_overlay` が 1 件だけ載り、総数が 27 になっていること。
 #[test]
-fn the_catalog_lists_twenty_one_operations_including_svg_overlay() {
+fn the_catalog_lists_twenty_seven_operations_including_svg_overlay() {
     let (_ws, tools) = tools();
     let out = structured(&tools.list_operations(&ListOperationsParams::default()));
     let ops = out["operations"].as_array().expect("operations array");
-    assert_eq!(ops.len(), 21, "v0.8 has 21 operations");
+    assert_eq!(ops.len(), 27, "v0.3.0 has 27 operations");
     let overlay: Vec<_> = ops
         .iter()
         .filter(|op| op["name"] == "svg_overlay")
