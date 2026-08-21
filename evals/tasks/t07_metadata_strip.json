@@ -1,12 +1,17 @@
 {
   "id": "t07_metadata_strip",
-  "prompt": "この写真から位置情報(GPS/EXIF)だけ確実に消したいけど、色は変えたくないのでICCプロファイルは残して。strip_metadataの適切なscopeを選んで適用し、JPEGのまま書き出して。",
+  "prompt": "この写真から位置情報(GPS/EXIF)だけ確実に消したいけど、色は変えたくないのでICCプロファイルは残して。strip_metadataの適切なscopeを選んで適用し、JPEGのまま書き出して。書き出し先はワークスペース外に出さず、export するなら {{TASK_DIR}} の中にして。",
   "input_fixture": "tests/fixtures/synthetic_scene.jpg",
   "success_criteria": {
     "expect_revision": {
       "mime_type": "image/jpeg",
       "recipe_contains_ops": [
-        { "op": "strip_metadata", "fields": { "scope": "exif" } }
+        {
+          "op": "strip_metadata",
+          "fields": {
+            "scope": "exif"
+          }
+        }
       ],
       "min_matches": 1
     }
