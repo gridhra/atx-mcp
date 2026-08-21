@@ -721,6 +721,46 @@ impl OpRunner<'_> {
                     ensure_space(&mut st.img, &mut st.space, Space::Linear);
                     st.img = crate::ops::blur::gaussian_blur(&st.img, *sigma);
                 }
+                Operation::Clone {
+                    src_x,
+                    src_y,
+                    dest_x,
+                    dest_y,
+                    radius,
+                    feather_px,
+                } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Linear);
+                    st.img = crate::ops::clone_heal::apply_clone(
+                        &st.img,
+                        *src_x,
+                        *src_y,
+                        *dest_x,
+                        *dest_y,
+                        *radius,
+                        *feather_px,
+                    )
+                    .map_err(fail)?;
+                }
+                Operation::Heal {
+                    src_x,
+                    src_y,
+                    dest_x,
+                    dest_y,
+                    radius,
+                    feather_px,
+                } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Linear);
+                    st.img = crate::ops::clone_heal::apply_heal(
+                        &st.img,
+                        *src_x,
+                        *src_y,
+                        *dest_x,
+                        *dest_y,
+                        *radius,
+                        *feather_px,
+                    )
+                    .map_err(fail)?;
+                }
                 Operation::Median { radius, .. } => {
                     ensure_space(&mut st.img, &mut st.space, Space::Linear);
                     st.img = crate::ops::blur::median(&st.img, *radius);
@@ -828,6 +868,8 @@ fn op_space(op: &Operation) -> Option<Space> {
         | Operation::Median { .. }
         | Operation::UnsharpMask { .. }
         | Operation::Convolve { .. }
+        | Operation::Clone { .. }
+        | Operation::Heal { .. }
         | Operation::WhiteBalance { .. } => Some(Space::Linear),
         Operation::Adjust { .. }
         | Operation::ColorMatrix { .. }
@@ -874,6 +916,8 @@ fn op_name(op: &Operation) -> &'static str {
         Operation::WhiteBalance { .. } => "white_balance",
         Operation::Hsl { .. } => "hsl",
         Operation::Convolve { .. } => "convolve",
+        Operation::Clone { .. } => "clone",
+        Operation::Heal { .. } => "heal",
         Operation::StripMetadata { .. } => "strip_metadata",
     }
 }

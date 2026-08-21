@@ -233,9 +233,10 @@ fn dims_mismatched_layer_is_a_structured_error_with_the_core_message() {
     );
 }
 
-/// explain_operation("layers") はレシピ構造のリファレンスを返し、12 の separable
-/// ブレンドモード名がすべて載ること。カタログ(list_operations)の op 数には数えられず、
-/// unknown_operation エラーの valid_values にも出ないこと(instructions 側で発見する設計)。
+/// explain_operation("layers") はレシピ構造のリファレンスを返し、16(separable 12 +
+/// non-separable 4)のブレンドモード名がすべて載ること。カタログ(list_operations)の
+/// op 数には数えられず、unknown_operation エラーの valid_values にも出ないこと
+/// (instructions 側で発見する設計)。
 #[test]
 fn explain_operation_layers_documents_the_recipe_structure() {
     let (_ws, tools) = tools();
@@ -261,6 +262,10 @@ fn explain_operation_layers_documents_the_recipe_structure() {
         "soft_light",
         "difference",
         "exclusion",
+        "hue",
+        "saturation",
+        "color",
+        "luminosity",
     ] {
         assert!(
             body.contains(mode),
