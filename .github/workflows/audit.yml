@@ -1,0 +1,69 @@
+name: Supply chain
+
+# 供給網の監査。CI(ci.yml)とは別ワークフローに分けてある:
+# advisories は依存を変えなくても時間とともに増えるため、push/PR だけでなく
+# 週次 cron でも回して「昨日まで緑だったツリー」の新規脆弱性に気づけるようにする。
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".cargo/audit.toml"
+      - ".github/workflows/audit.yml"
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".cargo/audit.toml"
+      - ".github/workflows/audit.yml"
+  schedule:
+    # 毎週月曜 00:20 UTC(= 月 09:20 JST)。Dependabot の週次と同じ曜日に揃えてある。
+    - cron: "20 0 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # RustSec advisory DB との突き合わせ。無視する ID とその根拠は .cargo/audit.toml。
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # ビルド済みバイナリを取得する(cargo install だと数分かかるうえ
+      # コンパイル失敗で CI が不安定になる)。
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # 無視 ID と informational_warnings の扱いは .cargo/audit.toml が持つ。
+      # 脆弱性が1件でも残れば exit != 0 になり、ここで落ちる。
+      - name: cargo audit
+        run: cargo audit
+
+  # ライセンス・依存の重複・出所。設定は deny.toml。
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # チェック種別ごとにジョブを分けると、どれが落ちたかが一覧で分かる。
+        checks: [advisories, licenses, bans, sources]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}
+          # 依存グラフの巨大なツリー出力を抑える(失敗理由は行頭の error で分かる)。
+          command-arguments: "--hide-inclusion-graph"

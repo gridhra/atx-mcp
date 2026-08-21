@@ -1,0 +1,118 @@
+# cargo-deny 設定 — 供給網(脆弱性・ライセンス・依存の重複と出所)のゲート。
+# CI: .github/workflows/audit.yml(push / PR / 毎週 cron)
+#
+# ライセンスの基本方針:
+#   cargo-deny は **allow に列挙したライセンス以外をすべて拒否**する(ホワイトリスト方式)。
+#   したがって GPL / LGPL / AGPL / MPL などが依存ツリーに混入した時点で CI が落ちる。
+#   これは docs/ROADMAP.md「v0.8 時点の RAW 判断」で確定した要件
+#   ——「LGPL を気づかぬうちに入れない」——の機械的な担保である。
+#   本体は MIT 配布なので、コピーレフト族は原則すべて非採用:
+#     - GPL-*/AGPL-*   : プロジェクト全体の再ライセンスを要求する。採用不可。
+#     - LGPL-*         : 静的リンクが常態の Rust では実質 GPL 相当の義務が生じる。
+#                        rawler(LGPL-2.1)/ imagepipe(LGPL-3.0)/ zenraw(AGPL)は
+#                        この理由で不採用(ROADMAP.md 参照)。下の [[bans.deny]] で
+#                        クレート名でも二重に塞いでいる。
+#     - MPL-2.0        : ファイル単位コピーレフトで MIT 配布と実務上は両立しうるが、
+#                        改変ファイルの公開義務という別ルールを一つ増やすことになるため
+#                        **意図的に allow しない**。必要になったら都度判断して追記する。
+
+[graph]
+# 既定どおり全ターゲット(Windows / wasm を含む)を評価する。
+# all-features は **意図的に有効化しない**: rav1e の `fuzzing` feature が
+# libfuzzer-sys(NCSA)を引き込み、実際には配布物に入らないライセンスを
+# allow リストに足す羽目になるため。
+
+[licenses]
+version = 2
+# 信頼度の低い LICENSE テキスト一致を許容しない。
+confidence-threshold = 0.93
+# allow に書いたが実際には誰も使っていない = 棚卸し漏れなので知らせる。
+unused-allowed-license = "warn"
+
+allow = [
+    # --- 主要 2 種。ツリーの大半はこのどちらか(または OR)。---
+    "MIT",
+    "Apache-2.0",
+
+    # --- パーミッシブな BSD 族 ---
+    # BSD-2-Clause: kamadak-exif / mutate_once(EXIF 読み)、rav1e / av1-grain /
+    #               v_frame(AVIF エンコード)、arrayref、zerocopy
+    "BSD-2-Clause",
+    # BSD-3-Clause: exr(OpenEXR 読み、image 経由)、moxcms(ICC/カラー変換)、
+    #               avif-serialize、brotli / brotli-decompressor(WebP・PNG 経由)、
+    #               alloc-no-stdlib / alloc-stdlib / lebe
+    "BSD-3-Clause",
+    # ISC はツリーに存在しないため意図的に入れていない(allow は最小に保つ)。
+
+    # --- 単一クレート単位で必要になるもの。各行に理由を明記する。---
+    # Zlib: bytemuck / safe_arch / wide(SIMD ヘルパ、fast_image_resize・ravif 経由)、
+    #       miniz_oxide(PNG の deflate)、zune-core / zune-inflate / zune-jpeg
+    #       (image クレートの JPEG デコーダ)
+    "Zlib",
+    # Unicode-3.0: unicode-ident(proc-macro2 経由、ビルド時のみ)。
+    #              Unicode, Inc. のデータライセンス。パーミッシブ。
+    "Unicode-3.0",
+    # CC0-1.0: imgref(ravif / rgb 系の画像バッファ参照型)。パブリックドメイン相当。
+    "CC0-1.0",
+    # 0BSD: adler2(miniz_oxide のチェックサム)。文言上は最も緩い BSD。
+    "0BSD",
+    # Unlicense: memchr / byteorder-lite。いずれも "Unlicense OR MIT" だが、
+    #            SPDX 式の評価順で Unlicense 側が採られる場合があるため両方許可する。
+    "Unlicense",
+]
+
+# 個別クレートの例外(allow に無いライセンスを、そのクレートに限って認める)。
+[[licenses.exceptions]]
+# jpeg-encoder は "MIT OR Apache-2.0 OR IJG"。IJG(Independent JPEG Group)は
+# パーミッシブだが SPDX の OSI 承認外で allow に入れると他クレートにも波及するため、
+# このクレート限定の例外にする。実際には MIT で受け取れる。
+name = "jpeg-encoder"
+allow = ["IJG"]
+
+[[licenses.exceptions]]
+# libfuzzer-sys は "(MIT OR Apache-2.0) AND NCSA" で、NCSA 部分が AND のため
+# 回避できない。rav1e の `[target.'cfg(fuzzing)'.dependencies]` 経由でのみ
+# 依存グラフに現れる = ファザービルド専用で、配布バイナリには一切入らない。
+# NCSA 自体も OSI 承認のパーミッシブライセンス。
+name = "libfuzzer-sys"
+allow = ["NCSA"]
+
+# --- 明示的に塞ぐクレート(ライセンス方針の二重化) ---------------------------
+[bans]
+multiple-versions = "warn"      # 重複バージョンは是正したいが CI を止めるほどではない
+# ワークスペース内の path 依存(atx-core / atx-geometry / atx-store)は version を
+# 書いておらず wildcard 扱いになる。allow-wildcard-paths は publish = false の
+# クレートにしか効かないため、ここは "warn" に留める(外部クレートへの "*" 依存が
+# 増えたら警告として気づける)。crates.io に publish する段になったら
+# path 依存に version を併記すること。
+wildcards = "warn"
+
+[[bans.deny]]
+# LGPL-2.1。RAW 現像の第一候補だったが docs/ROADMAP.md の判断で不採用(延期)。
+# 採用するなら feature flag による隔離と方針の明文化が先。
+name = "rawler"
+
+[[bans.deny]]
+# LGPL-3.0。rawler 上の現像パイプライン。同上。
+name = "imagepipe"
+
+[[bans.deny]]
+# AGPL。ネットワーク配布時に全ソース公開義務が及ぶ。採用不可。
+name = "zenraw"
+
+[advisories]
+version = 2
+# 脆弱性は無条件に CI を止める。ここが本命。
+# (`vulnerability` / `unmaintained` などの旧キーは cargo-deny v2 で廃止され、
+#  既定が「脆弱性 = deny」「unmaintained = warn 相当の ignore 運用」になっている。
+#  unmaintained は下の設定で workspace 直接依存のみに絞り、推移的依存の
+#  「メンテ停止」通知で CI が不定期に落ちるのを避ける。)
+unmaintained = "workspace"
+# yanked されたクレートが Cargo.lock に残るのは実害があるので落とす。
+yanked = "deny"
+ignore = [] # little_exif(未使用依存)の削除により quick-xml 系の無視エントリは不要になった
+
+[sources]
+unknown-registry = "deny"   # crates.io 以外のレジストリを禁止
+unknown-git = "deny"        # git 依存を禁止(タグ/リビジョンの差し替えが監査できないため)
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
