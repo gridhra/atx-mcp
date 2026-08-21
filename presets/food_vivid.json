@@ -1,0 +1,15 @@
+{
+  "name": "food_vivid",
+  "description": "Vivid food photography: warm orange/yellow saturation boost plus a contrast lift (no resize/encode).",
+  "recipe": {
+    "operations": [
+      {
+        "op": "hsl",
+        "orange": { "saturation": 22, "luminance": 4 },
+        "yellow": { "saturation": 18, "luminance": 4 },
+        "red": { "saturation": 12 }
+      },
+      { "op": "adjust", "contrast": 0.1 }
+    ]
+  }
+}

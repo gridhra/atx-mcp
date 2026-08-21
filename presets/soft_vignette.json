@@ -1,0 +1,9 @@
+{
+  "name": "soft_vignette",
+  "description": "Building block: a soft, subtle vignette on its own, for stacking after other looks (no resize/encode).",
+  "recipe": {
+    "operations": [
+      { "op": "vignette", "strength": 0.2, "radius": 0.7, "feather": 0.5 }
+    ]
+  }
+}

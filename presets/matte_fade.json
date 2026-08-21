@@ -1,0 +1,17 @@
+{
+  "name": "matte_fade",
+  "description": "Faded matte look: lifted black point via curves plus a slight desaturation (no resize/encode).",
+  "recipe": {
+    "operations": [
+      {
+        "op": "curves",
+        "master": [
+          [0, 28],
+          [128, 132],
+          [255, 238]
+        ]
+      },
+      { "op": "adjust", "saturation": -0.12 }
+    ]
+  }
+}

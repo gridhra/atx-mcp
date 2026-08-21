@@ -1,0 +1,11 @@
+{
+  "name": "instagram_square_1080",
+  "description": "Instagram square post: center-crop 1:1, exactly 1080x1080, WebP q85.",
+  "recipe": {
+    "operations": [
+      { "op": "crop", "aspect_ratio": "1:1", "anchor": "center" },
+      { "op": "resize", "width": 1080, "height": 1080, "fit": "cover", "without_enlargement": false },
+      { "op": "encode", "format": "webp", "quality": 85 }
+    ]
+  }
+}

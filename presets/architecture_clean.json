@@ -1,0 +1,11 @@
+{
+  "name": "architecture_clean",
+  "description": "Clean architecture look: auto black/white point stretch, a final sharpen, and a slight desaturation (no resize/encode). Run perspective correction separately first if the shot needs keystone fixed - its params are per-image.",
+  "recipe": {
+    "operations": [
+      { "op": "auto_levels", "clip_percent": 0.5, "per_channel": false },
+      { "op": "unsharp_mask", "amount": 0.5, "radius": 1.2, "threshold": 2 },
+      { "op": "adjust", "saturation": -0.05 }
+    ]
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "instagram_portrait_4_5",
+  "description": "Instagram portrait post: center-crop 4:5, exactly 1080x1350, WebP q85.",
+  "recipe": {
+    "operations": [
+      { "op": "crop", "aspect_ratio": "4:5", "anchor": "center" },
+      { "op": "resize", "width": 1080, "height": 1350, "fit": "cover", "without_enlargement": false },
+      { "op": "encode", "format": "webp", "quality": 85 }
+    ]
+  }
+}

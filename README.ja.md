@@ -145,9 +145,10 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 }
 ```
 
-対応 op(21種): `auto_orient` / `rotate` / `perspective` / `crop`(crop・pad)/ `resize`(cover・contain・fill)/
+対応 op(27種): `auto_orient` / `rotate` / `perspective` / `crop`(crop・pad)/ `resize`(cover・contain・fill)/
 `adjust` / `color_matrix` / `curves` / `levels` / `lut` / `white_balance` / `hsl` /
 `blur` / `median` / `unsharp_mask` / `convolve` / `clone` / `heal` / `svg_overlay` /
+`flip` / `vignette` / `grain` / `gradient_map` / `pixelate` / `auto_levels` /
 `encode`(jpeg・png・webp・avif)/ `strip_metadata`。
 op 一覧はツールのスキーマにあえて埋め込んでいない。最新のカタログは `list_operations`、
 個々の op の完全なスキーマ・例・注意点は `explain_operation` で取得する。
@@ -203,9 +204,10 @@ op 一覧はツールのスキーマにあえて埋め込んでいない。最�
 ### マスク(部分適用)
 
 マスクは**グレースケールの画像 revision** である。BT.709 輝度がそのまま重みで、
-白 = その op を全量適用、黒 = その画素には適用しない。トーン系・フィルタ系の 11 op
+白 = その op を全量適用、黒 = その画素には適用しない。トーン系・フィルタ系の 14 op
 (`adjust` / `color_matrix` / `curves` / `levels` / `hsl` / `lut` / `white_balance` /
-`blur` / `median` / `unsharp_mask` / `convolve`)が受け取れる。
+`blur` / `median` / `unsharp_mask` / `convolve` / `grain` / `gradient_map` /
+`auto_levels`)が受け取れる。
 
 1. `generate_mask` が、参照画像と**厳密に同じ寸法**のマスクを決定論的に作る:
 
@@ -281,15 +283,38 @@ op 一覧はツールのスキーマにあえて埋め込んでいない。最�
 `apply_transform` / `render_preview` は `recipe`(生の DSL)と
 `preset`([`presets/`](presets) 同梱の名前付きレシピ)のどちらか一方を受ける(排他・どちらか必須):
 
-| プリセット | 内容 |
-|---|---|
-| `eyecatch_16_9` | 16:9 に中央クロップ → 幅 1600px → WebP q82 |
-| `film_soft` | フィルム風の柔らかさ: 緩い S 字カーブ + 輝度側へ 15% の脱色 |
-| `product_clean` | EC 商品向けの清潔感: ほぼ中立の WB + レベル調整 + 軽いシャープ |
-| `thumbnail_square` | 1:1 に中央クロップ → 800x800 → WebP q80 |
-| `web_optimize` | 拡大せず 2000x2000 に収める → WebP q80 |
-| `grayscale` | BT.709 輝度の `color_matrix` による白黒化 |
-| `sepia` | `color_matrix` による古典的セピア |
+| セット | プリセット | 内容 |
+|---|---|---|
+| basics | `eyecatch_16_9` | 16:9 に中央クロップ → 幅 1600px → WebP q82 |
+| basics | `film_soft` | フィルム風の柔らかさ: 緩い S 字カーブ + 輝度側へ 15% の脱色 |
+| basics | `product_clean` | EC 商品向けの清潔感: ほぼ中立の WB + レベル調整 + 軽いシャープ |
+| basics | `thumbnail_square` | 1:1 に中央クロップ → 800x800 → WebP q80 |
+| basics | `web_optimize` | 拡大せず 2000x2000 に収める → WebP q80 |
+| basics | `grayscale` | BT.709 輝度の `color_matrix` による白黒化 |
+| basics | `sepia` | `color_matrix` による古典的セピア |
+| film | `film_warm` | 暖色系フィルム: アンバー寄り WB + 緩い S 字カーブ + 軽いグレイン |
+| film | `film_cool` | 寒色系フィルム: ブルー寄り WB + 緩い S 字カーブ + 軽いグレイン |
+| film | `matte_fade` | 褪色マット調: `curves` で黒を持ち上げ、わずかに脱色 |
+| film | `film_grain_strong` | 緩い S 字カーブに粗く強いグレイン(増感風) |
+| film | `cinema_teal_orange` | `hsl` の狙い撃ちシフトによるティール&オレンジのシネマ調 |
+| mono | `bw_neutral` | BT.709 輝度の `color_matrix` による中立な白黒 |
+| mono | `bw_high_contrast` | 白黒変換 + 強い S 字カーブによる高コントラスト白黒 |
+| mono | `bw_red_filter` | 赤フィルターを模した白黒(空を落とす古典的手法) |
+| mono | `bw_soft` | マットカーブによる柔らかく低コントラストな白黒 |
+| mono | `duotone_navy_cream` | `gradient_map` によるネイビー→クリームのデュオトーン |
+| editorial | `product_white` | 自動レベル伸長 + 中立 WB + 最終シャープ |
+| editorial | `food_vivid` | オレンジ/イエローの彩度を上げコントラストを持ち上げる |
+| editorial | `portrait_soft` | 柔らかいマットカーブ + 軽い脱色 + 控えめなビネット |
+| editorial | `landscape_punch` | コントラスト・彩度の底上げ + 軽いビネット |
+| editorial | `architecture_clean` | 自動レベル + シャープ + わずかな脱色(`perspective` 補正は別途手動で) |
+| social | `og_1200x630` | Open Graph 用: 1200:630 にクロップ → 幅 1200 → WebP q82 |
+| social | `x_wide_16_9` | X(Twitter)ワイドカード用: 16:9 にクロップ → 幅 1600 → WebP q82 |
+| social | `instagram_square_1080` | Instagram 正方形投稿: 1:1 にクロップ → 1080x1080 → WebP q85 |
+| social | `instagram_portrait_4_5` | Instagram 縦長投稿: 4:5 にクロップ → 1080x1350 → WebP q85 |
+| social | `youtube_thumb_1280x720` | YouTube サムネイル: 16:9 にクロップ → 1280x720 → WebP q85 |
+| social | `hero_2400` | 大判ヒーロー/バナー画像: 2400px に収める → WebP q85 |
+| building block | `soft_vignette` | ビネット単体。他の仕上げの上に重ねる部品として |
+| building block | `grain_fine` | 軽く細かい決定論的グレイン単体。重ねる部品として |
 
 プリセットは純粋な糖衣である: 解決後は通常のレシピとして同じパイプラインを流れ、
 `recipe_hash`(冪等キー)は**解決後のレシピ**に対して計算される。

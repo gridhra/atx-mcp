@@ -1,0 +1,19 @@
+{
+  "name": "film_warm",
+  "description": "Warm film stock: amber white balance, a gentle S-curve, and light fine grain (no resize/encode).",
+  "recipe": {
+    "operations": [
+      { "op": "white_balance", "temperature": 14, "tint": -2 },
+      {
+        "op": "curves",
+        "master": [
+          [0, 6],
+          [64, 60],
+          [192, 200],
+          [255, 250]
+        ]
+      },
+      { "op": "grain", "amount": 0.08, "size": 1, "monochrome": true, "seed": 1 }
+    ]
+  }
+}

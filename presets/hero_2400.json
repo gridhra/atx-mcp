@@ -1,0 +1,10 @@
+{
+  "name": "hero_2400",
+  "description": "Large hero/banner image: fit inside 2400px on the long edge without upscaling, WebP q85.",
+  "recipe": {
+    "operations": [
+      { "op": "resize", "width": 2400, "height": 2400, "fit": "contain", "without_enlargement": true },
+      { "op": "encode", "format": "webp", "quality": 85 }
+    ]
+  }
+}

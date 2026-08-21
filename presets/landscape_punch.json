@@ -1,0 +1,10 @@
+{
+  "name": "landscape_punch",
+  "description": "Punchy landscape look: contrast and saturation lift plus a light vignette to frame the scene (no resize/encode).",
+  "recipe": {
+    "operations": [
+      { "op": "adjust", "contrast": 0.15, "saturation": 0.18 },
+      { "op": "vignette", "strength": 0.22, "radius": 0.65, "feather": 0.5 }
+    ]
+  }
+}

@@ -19,16 +19,88 @@ use serde::Deserialize;
 /// 表の名前と JSON の `"name"` が一致することはユニットテストで検証される。
 pub const PRESET_FILES: &[(&str, &str)] = &[
     (
+        "architecture_clean",
+        include_str!("../../../presets/architecture_clean.json"),
+    ),
+    (
+        "bw_high_contrast",
+        include_str!("../../../presets/bw_high_contrast.json"),
+    ),
+    (
+        "bw_neutral",
+        include_str!("../../../presets/bw_neutral.json"),
+    ),
+    (
+        "bw_red_filter",
+        include_str!("../../../presets/bw_red_filter.json"),
+    ),
+    ("bw_soft", include_str!("../../../presets/bw_soft.json")),
+    (
+        "cinema_teal_orange",
+        include_str!("../../../presets/cinema_teal_orange.json"),
+    ),
+    (
+        "duotone_navy_cream",
+        include_str!("../../../presets/duotone_navy_cream.json"),
+    ),
+    (
         "eyecatch_16_9",
         include_str!("../../../presets/eyecatch_16_9.json"),
     ),
+    ("film_cool", include_str!("../../../presets/film_cool.json")),
+    (
+        "film_grain_strong",
+        include_str!("../../../presets/film_grain_strong.json"),
+    ),
     ("film_soft", include_str!("../../../presets/film_soft.json")),
+    ("film_warm", include_str!("../../../presets/film_warm.json")),
+    (
+        "food_vivid",
+        include_str!("../../../presets/food_vivid.json"),
+    ),
+    (
+        "grain_fine",
+        include_str!("../../../presets/grain_fine.json"),
+    ),
     ("grayscale", include_str!("../../../presets/grayscale.json")),
+    ("hero_2400", include_str!("../../../presets/hero_2400.json")),
+    (
+        "instagram_portrait_4_5",
+        include_str!("../../../presets/instagram_portrait_4_5.json"),
+    ),
+    (
+        "instagram_square_1080",
+        include_str!("../../../presets/instagram_square_1080.json"),
+    ),
+    (
+        "landscape_punch",
+        include_str!("../../../presets/landscape_punch.json"),
+    ),
+    (
+        "matte_fade",
+        include_str!("../../../presets/matte_fade.json"),
+    ),
+    (
+        "og_1200x630",
+        include_str!("../../../presets/og_1200x630.json"),
+    ),
+    (
+        "portrait_soft",
+        include_str!("../../../presets/portrait_soft.json"),
+    ),
     (
         "product_clean",
         include_str!("../../../presets/product_clean.json"),
     ),
+    (
+        "product_white",
+        include_str!("../../../presets/product_white.json"),
+    ),
     ("sepia", include_str!("../../../presets/sepia.json")),
+    (
+        "soft_vignette",
+        include_str!("../../../presets/soft_vignette.json"),
+    ),
     (
         "thumbnail_square",
         include_str!("../../../presets/thumbnail_square.json"),
@@ -36,6 +108,14 @@ pub const PRESET_FILES: &[(&str, &str)] = &[
     (
         "web_optimize",
         include_str!("../../../presets/web_optimize.json"),
+    ),
+    (
+        "x_wide_16_9",
+        include_str!("../../../presets/x_wide_16_9.json"),
+    ),
+    (
+        "youtube_thumb_1280x720",
+        include_str!("../../../presets/youtube_thumb_1280x720.json"),
     ),
 ];
 
@@ -143,5 +223,36 @@ mod tests {
     #[test]
     fn unknown_preset_is_reported() {
         assert!(matches!(resolve("nope"), Err(PresetError::Unknown)));
+    }
+
+    /// v0.3.0 op(gradient_map)を使うプリセットの validate。
+    /// gradient_map の validate は着地済み(`ops::gradient::validate_stops`)。
+    #[test]
+    fn gradient_map_preset_passes_core_validate() {
+        let preset = resolve("duotone_navy_cream").expect("preset must resolve");
+        atx_core::recipe::validate(&preset.recipe)
+            .unwrap_or_else(|e| panic!("preset duotone_navy_cream must be a valid recipe: {e}"));
+    }
+
+    /// v0.3.0 op(vignette / grain / auto_levels)を使うプリセット。
+    /// これらの `validate` は他 2 エージェントが並行実装中で、この時点では
+    /// `todo!()` のため呼ぶとパニックする。ops が着地したら ignore を外すこと。
+    #[test]
+    fn vignette_grain_auto_levels_presets_pass_core_validate() {
+        for name in [
+            "film_warm",
+            "film_cool",
+            "film_grain_strong",
+            "grain_fine",
+            "portrait_soft",
+            "landscape_punch",
+            "soft_vignette",
+            "product_white",
+            "architecture_clean",
+        ] {
+            let preset = resolve(name).expect("preset must resolve");
+            atx_core::recipe::validate(&preset.recipe)
+                .unwrap_or_else(|e| panic!("preset {name} must be a valid recipe: {e}"));
+        }
     }
 }

@@ -1,0 +1,18 @@
+{
+  "name": "portrait_soft",
+  "description": "Soft portrait look: a gentle matte curve, a light desaturation, and a subtle vignette to draw the eye inward (no resize/encode).",
+  "recipe": {
+    "operations": [
+      {
+        "op": "curves",
+        "master": [
+          [0, 12],
+          [128, 130],
+          [255, 244]
+        ]
+      },
+      { "op": "adjust", "saturation": -0.08 },
+      { "op": "vignette", "strength": 0.18, "radius": 0.75, "feather": 0.55 }
+    ]
+  }
+}

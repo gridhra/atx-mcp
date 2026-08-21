@@ -1,0 +1,19 @@
+{
+  "name": "film_cool",
+  "description": "Cool film stock: blue-leaning white balance, a gentle S-curve, and light fine grain (no resize/encode).",
+  "recipe": {
+    "operations": [
+      { "op": "white_balance", "temperature": -14, "tint": 2 },
+      {
+        "op": "curves",
+        "master": [
+          [0, 6],
+          [64, 58],
+          [192, 198],
+          [255, 249]
+        ]
+      },
+      { "op": "grain", "amount": 0.08, "size": 1, "monochrome": true, "seed": 2 }
+    ]
+  }
+}

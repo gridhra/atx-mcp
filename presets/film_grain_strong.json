@@ -1,0 +1,17 @@
+{
+  "name": "film_grain_strong",
+  "description": "Heavy, coarse film grain over a gentle S-curve for a pushed/high-ISO look (no resize/encode).",
+  "recipe": {
+    "operations": [
+      {
+        "op": "curves",
+        "master": [
+          [0, 10],
+          [128, 130],
+          [255, 246]
+        ]
+      },
+      { "op": "grain", "amount": 0.4, "size": 2, "monochrome": true, "seed": 3 }
+    ]
+  }
+}
