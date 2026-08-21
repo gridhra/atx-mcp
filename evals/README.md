@@ -7,7 +7,7 @@ CI には組み込まない(§下記コスト注意)。
 ## ⚠️ コスト注意
 
 `evals/run.sh` を(`--dry-run` なしで)実行すると、タスクごとに実際の Claude API トークンを消費する。
-10 タスク × 数ターンの実行になるので、CI やプッシュ毎の自動実行には絶対に使わないこと。
+13 タスク × 数ターンの実行になるので、CI やプッシュ毎の自動実行には絶対に使わないこと。
 リリース候補を切る前に手動で1回まわす、という運用を想定している。
 
 ## 前提
@@ -23,7 +23,7 @@ which claude                        # Claude Code CLI が PATH にあること
 # 1. まずコマンド列挙だけ確認する(トークン消費なし)
 evals/run.sh --dry-run
 
-# 2. 全10タスクを実行する(課金される)
+# 2. 全13タスクを実行する(課金される)
 evals/run.sh
 
 # 3. 1タスクだけ実行する(デバッグ用、courseの絞り込み)
@@ -49,7 +49,14 @@ evals/run.sh t01_straighten_eyecatch
 `success_criteria` に書けるキー(すべて AND 条件):
 
 - `expect_revision`: `mime_type` / `width` / `height` / `aspect_ratio`("W:H"、相対誤差2%まで許容) /
-  `recipe_contains_ops`(op名の配列。`{"op": "...", "fields": {...}}` の形式でフィールド値まで指定可) /
+  `recipe_contains_ops`(op名の配列。要素は文字列(op名一致)か
+  `{"op": "...", "fields": {...}, "fields_present": [...]}` の形式。`op` は省略可
+  (省略時はop名を問わず走査。マスク付きトーン系 op のようにどの op が使われるか
+  事前に決め打てないケース用)。`fields` は値まで一致、`fields_present` は
+  値を問わずそのフィールドが存在する(null でない)ことだけを要求する) /
+  `recipe_contains_text`(recipe を JSON 文字列化したものへの部分文字列一致の配列。
+  `layers` キーの存在やブレンドモード名など、op名ベースでは表現しづらい構造の
+  ざっくり確認用) /
   `min_matches`(条件に合う派生 revision の最小数、既定1) / `max_derived_total`
   (台帳全体の派生 revision 数の上限。冪等な再適用でrevisionが重複していないことの確認に使う)
 - `expect_no_new_revision`: `true` なら、台帳に派生 revision(`source_revision_id` が非null)が
@@ -81,7 +88,7 @@ python3 evals/score.py --selftest
 
 ## タスク一覧(evals/tasks/*.json)
 
-実運用フィードバック(docs/DESIGN.md §9)と ROADMAP の Agent UX 規律に由来する10本:
+実運用フィードバック(docs/DESIGN.md §9)と ROADMAP の Agent UX 規律に由来する13本:
 
 | id | 検証する挙動 |
 |---|---|
@@ -95,6 +102,9 @@ python3 evals/score.py --selftest
 | `t08_source_space_crop` | crop の `coordinate_space: source`(回転前ピクセル座標での指定) |
 | `t09_preset_use` | ビルトインプリセット名での指定 |
 | `t10_error_self_correction` | 意図的に不整合なレシピ(aspect_ratio と rect の同時指定)を投げ、構造化エラーの `recovery` に従って1往復で自己修復する |
+| `t11_masked_adjustment` | `generate_mask`(linear_gradient)でマスクを作り、トーン系 op の `mask` フィールドから参照して部分適用する(空だけ暗くする、下半分は不変) |
+| `t12_layer_composite` | `layers` スタックで同一画像のぼかし版を `screen` 50% で重ね、仕上げの `operations` で 1200px幅 WebP へ |
+| `t13_svg_watermark` | `.svg` バッジを `import_asset` してから `svg_overlay` で右下に焼き込む(ベクタアセットの取り込み→参照フロー) |
 
 各タスクの `input_fixture` は基本的に共通で `tests/fixtures/synthetic_scene.jpg`
 (完全合成・決定論的に再生成可能なフィクスチャ。docs/DESIGN.md §9.2 参照)。

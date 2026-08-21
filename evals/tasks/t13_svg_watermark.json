@@ -1,0 +1,20 @@
+{
+  "id": "t13_svg_watermark",
+  "prompt": "このSVGバッジ({{TASK_DIR}}/badge.svg)を右下に透かしとして入れて。",
+  "input_fixture": "tests/fixtures/synthetic_scene.jpg",
+  "setup": {
+    "seed_files": [
+      {
+        "path": "badge.svg",
+        "text": "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"20\" viewBox=\"0 0 40 20\">\n  <!-- Fully synthetic fixture for the svg_overlay tests (atx v0.8).\n       Shapes only, on purpose: glyphs are never rendered (no system fonts are\n       ever loaded, see DESIGN.md 9.9), so a lettered fixture would not be a\n       stable probe target. The rect covers the whole viewBox on the pixel\n       grid, so every pixel of the 40x20 raster is fully opaque and can be\n       probed exactly. -->\n  <rect x=\"0\" y=\"0\" width=\"40\" height=\"20\" fill=\"#0000ff\"/>\n  <circle cx=\"10\" cy=\"10\" r=\"6\" fill=\"#ffff00\"/>\n</svg>\n"
+      }
+    ]
+  },
+  "success_criteria": {
+    "expect_revision": {
+      "recipe_contains_ops": ["svg_overlay"],
+      "min_matches": 1
+    }
+  },
+  "max_turns": 12
+}

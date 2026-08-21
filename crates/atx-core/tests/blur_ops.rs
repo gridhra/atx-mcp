@@ -190,8 +190,11 @@ fn blur_large_sigma_on_full_fixture_completes_quickly() {
     );
     let elapsed = start.elapsed();
     assert!(!out.bytes.is_empty());
+    // 素朴な 2D 実装(数分〜)を検出するためのカナリア。分離可能 + 行並列実装なら
+    // 手元 arm64 で ~20s、CI の低コア ubuntu ランナーで ~66s(debug ビルド)。
+    // ランナー性能差で偽陽性にならないよう余裕を持たせた上限にする。
     assert!(
-        elapsed.as_secs() < 60,
+        elapsed.as_secs() < 150,
         "separable gaussian blur at sigma=100 on the full fixture took too long: {elapsed:?}"
     );
 }
