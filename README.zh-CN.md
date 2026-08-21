@@ -310,6 +310,12 @@ crate 结构:`atx-core`(配方与变换引擎)/ `atx-geometry`(倾斜检测)/
 
 发布流程请参见 [RELEASING.md](RELEASING.md)。
 
+## 名称由来
+
+"atx" 是 **A**sset **T**ransform 的缩写;末尾的 `x` 沿用了 "transform" 的
+惯用简写(如 xform / tx)。选它是因为便于作为简短易输入的二进制名和 crate
+前缀(如 `atx-core`),与 PC 的 ATX 规格或 Markdown 的 ATX 风格标题并无关系。
+
 ## 许可证
 
 MIT。详见 [LICENSE](LICENSE)。

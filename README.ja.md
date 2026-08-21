@@ -314,6 +314,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 リリース手順は [RELEASING.md](RELEASING.md) を参照。
 
+## 名前の由来
+
+"atx" は **A**sset **T**ransform の略。末尾の `x` は "transform" の慣用的な
+省略記法(xform / tx)にならったもの。短くタイプしやすいバイナリ名・クレート
+接頭辞(`atx-core` など)として採用しており、PC の ATX 規格や Markdown の
+ATX 見出しとは関係ない。
+
 ## ライセンス
 
 MIT。[LICENSE](LICENSE) を参照。

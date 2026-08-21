@@ -338,6 +338,13 @@ detection) / `atx-store` (immutable asset store) / `atx-mcp` (rmcp stdio server)
 
 See [RELEASING.md](RELEASING.md) for the release process.
 
+## Name
+
+"atx" stands for **A**sset **T**ransform; the trailing `x` follows the
+familiar shorthand for "transform" (as in xform / tx). It was chosen as a
+short, easy-to-type binary name and crate prefix (`atx-core`, etc.), and it
+has no relation to the PC ATX form factor or Markdown ATX-style headings.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
