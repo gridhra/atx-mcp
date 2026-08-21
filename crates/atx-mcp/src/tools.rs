@@ -51,6 +51,18 @@ pub const CUBE_MIME: &str = "application/x-cube";
 pub const MAX_CUBE_BYTES: u64 = 16 * 1024 * 1024;
 /// .cube 判定でヘッダとして読むバイト数の上限。
 const CUBE_SNIFF_BYTES: usize = 64 * 1024;
+/// SVG ベクタアセットの MIME type(v0.8「`svg_overlay`」)。
+///
+/// `image/` で始まるが**ラスタ画像ではない**。`inspect_image` / `generate_mask` /
+/// マスクオーバレイのようにデコードを前提とするツールは、この MIME を
+/// [`not_an_image`] で弾く([`is_raster_image`] が唯一の判定点)。
+/// atx-store の `ext_for_mime` がこれを `.svg` 拡張子に写す。
+pub const SVG_MIME: &str = "image/svg+xml";
+/// SVG 取り込みのサイズ上限。ロゴ・ウォーターマークの SVG が 16MiB を超えることは
+/// 実務上ありえないので、テキストとしての暴走を弾く実務的なサニティ上限。
+pub const MAX_SVG_BYTES: u64 = 16 * 1024 * 1024;
+/// SVG 判定で内容を覗くバイト数の上限(先頭 4KiB)。
+const SVG_SNIFF_BYTES: usize = 4 * 1024;
 
 // ---------------------------------------------------------------------------
 // 入力パラメータ(tool inputSchema はこれらから生成される)
@@ -531,6 +543,8 @@ fn atx_error(err: AtxError) -> CallToolResult {
 fn not_an_image(revision_id: &str, mime_type: &str) -> CallToolResult {
     let hint = if mime_type == CUBE_MIME {
         "this is an imported .cube 3D LUT asset, not an image; reference it from a recipe as {\"op\": \"lut\", \"lut_revision_id\": \"...\"} instead of inspecting it"
+    } else if mime_type == SVG_MIME {
+        "this is an imported SVG, a VECTOR asset with no pixels of its own, not a raster image; stamp it onto a raster revision with {\"op\": \"svg_overlay\", \"svg_revision_id\": \"...\", \"x\": 0, \"y\": 0} instead of inspecting it"
     } else {
         "call list_assets and pick a revision whose mime_type starts with \"image/\""
     };
@@ -545,6 +559,36 @@ fn not_an_image(revision_id: &str, mime_type: &str) -> CallToolResult {
             "recovery": hint,
         }),
     )
+}
+
+/// revision が**デコードできるラスタ画像**かどうか。
+///
+/// `image/` で始まるだけでは足りない: v0.8 の SVG(`image/svg+xml`)は
+/// `image/` 名前空間に居ながらベクタなので、デコードを前提とするツール
+/// (`inspect_image` / `generate_mask` / マスクオーバレイ)からは弾く必要がある。
+/// 判定を 1 箇所に閉じ込めておけば、将来ベクタ系アセットが増えてもここだけ直せばよい。
+fn is_raster_image(mime_type: &str) -> bool {
+    mime_type.starts_with("image/") && mime_type != SVG_MIME
+}
+
+/// ファイルが SVG ベクタアセットかどうかを判定する。
+///
+/// 判定規則(どちらか一方を満たせば SVG とみなす):
+/// 1. 拡張子が `.svg`(大文字小文字を無視)
+/// 2. 先頭 4KiB(UTF-8 として読めた範囲)に `<svg` が現れる
+///    — XML 宣言・DOCTYPE・コメントが前置されていても拾える素朴な sniff
+///
+/// **画像のマジックバイト判定より先に**呼ぶ。SVG はテキストなので
+/// `inspect_bytes` に渡すと「未知フォーマット」エラーになる(.cube と同じ理由)。
+fn looks_like_svg(path: &Path, bytes: &[u8]) -> bool {
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
+    {
+        return true;
+    }
+    let head = &bytes[..bytes.len().min(SVG_SNIFF_BYTES)];
+    String::from_utf8_lossy(head).contains("<svg")
 }
 
 /// ファイルが .cube 3D LUT かどうかを判定する。
@@ -685,8 +729,32 @@ impl AtxTools {
                 }),
             );
         }
+        // ベクタアセット(v0.8: レシピから参照される SVG)も画像としては検査しない。
+        // 寸法は SVG の**固有サイズ**を記録し、持たない SVG は 0x0 のままにする
+        // (0x0 は「この SVG は自分では大きさを決められない」の記録でもあり、
+        //  svg_overlay で width/height を書けというサインになる)。
+        let is_svg = !is_cube && looks_like_svg(&path, &bytes);
+        if is_svg && bytes.len() as u64 > MAX_SVG_BYTES {
+            return tool_error(
+                "limit_exceeded",
+                format!(
+                    "{} looks like an SVG but is {} bytes, over the {MAX_SVG_BYTES} byte limit for SVG assets",
+                    path.display(),
+                    bytes.len()
+                ),
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "byte_size": bytes.len(),
+                    "max_bytes": MAX_SVG_BYTES,
+                    "recovery": "an SVG this large is almost certainly not a logo/watermark; check the file, or simplify the artwork",
+                }),
+            );
+        }
         let (mime_type, width, height) = if is_cube {
             (CUBE_MIME.to_string(), 0, 0)
+        } else if is_svg {
+            let (w, h) = atx_core::svg_intrinsic_size(&bytes).unwrap_or((0, 0));
+            (SVG_MIME.to_string(), w, h)
         } else {
             let info = tri!(atx_core::inspect_bytes(&bytes, &self.limits), atx_error);
             // 寸法は EXIF Orientation 適用後の実効値を記録する(atx-core はデコード時に
@@ -708,6 +776,9 @@ impl AtxTools {
         if is_cube {
             origin.insert("asset_kind".to_string(), "lut".to_string());
         }
+        if is_svg {
+            origin.insert("asset_kind".to_string(), "svg".to_string());
+        }
 
         let known_before = tri!(self.known_revision_ids(), store_error);
         let revision = tri!(
@@ -726,6 +797,23 @@ impl AtxTools {
         let text = if is_cube {
             format!(
                 "{verb} {} as {} (.cube LUT asset, {}, {} bytes). It is not an image: reference it from a recipe as {{\"op\": \"lut\", \"lut_revision_id\": \"{}\"}}.\npath: {}",
+                path.display(),
+                summary.revision_id,
+                summary.mime_type,
+                summary.byte_size,
+                summary.revision_id,
+                summary.path,
+            )
+        } else if is_svg {
+            let size = if summary.width == 0 || summary.height == 0 {
+                "no intrinsic size (no viewBox / absolute width+height): pass both width and \
+                 height on svg_overlay"
+                    .to_string()
+            } else {
+                format!("intrinsic size {}x{}", summary.width, summary.height)
+            };
+            format!(
+                "{verb} {} as {} (SVG vector asset, {}, {size}, {} bytes). It is not a raster image: stamp it onto one with {{\"op\": \"svg_overlay\", \"svg_revision_id\": \"{}\", \"x\": 0, \"y\": 0}}. Text is NOT rendered (no fonts are loaded, for determinism) - convert text to paths.\npath: {}",
                 path.display(),
                 summary.revision_id,
                 summary.mime_type,
@@ -761,7 +849,7 @@ impl AtxTools {
     pub fn inspect_image(&self, params: &RevisionParams) -> CallToolResult {
         let revision = tri!(self.store.get_revision(&params.revision_id), store_error);
         // 画像でない revision(.cube LUT 等)はデコードを試みず、構造化エラーで返す。
-        if !revision.mime_type.starts_with("image/") {
+        if !is_raster_image(&revision.mime_type) {
             return not_an_image(&params.revision_id, &revision.mime_type);
         }
         let bytes = tri!(self.store.read_bytes(&params.revision_id), store_error);
@@ -1057,7 +1145,7 @@ impl AtxTools {
             self.store.get_revision(&params.reference_revision_id),
             store_error
         );
-        if !reference.mime_type.starts_with("image/") {
+        if !is_raster_image(&reference.mime_type) {
             return not_an_image(&params.reference_revision_id, &reference.mime_type);
         }
         let bytes = tri!(
@@ -1150,6 +1238,11 @@ impl AtxTools {
         tri!(atx_core::recipe::validate(&recipe), atx_error);
         let recipe_hash = tri!(atx_core::recipe_hash(&recipe), atx_error);
         let source = tri!(self.store.get_revision(&params.revision_id), store_error);
+        // 変換の入力はラスタ画像でなければならない(SVG / .cube は
+        // **レシピから参照される**アセットであって、パイプラインの入力ではない)。
+        if !is_raster_image(&source.mime_type) {
+            return not_an_image(&params.revision_id, &source.mime_type);
+        }
 
         // --- 冪等ショートサーキット: 既存派生があれば再変換しない ---
         let existing = tri!(self.store.list_revisions(None), store_error)
@@ -1292,7 +1385,10 @@ impl AtxTools {
         // 冪等キーは(プリセット解決後の)ユーザレシピのハッシュ。
         // プレビュー用に差し替えた encode は含めない。
         let recipe_hash = tri!(atx_core::recipe_hash(&recipe), atx_error);
-        tri!(self.store.get_revision(&params.revision_id), store_error);
+        let source = tri!(self.store.get_revision(&params.revision_id), store_error);
+        if !is_raster_image(&source.mime_type) {
+            return not_an_image(&params.revision_id, &source.mime_type);
+        }
 
         let preview_recipe = preview_recipe_of(&recipe);
         let bytes = tri!(self.store.read_bytes(&params.revision_id), store_error);
@@ -1315,7 +1411,7 @@ impl AtxTools {
         let final_bytes = match (params.overlay.as_deref(), mask_revision_id.as_deref()) {
             (Some("mask"), Some(mask_id)) => {
                 let mask_revision = tri!(self.store.get_revision(mask_id), store_error);
-                if !mask_revision.mime_type.starts_with("image/") {
+                if !is_raster_image(&mask_revision.mime_type) {
                     return not_an_image(mask_id, &mask_revision.mime_type);
                 }
                 let mask_bytes = tri!(self.store.read_bytes(mask_id), store_error);

@@ -29,6 +29,13 @@ little_exif = "0.6"
 jpeg-encoder = "0.7"
 webp = "0.3"
 ravif = "0.13"
+# SVG のラスタライズ(v0.8 `svg_overlay`)。
+# **default-features = false は決定論のための必須設定**: 既定の
+# `text` / `system-fonts` はマシンごとに違うシステムフォントを読みに行くため、
+# 同じレシピが環境によって別のバイト列を出す。無効化すると usvg に fontdb 自体が
+# 存在せず、`<text>` は「フォント解決不能」ではなく**そもそも描かれない**
+# (DESIGN.md §9.9)。svgz / raster-images も外して純 Rust・依存最小に保つ。
+resvg = { version = "0.48.1", default-features = false }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

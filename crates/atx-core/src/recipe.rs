@@ -274,6 +274,40 @@ pub enum Operation {
         #[serde(default)]
         feather_px: f64,
     },
+    /// SVG オーバレイ(v0.8)。ワークスペースへ import 済みの **SVG アセット**を
+    /// ラスタライズして、現在の画像の `(x, y)`(左上)へ焼き込む。
+    /// ロゴ・ウォーターマーク・クレジット表記の語彙。
+    ///
+    /// - 作業空間は **sRGB 符号値**。合成は `layers` と**同じ W3C compositing-1 の式**で、
+    ///   同じ 16 種の `blend_mode` が使える(実装も同じ関数を共有する)
+    /// - `(x, y)` は**負でもよい**(画像の外へ出た部分はクリップされる)
+    /// - `width` / `height` はラスタライズ先の寸法。両方省略すると SVG の固有サイズ、
+    ///   片方だけ指定すると固有サイズの縦横比を保って拡縮する
+    /// - **マスクは付けられない**: この op は「どこに置くか」を自分で持っており、
+    ///   マスクと二重定義になる(`clone` / `heal` と同じ理由)
+    /// - **`<text>` は描画されない**。決定論のためシステムフォントを一切読まないため
+    ///   (実行時警告を出す)。文字を載せたい SVG はテキストをパスへ変換しておくこと
+    ///   (DESIGN.md §9.9)
+    SvgOverlay {
+        /// SVG アセットの revision id("rev_...")。
+        svg_revision_id: String,
+        /// 貼り付け位置の左上 X(現在の画像座標。負可)。
+        x: i64,
+        /// 貼り付け位置の左上 Y(現在の画像座標。負可)。
+        y: i64,
+        /// ラスタライズ先の幅 [px]。省略時は SVG の固有サイズ(または height からの比例)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<u32>,
+        /// ラスタライズ先の高さ [px]。省略時は SVG の固有サイズ(または width からの比例)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+        /// オーバレイ不透明度 0.0..=1.0。既定 1.0。
+        #[serde(default = "default_one")]
+        opacity: f64,
+        /// ブレンドモード(`layers` と同じ 16 種)。既定 `normal`。
+        #[serde(default)]
+        blend_mode: BlendMode,
+    },
     /// 出力エンコード指定。レシピ内で最後に1回のみ許可。省略時は入力フォーマット維持。
     Encode {
         format: OutputFormat,
@@ -487,6 +521,8 @@ impl Operation {
     /// 意味が無いため対象外、encode / strip_metadata / auto_orient も同様。
     /// `clone` / `heal`(v0.7)は `radius` + `feather_px` という**自前の適用領域**を
     /// 持つので、マスクと二重定義になることを避けて対象外とする。
+    /// `svg_overlay`(v0.8)も同じ理由で対象外(`x` / `y` / `width` / `height` +
+    /// ラスタのアルファが、そのまま適用領域そのものである)。
     pub fn mask(&self) -> Option<&MaskRef> {
         match self {
             Operation::Adjust { mask, .. }
@@ -507,6 +543,7 @@ impl Operation {
             | Operation::Perspective { .. }
             | Operation::Clone { .. }
             | Operation::Heal { .. }
+            | Operation::SvgOverlay { .. }
             | Operation::Encode { .. }
             | Operation::StripMetadata { .. } => None,
         }
@@ -931,6 +968,13 @@ fn validate_operations(operations: &[Operation]) -> crate::Result<()> {
             Operation::Heal {
                 radius, feather_px, ..
             } => crate::ops::clone_heal::validate(index, "heal", *radius, *feather_px)?,
+            Operation::SvgOverlay {
+                svg_revision_id,
+                opacity,
+                width,
+                height,
+                ..
+            } => crate::ops::svg::validate(index, svg_revision_id, *opacity, *width, *height)?,
             Operation::Blur { sigma, .. } => crate::ops::blur::validate_blur(index, *sigma)?,
             Operation::Median { radius, .. } => crate::ops::blur::validate_median(index, *radius)?,
             Operation::UnsharpMask {

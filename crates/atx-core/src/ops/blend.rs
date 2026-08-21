@@ -435,13 +435,32 @@ pub(crate) fn composite(
             Some(m) => m[i],
             None => 1.0,
         };
+        composite_px(dst, src, mode, opacity, w);
+    }
+}
+
+/// **1 画素**の合成(W3C compositing-1)。[`composite`] の内側そのものであり、
+/// `svg_overlay`(v0.8)のようにキャンバス全面ではなく**部分領域**へ合成する op も
+/// この関数を通す。式・演算順・端点分岐を 1 実装に閉じ込めることで、
+/// 「レイヤー合成と同じ数式」であることがコード上で自明になる。
+///
+/// `αs = src[3] × opacity × w`(固定順序)。`w` は合成マスクの重み(無ければ 1.0)。
+#[inline]
+pub(crate) fn composite_px(
+    dst: &mut [f32; 4],
+    src: &[f32; 4],
+    mode: BlendMode,
+    opacity: f32,
+    w: f32,
+) {
+    {
         // αs = レイヤーアルファ × opacity × マスク重み(固定順序)。
         let a_s = src[3].clamp(0.0, 1.0);
         let a_s = a_s * opacity;
         let a_s = a_s * w;
         // 端点: 何も乗らないなら backdrop をバイト単位でそのまま残す。
         if a_s == 0.0 {
-            continue;
+            return;
         }
         let a_b = dst[3].clamp(0.0, 1.0);
 
@@ -451,7 +470,7 @@ pub(crate) fn composite(
         let a_o = a_s + ab_term;
         if a_o == 0.0 {
             *dst = [0.0, 0.0, 0.0, 0.0];
-            continue;
+            return;
         }
 
         // Co = ( αs(1 − αb)Cs + αs·αb·B(Cb, Cs) + (1 − αs)αb·Cb ) / αo

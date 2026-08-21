@@ -109,10 +109,10 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 }
 ```
 
-支持的操作(op,共 20 个):`auto_orient` / `rotate` / `perspective` / `crop`(crop、pad)/
+支持的操作(op,共 21 个):`auto_orient` / `rotate` / `perspective` / `crop`(crop、pad)/
 `resize`(cover、contain、fill)/ `adjust` / `color_matrix` / `curves` / `levels` /
 `lut` / `white_balance` / `hsl` / `blur` / `median` / `unsharp_mask` / `convolve` /
-`clone` / `heal` / `encode`(jpeg、png、webp、avif)/ `strip_metadata`。
+`clone` / `heal` / `svg_overlay` / `encode`(jpeg、png、webp、avif)/ `strip_metadata`。
 操作清单刻意不写进工具的 schema:请调用 `list_operations` 获取最新目录,
 调用 `explain_operation` 获取单个操作的完整 schema、示例与注意事项。
 
@@ -132,6 +132,33 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 计入 `recipe_hash` 即可保持完全确定性;但这也意味着该配方只能在持有该 LUT 的
 工作区内复现,跨机器搬运风格时请连同 `.cube` 一起搬。引用不存在的 id 会在任何
 像素处理开始之前以结构化错误返回。
+
+### SVG 叠加(Logo 与水印)
+
+`.svg` 与 `.cube` LUT 一样是**矢量素材**而非图像:先导入,再让配方引用它生成的
+修订版本,把它烧录到栅格图像上。
+
+1. 对 `.svg` 文件调用 `import_asset`。它会以 `mime_type: "image/svg+xml"` 存为
+   不可变修订版本,摘要中会给出该 SVG 的**固有尺寸**(`0x0` 表示没有固有尺寸,
+   即根 `<svg>` 上既无 `viewBox` 也无绝对的 `width`/`height`)。它不是栅格图像,
+   因此 `inspect_image` 会有意返回结构化错误。
+2. 在配方中引用返回的 `revision_id`:
+
+```json
+{ "op": "svg_overlay", "svg_revision_id": "rev_...",
+  "x": 24, "y": 24, "width": 320, "opacity": 0.25, "blend_mode": "normal" }
+```
+
+`x` / `y` 是叠加层**左上角**的坐标,按**流水线到此为止**的图像坐标系解释
+(所以请把叠加放在 resize / crop 之后);允许为负值,超出画面的部分会被裁掉。
+`width` / `height` 都省略则按 SVG 的固有尺寸栅格化,只给一个则按固有宽高比缩放,
+两个都给则拉伸到精确尺寸——没有固有尺寸的 SVG,若不同时给出两者会返回结构化错误。
+合成公式与 16 种 `blend_mode` 与[图层](#图层)完全一致。
+
+> **文本永远不会被渲染。** 为保证确定性,atx 不加载任何系统字体(各机器安装的
+> 字体不同,会破坏逐字节可复现性)。含 `<text>` 的 SVG 只渲染图形、不渲染字形,
+> 并返回一条警告。**请在导入前于矢量编辑器中把文本转换为路径(轮廓)**,
+> 这样在任何机器上得到的像素都完全相同。
 
 ### 蒙版(局部调整)
 

@@ -765,6 +765,69 @@ pub const OPERATIONS: &[OpDoc] = &[
         ],
     },
     OpDoc {
+        name: "svg_overlay",
+        // 分類は "filter": 語彙上は「画素をその場で書き換える op」であって、
+        // キャンバスの寸法や座標系を動かす geometry でも、出力形式を決める output でもない。
+        category: "filter",
+        summary: "Stamp an imported SVG (logo/watermark/credit) onto the image at a position.",
+        params: &[
+            ParamDoc {
+                name: "svg_revision_id",
+                type_hint: "\"rev_...\"",
+                requirement: "required",
+                semantics: "Revision id of an SVG already imported into THIS workspace. Workflow: call import_asset on the .svg file first (it becomes a revision with mime_type image/svg+xml), then put the returned revision_id here.",
+            },
+            ParamDoc {
+                name: "x",
+                type_hint: "i64",
+                requirement: "required",
+                semantics: "X of the overlay's TOP-LEFT corner, in the current image's pixel coordinates. May be negative: the part that falls outside the image is clipped, not an error.",
+            },
+            ParamDoc {
+                name: "y",
+                type_hint: "i64",
+                requirement: "required",
+                semantics: "Y of the overlay's top-left corner. May be negative (clipped).",
+            },
+            ParamDoc {
+                name: "width",
+                type_hint: "u32 1..32768",
+                requirement: "optional",
+                semantics: "Width to rasterize the SVG at. Omit both width and height to use the SVG's own intrinsic size; give only one and the other is derived from the intrinsic aspect ratio; give both to stretch to an exact box.",
+            },
+            ParamDoc {
+                name: "height",
+                type_hint: "u32 1..32768",
+                requirement: "optional",
+                semantics: "Height to rasterize the SVG at. See width for how the two combine.",
+            },
+            ParamDoc {
+                name: "opacity",
+                type_hint: "f64 0..1",
+                requirement: "default: 1.0",
+                semantics: "Overall strength of the overlay, multiplied into the SVG's own alpha. 0 leaves the image byte-identical, 1 stamps at full strength (a typical watermark is 0.15-0.4).",
+            },
+            ParamDoc {
+                name: "blend_mode",
+                type_hint: "enum, 16 modes",
+                requirement: "default: normal",
+                semantics: "The same 16 W3C blend modes as layers: normal | multiply | screen | overlay | darken | lighten | color_dodge | color_burn | hard_light | soft_light | difference | exclusion | hue | saturation | color | luminosity. Compositing uses the identical W3C formula, so a watermark behaves exactly as it would as a layer.",
+            },
+        ],
+        examples: &[
+            r#"{"op": "svg_overlay", "svg_revision_id": "rev_01J000000000000000000000", "x": 24, "y": 24}"#,
+            r#"{"op": "svg_overlay", "svg_revision_id": "rev_01J000000000000000000000", "x": -40, "y": 900, "width": 320, "opacity": 0.25, "blend_mode": "screen"}"#,
+        ],
+        warnings: &[
+            "TEXT IS NOT RENDERED. atx never loads system fonts, because the installed fonts differ from machine to machine and would break byte-for-byte reproducibility. An SVG containing <text> renders its shapes but not its glyphs, and reports a warning. Convert text to paths (outlines) in your vector editor before importing.",
+            "The SVG must be in the workspace: import_asset the .svg file FIRST, then reference the revision_id it returns. A recipe pointing at an unknown id fails with a structured error before any pixel work happens.",
+            "An SVG with no intrinsic size (no viewBox and no absolute width/height on the root <svg>) is a structured error unless you give BOTH width and height - the engine will not silently fall back to a default size. import_asset reports the intrinsic size (0x0 means it has none).",
+            "inspect_image refuses an SVG revision on purpose - it is a vector asset, not a raster image. So do apply_transform/render_preview when pointed AT the SVG: the SVG is what you reference from a recipe, not what you transform.",
+            "x/y are the TOP-LEFT corner, not the centre, and are interpreted in the image as it is at THIS point of the pipeline - put the overlay after your resize/crop, or the watermark lands in the wrong place and at the wrong scale.",
+            "The recipe hash includes the referenced revision id, so a recipe is only reproducible inside a workspace that holds that SVG. Export/import the .svg alongside the recipe to move a watermark between machines.",
+        ],
+    },
+    OpDoc {
         name: "encode",
         category: "output",
         summary: "Output format/quality. At most one, and it must be last.",
@@ -929,7 +992,7 @@ mod tests {
     #[test]
     fn catalog_covers_every_operation_exactly_once() {
         let names = operation_names();
-        assert_eq!(names.len(), 20, "v0.7 has 20 operations");
+        assert_eq!(names.len(), 21, "v0.8 has 21 operations");
         let mut sorted = names.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -975,13 +1038,14 @@ mod tests {
         }
     }
 
-    /// `clone` / `heal` の examples も `atx_core::recipe::Operation` としてデシリアライズ
-    /// できること(v0.7 core 着地済み)。
+    /// `clone` / `heal` / `svg_overlay` の examples も
+    /// `atx_core::recipe::Operation` としてデシリアライズできること
+    /// (v0.7 / v0.8 core 着地済み)。
     #[test]
     fn clone_heal_examples_deserialize_as_operations() {
         for op in OPERATIONS
             .iter()
-            .filter(|op| op.name == "clone" || op.name == "heal")
+            .filter(|op| op.name == "clone" || op.name == "heal" || op.name == "svg_overlay")
         {
             for example in op.examples {
                 let parsed: atx_core::recipe::Operation = serde_json::from_str(example)

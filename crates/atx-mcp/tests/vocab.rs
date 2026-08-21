@@ -56,7 +56,7 @@ fn tools() -> (tempfile::TempDir, AtxTools) {
     (workspace, tools)
 }
 
-const V03_OPERATIONS: [&str; 20] = [
+const V03_OPERATIONS: [&str; 21] = [
     "auto_orient",
     "rotate",
     "crop",
@@ -75,6 +75,7 @@ const V03_OPERATIONS: [&str; 20] = [
     "convolve",
     "clone",
     "heal",
+    "svg_overlay",
     "encode",
     "strip_metadata",
 ];
@@ -96,7 +97,7 @@ fn list_operations_returns_every_op_and_the_presets() {
     let out = structured(&result);
     let body = text(&result);
 
-    assert_eq!(out["count"], 20);
+    assert_eq!(out["count"], 21);
     let names: Vec<&str> = out["operations"]
         .as_array()
         .expect("operations must be an array")
@@ -134,9 +135,9 @@ fn list_operations_returns_every_op_and_the_presets() {
     assert!(body.contains("0.1..100"));
 
     // 段階的開示: カタログはトークン的に軽いこと
-    // (v0.7 で 20 op + 11 op に付く mask の1行、目安 ~1080 tokens ≒ 4500 chars)。
+    // (v0.8 で 21 op + 11 op に付く mask の1行、目安 ~1150 tokens ≒ 4800 chars)。
     assert!(
-        body.len() < 4500,
+        body.len() < 4800,
         "the catalog must stay compact, got {} chars",
         body.len()
     );
@@ -163,7 +164,8 @@ fn list_operations_filters_by_category_and_rejects_unknown_ones() {
             "unsharp_mask",
             "convolve",
             "clone",
-            "heal"
+            "heal",
+            "svg_overlay"
         ]
     );
     // プリセットは分類で絞っても常に出す(語彙の圧縮層は分類に属さない)。
@@ -316,7 +318,7 @@ fn explain_operation_rejects_unknown_names_with_the_valid_list() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert_eq!(valid.len(), 20);
+    assert_eq!(valid.len(), 21);
     for op in V03_OPERATIONS {
         assert!(valid.contains(&op));
     }

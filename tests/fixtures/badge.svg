@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20" viewBox="0 0 40 20">
+  <!-- Fully synthetic fixture for the svg_overlay tests (atx v0.8).
+       Shapes only, on purpose: glyphs are never rendered (no system fonts are
+       ever loaded, see DESIGN.md 9.9), so a lettered fixture would not be a
+       stable probe target. The rect covers the whole viewBox on the pixel
+       grid, so every pixel of the 40x20 raster is fully opaque and can be
+       probed exactly. -->
+  <rect x="0" y="0" width="40" height="20" fill="#0000ff"/>
+  <circle cx="10" cy="10" r="6" fill="#ffff00"/>
+</svg>

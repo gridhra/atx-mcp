@@ -114,11 +114,11 @@ It is created automatically if it doesn't exist.
 }
 ```
 
-Supported ops (20): `auto_orient` / `rotate` / `perspective` / `crop` (crop,
+Supported ops (21): `auto_orient` / `rotate` / `perspective` / `crop` (crop,
 pad) / `resize` (cover, contain, fill) / `adjust` / `color_matrix` / `curves` /
 `levels` / `lut` / `white_balance` / `hsl` / `blur` / `median` /
-`unsharp_mask` / `convolve` / `clone` / `heal` / `encode` (jpeg, png, webp,
-avif) / `strip_metadata`.
+`unsharp_mask` / `convolve` / `clone` / `heal` / `svg_overlay` / `encode`
+(jpeg, png, webp, avif) / `strip_metadata`.
 The operation vocabulary is deliberately kept out of the tool schemas: call
 `list_operations` for the up-to-date catalog and `explain_operation` for one
 operation's full schema, examples and gotchas.
@@ -143,6 +143,39 @@ the transform fully deterministic — but it also means the recipe is only
 reproducible inside a workspace that holds that LUT, so move the `.cube`
 alongside the recipe when you move a look between machines. Referencing an
 unknown id fails with a structured error before any pixel work happens.
+
+### SVG overlays (logos and watermarks)
+
+An `.svg` is a *vector asset*, like a `.cube` LUT: import it first, then stamp
+it onto a raster image from a recipe.
+
+1. `import_asset` the `.svg` file. It is stored as an immutable revision with
+   `mime_type: "image/svg+xml"`, and the summary reports the SVG's intrinsic
+   size (`0x0` means it has none — no `viewBox` and no absolute
+   `width`/`height` on the root `<svg>`). `inspect_image` refuses it on
+   purpose: it is a vector asset, not a raster image.
+2. Reference the returned `revision_id` from a recipe:
+
+```json
+{ "op": "svg_overlay", "svg_revision_id": "rev_...",
+  "x": 24, "y": 24, "width": 320, "opacity": 0.25, "blend_mode": "normal" }
+```
+
+`x`/`y` are the overlay's **top-left corner** in the coordinates of the image
+*at that point in the pipeline* (so put the overlay after your resize/crop);
+negative values are allowed and the overflow is clipped. Omit `width` and
+`height` to rasterize at the SVG's intrinsic size, give one to scale while
+preserving the aspect ratio, or give both to stretch to an exact box — an SVG
+with no intrinsic size is a structured error unless you give both. Compositing
+uses the same W3C formula and the same 16 `blend_mode` values as
+[layers](#layers).
+
+> **Text is never rendered.** atx loads no system fonts, because the installed
+> fonts differ from machine to machine and would break byte-for-byte
+> reproducibility. An SVG containing `<text>` renders its shapes but not its
+> glyphs and reports a warning — **convert text to paths (outlines) in your
+> vector editor before importing**, and the result is identical on every
+> machine.
 
 ### Masks (local adjustments)
 

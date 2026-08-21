@@ -108,9 +108,9 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 }
 ```
 
-対応 op(20種): `auto_orient` / `rotate` / `perspective` / `crop`(crop・pad)/ `resize`(cover・contain・fill)/
+対応 op(21種): `auto_orient` / `rotate` / `perspective` / `crop`(crop・pad)/ `resize`(cover・contain・fill)/
 `adjust` / `color_matrix` / `curves` / `levels` / `lut` / `white_balance` / `hsl` /
-`blur` / `median` / `unsharp_mask` / `convolve` / `clone` / `heal` /
+`blur` / `median` / `unsharp_mask` / `convolve` / `clone` / `heal` / `svg_overlay` /
 `encode`(jpeg・png・webp・avif)/ `strip_metadata`。
 op 一覧はツールのスキーマにあえて埋め込んでいない。最新のカタログは `list_operations`、
 個々の op の完全なスキーマ・例・注意点は `explain_operation` で取得する。
@@ -134,6 +134,34 @@ op 一覧はツールのスキーマにあえて埋め込んでいない。最�
 再現はその LUT を持つワークスペース内でのみ保証されるため、ルックを別環境へ
 移すときは `.cube` ごと移すこと。存在しない id を参照した場合は、画素処理に
 入る前に構造化エラーで返る。
+
+### SVG オーバレイ(ロゴ・ウォーターマーク)
+
+`.svg` は `.cube` LUT と同じく画像ではなく**ベクタアセット**である。先に取り込み、
+生成された revision をレシピから参照してラスタ画像へ焼き込む。
+
+1. `.svg` ファイルを `import_asset` する。`mime_type: "image/svg+xml"` の不変
+   revision として格納され、サマリに SVG の**固有サイズ**が出る(`0x0` は固有サイズが
+   無い = ルート `<svg>` に `viewBox` も絶対値の `width`/`height` も無い、の意)。
+   ラスタ画像ではないので `inspect_image` は意図的に構造化エラーを返す。
+2. 返ってきた `revision_id` をレシピから参照する:
+
+```json
+{ "op": "svg_overlay", "svg_revision_id": "rev_...",
+  "x": 24, "y": 24, "width": 320, "opacity": 0.25, "blend_mode": "normal" }
+```
+
+`x` / `y` は**左上隅**の座標で、**その時点のパイプラインの画像**の座標系で解釈される
+(リサイズ・クロップの後に置くこと)。負の値も指定でき、はみ出した部分はクリップされる。
+`width` / `height` を両方省略すると SVG の固有サイズ、片方だけ指定すると縦横比を保って
+拡縮、両方指定するとその寸法へ引き伸ばす — 固有サイズを持たない SVG は、両方を
+指定しない限り構造化エラーになる。合成式とブレンドモード 16 種は
+[レイヤー](#レイヤー)と完全に同じものを使う。
+
+> **テキストは描画されない。** 決定論のため、atx はシステムフォントを一切読まない
+> (インストールされているフォントはマシンごとに違い、バイト単位の再現性を壊すため)。
+> `<text>` を含む SVG は図形だけが描かれて警告が出る。**取り込む前にベクタエディタで
+> テキストをパス(アウトライン)へ変換すること**。そうすればどのマシンでも同じ画素になる。
 
 ### マスク(部分適用)
 
