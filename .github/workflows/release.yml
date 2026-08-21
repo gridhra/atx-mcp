@@ -206,7 +206,15 @@ jobs:
           # pin these exact versions.
           for pkg in npm/dist/atx-mcp-*; do
             echo "==> publishing $pkg"
-            npm publish --provenance --access public "$pkg"
+            # win32 パッケージは npm のスパム誤検知の解除待ち(サポート対応中)のため、
+            # 失敗してもリリース全体は止めない。ランチャーの optionalDependencies は
+            # 存在しないバージョンを参照しても npm が optional として警告スキップする。
+            if [ "$(basename "$pkg")" = "atx-mcp-win32-x64" ]; then
+              npm publish --provenance --access public "$pkg" \
+                || echo "::warning::atx-mcp-win32-x64 publish failed (npm spam-block pending); continuing"
+            else
+              npm publish --provenance --access public "$pkg"
+            fi
           done
           echo "==> publishing npm/dist/atx-mcp"
           npm publish --provenance --access public npm/dist/atx-mcp
