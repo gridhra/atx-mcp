@@ -11,6 +11,42 @@ immutable revision. The original asset is never modified.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the full design.
 
+## Use cases
+
+1. **Eye-catch image for an article**
+   > "Straighten this photo and crop it to a 16:9, 1600px eye-catch. WebP."
+   `import_asset` → `detect_tilt` (the AI skips correction when it's already near-level) → `apply_transform` (rotate → crop → resize → encode) → `export_asset`. The original is never touched, and the same recipe reproduces the same result every time.
+
+2. **Multiple sizes for social/CMS**
+   > "Generate the OGP, Instagram square, and thumbnail versions of this photo."
+   One original fans out into OGP 1200×630, Instagram 1080 square, and a 400px thumbnail in parallel. The same-recipe-same-revision idempotency means re-running never double-creates output; a one-word preset name works too.
+
+3. **Safe to publish**
+   > "Strip the location data for sure, but don't touch the colors."
+   `strip_metadata` (`exif`) removes EXIF including GPS while keeping the ICC profile intact. The AI can also warn ahead of time by checking `has_gps` from `inspect_image`.
+
+4. **Color and look adjustments**
+   > "Make just the sky bluer, leave everything else alone."
+   Covers `curves` / `levels` / `hsl` / `white_balance`, the `film_soft` preset, and importing your own `.cube` LUT with `import_asset` then applying it with `lut`.
+
+5. **Local (masked) adjustments**
+   > "Darken just the sky a bit, keep the ground as is."
+   `generate_mask` builds a mask (gradient, luminosity range, or hue range); after wiring it into the adjustment, `render_preview` with `overlay:"mask"` shows exactly where it will bite before you commit.
+
+6. **Layer compositing**
+   > "Blur a copy of this photo and blend it in at 50% screen for a soft glow."
+   The `layers` stack combines 16 blend modes, opacity, and masks to build reproducible composites like soft focus.
+
+7. **Watermarks, retouching, and perspective**
+   > "Stamp my logo in the corner, remove the power lines, and fix the converging verticals."
+   `svg_overlay` burns in a logo, `clone`/`heal` remove blemishes or wires by compositing both texture and tone, and `perspective` corrects converging verticals.
+
+8. **Verification and accountability**
+   > "Show me this image before and after the edits, side by side."
+   `compare_revisions` places before/after side by side, or returns a difference heatmap with stats like `mean_abs_diff`. Every revision keeps its lineage, so the full edit history behind any image used in an article can be traced and reproduced — byte-identical on any machine.
+
+What atx doesn't do — generative editing, RAW development, ML-based auto-cropping — is out of scope; see [docs/DESIGN.md](docs/DESIGN.md) for the roadmap.
+
 ## Install
 
 No Rust toolchain required. Pick one of the following.
