@@ -1,6 +1,6 @@
 {
   "id": "t12_layer_composite",
-  "prompt": "この画像の上に、同じ画像をぼかしたものを screen 50% で重ねてふんわりさせて、1200px幅 WebPで書き出す準備をして。",
+  "prompt": "この画像の上に、同じ画像をぼかしたものを screen 50% で重ねてふんわりさせて。仕上がりを確認したら、1200px幅 WebPで実際に書き出して(確認だけで終わらせず、最後まで適用して)。",
   "input_fixture": "tests/fixtures/synthetic_scene.jpg",
   "success_criteria": {
     "expect_revision": {
