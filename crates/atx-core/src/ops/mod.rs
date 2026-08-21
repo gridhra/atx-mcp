@@ -6,7 +6,9 @@
 //! - `blur`: blur / median / unsharp_mask(カーネル系)
 //! - `convolve` / `hsl` / `lut` / `wb`
 //! - `mask`: 局所適用マスク(重み平面の解決とブレンド。v0.5、DESIGN.md §9.6)
-//! - `blend`: レイヤー合成(W3C separable ブレンド 12 種。v0.6、DESIGN.md §9.7)
+//! - `blend`: レイヤー合成(W3C ブレンド 16 種 = separable 12 + 非 separable 4。
+//!   v0.6 / v0.7、DESIGN.md §9.7 / §9.8)
+//! - `clone_heal`: clone / heal(円領域の複写・修復。v0.7、DESIGN.md §9.8)
 //!
 //! # 画素エンジン v2: op ごとの作業空間(v0.4 の中核設計)
 //!
@@ -17,7 +19,7 @@
 //!
 //! | 作業空間 | op | 理由 |
 //! |---|---|---|
-//! | **線形光** | `resize` / `rotate` / `perspective` / `crop` / `pad` / `blur` / `median` / `unsharp_mask` / `convolve` / `white_balance` | 画素の**混合**(加重平均・畳み込み)と**露出のスケール**は、物理的な光量に対して行ってはじめて正しい。符号値のまま平均すると暗部に寄る(古典的なガンマ・ブラー誤差) |
+//! | **線形光** | `resize` / `rotate` / `perspective` / `crop` / `pad` / `blur` / `median` / `unsharp_mask` / `convolve` / `white_balance` / `clone` / `heal` | 画素の**混合**(加重平均・畳み込み)と**露出のスケール**は、物理的な光量に対して行ってはじめて正しい。符号値のまま平均すると暗部に寄る(古典的なガンマ・ブラー誤差) |
 //! | **sRGB 符号値** | `adjust` / `color_matrix` / `curves` / `levels` / `hsl` / `lut` | これらは「見た目のトーンカーブ」を操作する語彙で、スライダの効き方・制御点の座標・`.cube` の定義域がいずれも**符号値**上の慣習で決まっている。線形光で適用すると同じ数値が全く違う見た目になる |
 //!
 //! 空間変換は `linear::srgb_to_linear` / `linear::linear_to_srgb`(4096 エントリ +
@@ -45,6 +47,7 @@
 
 pub mod blend;
 pub mod blur;
+pub mod clone_heal;
 pub mod color;
 pub mod convolve;
 pub mod hsl;

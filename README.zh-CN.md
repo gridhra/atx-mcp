@@ -92,7 +92,7 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 | `generate_mask` | 确定性地生成灰度蒙版(`linear_gradient` / `radial_gradient` / `luminosity_range` / `color_range`),存为与参考图像同尺寸的 PNG 修订版本,供操作的 `mask` 字段引用(幂等) |
 | `render_preview` | 以低分辨率(长边 ≤768)应用配方(或 `preset` 预设)并以内联图像返回。可通过 `overlay:"grid"\|"thirds"\|"horizon"` 叠加构图参考线,或通过 `overlay:"mask"`(配合 `mask_revision_id`)叠加蒙版覆盖范围(仅绘制在预览图上,不影响实际变换) |
 | `apply_transform` | 以完整分辨率应用配方(或 `preset` 预设)并生成新的修订版本(同一配方 → 同一修订版本) |
-| `compare_revisions` | 将两个修订版本缩放到长边 ≤640,通过 `layout:"side_by_side"\|"stacked"` 拼接为一张内联图像返回(用于 A/B 或前后对比的可视化) |
+| `compare_revisions` | 将两个修订版本缩放到长边 ≤640,通过 `layout:"side_by_side"\|"stacked"` 拼接为一张内联图像返回(用于 A/B 或前后对比的可视化);`layout:"diff"` 则返回单张像素差异热力图,并附带 `mean_abs_diff`/`max_abs_diff`/`changed_pixel_ratio` 统计值(要求两者尺寸完全一致) |
 | `list_assets` | 查阅修订版本台账(只读) |
 | `export_asset` | 将修订版本导出到指定路径(仅在显式设置 `overwrite:true` 时才会覆盖已存在的文件) |
 
@@ -109,10 +109,10 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 }
 ```
 
-支持的操作(op,共 18 个):`auto_orient` / `rotate` / `perspective` / `crop`(crop、pad)/
+支持的操作(op,共 20 个):`auto_orient` / `rotate` / `perspective` / `crop`(crop、pad)/
 `resize`(cover、contain、fill)/ `adjust` / `color_matrix` / `curves` / `levels` /
 `lut` / `white_balance` / `hsl` / `blur` / `median` / `unsharp_mask` / `convolve` /
-`encode`(jpeg、png、webp、avif)/ `strip_metadata`。
+`clone` / `heal` / `encode`(jpeg、png、webp、avif)/ `strip_metadata`。
 操作清单刻意不写进工具的 schema:请调用 `list_operations` 获取最新目录,
 调用 `explain_operation` 获取单个操作的完整 schema、示例与注意事项。
 
@@ -198,9 +198,11 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 - `ops` 是普通的操作列表,只作用于该图层自己的来源。
 - `mask`、`blend_mode`(默认 `"normal"`)与 `opacity`(默认 `1.0`)决定该图层
   如何混合到下方的图层上。
-- 混合模式为 W3C 的 12 种 separable 模式之一:`normal` / `multiply` /
-  `screen` / `overlay` / `darken` / `lighten` / `color_dodge` / `color_burn` /
-  `hard_light` / `soft_light` / `difference` / `exclusion`。
+- 混合模式为 W3C 的 16 种模式之一:12 种 separable 模式(`normal` /
+  `multiply` / `screen` / `overlay` / `darken` / `lighten` / `color_dodge` /
+  `color_burn` / `hard_light` / `soft_light` / `difference` / `exclusion`)
+  加上 4 种 non-separable 模式(`hue` / `saturation` / `color` /
+  `luminosity`)。
 - 存在 `layers` 时,顶层的 `operations` 就成为对合成结果的**收尾流程**——
   `resize` 与最终的 `encode` 都放在这里(`encode` 仍须最后出现且至多一次)。
 - 调用 `explain_operation {"operation":"layers"}` 可获取完整参考。

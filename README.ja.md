@@ -91,7 +91,7 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 | `generate_mask` | 決定論的なグレースケールマスク(`linear_gradient` / `radial_gradient` / `luminosity_range` / `color_range`)を、参照画像と同寸法の PNG revision として生成する。op の `mask` フィールドから参照して使う(冪等) |
 | `render_preview` | レシピ(または `preset`)を低解像度(長辺 ≤768)で適用、インライン画像付きで返却。`overlay:"grid"\|"thirds"\|"horizon"` で構図確認用のガイド線を、`overlay:"mask"`(+ `mask_revision_id`)でマスクの被覆を重ねられる(プレビューのみに描画、本適用には影響しない) |
 | `apply_transform` | レシピ(または `preset`)を高解像度適用し新 revision を発行(同一レシピ→同一 revision) |
-| `compare_revisions` | 2つの revision を長辺 ≤640 に縮小し、`layout:"side_by_side"\|"stacked"` で1枚に並べてインライン画像で返却(A/B・before/after の視覚比較用) |
+| `compare_revisions` | 2つの revision を長辺 ≤640 に縮小し、`layout:"side_by_side"\|"stacked"` で1枚に並べてインライン画像で返却(A/B・before/after の視覚比較用)。`layout:"diff"` なら1枚の画素差分ヒートマップ + `mean_abs_diff`/`max_abs_diff`/`changed_pixel_ratio` の統計を返す(寸法が完全一致している必要あり) |
 | `list_assets` | revision 台帳の参照(read-only) |
 | `export_asset` | revision を指定パスへ書き出し(既存ファイルは `overwrite:true` 明示時のみ上書き) |
 
@@ -108,9 +108,9 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 }
 ```
 
-対応 op(18種): `auto_orient` / `rotate` / `perspective` / `crop`(crop・pad)/ `resize`(cover・contain・fill)/
+対応 op(20種): `auto_orient` / `rotate` / `perspective` / `crop`(crop・pad)/ `resize`(cover・contain・fill)/
 `adjust` / `color_matrix` / `curves` / `levels` / `lut` / `white_balance` / `hsl` /
-`blur` / `median` / `unsharp_mask` / `convolve` /
+`blur` / `median` / `unsharp_mask` / `convolve` / `clone` / `heal` /
 `encode`(jpeg・png・webp・avif)/ `strip_metadata`。
 op 一覧はツールのスキーマにあえて埋め込んでいない。最新のカタログは `list_operations`、
 個々の op の完全なスキーマ・例・注意点は `explain_operation` で取得する。
@@ -201,9 +201,11 @@ op 一覧はツールのスキーマにあえて埋め込んでいない。最�
 - `ops` は通常の operations 列で、そのレイヤーのソースだけに適用される。
 - `mask` / `blend_mode`(既定 `"normal"`)/ `opacity`(既定 `1.0`)が、
   下のレイヤーへの合成のされ方を決める。
-- ブレンドモードは W3C の separable 12 種のいずれか: `normal` / `multiply` /
-  `screen` / `overlay` / `darken` / `lighten` / `color_dodge` / `color_burn` /
-  `hard_light` / `soft_light` / `difference` / `exclusion`。
+- ブレンドモードは W3C の16種のいずれか: separable 12種
+  (`normal` / `multiply` / `screen` / `overlay` / `darken` / `lighten` /
+  `color_dodge` / `color_burn` / `hard_light` / `soft_light` / `difference` /
+  `exclusion`)に加え、non-separable 4種(`hue` / `saturation` / `color` /
+  `luminosity`)。
 - `layers` がある場合、トップレベルの `operations` は合成結果に対する
   **仕上げパス**になる。`resize` や最後の `encode` はここに置く
   (`encode` は従来どおり最後に1回だけ)。

@@ -132,12 +132,17 @@ pub struct ExplainOperationParams {
 }
 
 /// `compare_revisions` のレイアウト。
+///
+/// `"diff"`(v0.7)だけは他の2つと質が違う: 2枚を並べるのではなく、
+/// 同寸法の A/B から画素単位の差分ヒートマップを1枚合成する
+/// ([`AtxTools::compare_revisions`] の diff 分岐を参照)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CompareLayout {
     #[default]
     SideBySide,
     Stacked,
+    Diff,
 }
 
 impl CompareLayout {
@@ -145,6 +150,7 @@ impl CompareLayout {
         match self {
             CompareLayout::SideBySide => "side_by_side",
             CompareLayout::Stacked => "stacked",
+            CompareLayout::Diff => "diff",
         }
     }
 }
@@ -156,7 +162,8 @@ pub struct CompareRevisionsParams {
     pub revision_id_a: String,
     /// 比較対象 B の revision ID("rev_...")。合成画像の右(または下)に置かれる。
     pub revision_id_b: String,
-    /// `"side_by_side"`(既定、水平に並べる)| `"stacked"`(垂直に並べる)。
+    /// `"side_by_side"`(既定、水平に並べる)| `"stacked"`(垂直に並べる)|
+    /// `"diff"`(並べる代わりに1枚の差分ヒートマップを作る。A/B の寸法が完全一致している必要がある)。
     #[serde(default)]
     pub layout: CompareLayout,
 }
@@ -326,6 +333,15 @@ pub struct CompareRevisionsOutput {
     pub byte_size: u64,
     /// 比較プレビュー画像の絶対パス。
     pub preview_path: String,
+    /// `layout: "diff"` のときだけ載る: 全チャンネル・全画素平均の絶対差(0..255 スケール)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean_abs_diff: Option<f64>,
+    /// `layout: "diff"` のときだけ載る: 画素ごとのチャンネル最大絶対差 d の、全画素中の最大値。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_abs_diff: Option<u8>,
+    /// `layout: "diff"` のときだけ載る: d > 2 の画素が全体に占める割合(0.0..=1.0)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed_pixel_ratio: Option<f64>,
 }
 
 /// `list_assets` の structuredContent。
@@ -1385,6 +1401,8 @@ impl AtxTools {
     // -- 5b. compare_revisions ----------------------------------------------
 
     /// 2つの revision を長辺 <= 640 に縮小し、1枚のキャンバスへ並べて jpeg で返す。
+    /// `layout: "diff"`(v0.7)だけは並べる代わりに画素差分ヒートマップを1枚返す
+    /// ([`Self::compare_revisions_diff`] に委譲)。
     pub fn compare_revisions(&self, params: &CompareRevisionsParams) -> CallToolResult {
         let rev_a = match self.store.get_revision(&params.revision_id_a) {
             Ok(r) => r,
@@ -1411,12 +1429,18 @@ impl AtxTools {
             atx_error
         );
 
+        if params.layout == CompareLayout::Diff {
+            return self.compare_revisions_diff(params, &rev_a, &rev_b, img_a, img_b);
+        }
+
         let scaled_a = scale_contain(img_a, COMPARE_LONG_EDGE).to_rgb8();
         let scaled_b = scale_contain(img_b, COMPARE_LONG_EDGE).to_rgb8();
 
         let canvas = match params.layout {
             CompareLayout::SideBySide => compose_side_by_side(&scaled_a, &scaled_b, COMPARE_GAP_PX),
             CompareLayout::Stacked => compose_stacked(&scaled_a, &scaled_b, COMPARE_GAP_PX),
+            // layout="diff" は上の早期 return (compare_revisions_diff) で処理済み。
+            CompareLayout::Diff => unreachable!("diff layout returns earlier"),
         };
         let (cw, ch) = canvas.dimensions();
         let composed_bytes = tri!(encode_jpeg_q80(&canvas), |e: String| tool_error(
@@ -1455,6 +1479,7 @@ impl AtxTools {
         let (a_position, b_position) = match params.layout {
             CompareLayout::SideBySide => ("left", "right"),
             CompareLayout::Stacked => ("top", "bottom"),
+            CompareLayout::Diff => unreachable!("diff layout returns earlier"),
         };
 
         let text = format!(
@@ -1492,6 +1517,127 @@ impl AtxTools {
                 mime_type: "image/jpeg".to_string(),
                 byte_size: composed_bytes.len() as u64,
                 preview_path: path,
+                mean_abs_diff: None,
+                max_abs_diff: None,
+                changed_pixel_ratio: None,
+            },
+            vec![image_block],
+        )
+    }
+
+    // -- 5c. compare_revisions (layout: "diff") ------------------------------
+
+    /// `compare_revisions` の diff レイアウト専用の経路。
+    ///
+    /// side_by_side/stacked と違い縮小前に**寸法が完全一致**していることを要求する
+    /// (画素単位で差分を取るため)。ヒートマップは長辺 640 に縮めてから jpeg 化するが、
+    /// 統計(mean/max/changed_pixel_ratio)は縮小前のフル解像度の差分から計算する
+    /// (縮小はプレビューの都合であって統計を歪めてはいけないため)。
+    fn compare_revisions_diff(
+        &self,
+        params: &CompareRevisionsParams,
+        rev_a: &AssetRevision,
+        rev_b: &AssetRevision,
+        img_a: image::DynamicImage,
+        img_b: image::DynamicImage,
+    ) -> CallToolResult {
+        let full_a = img_a.to_rgb8();
+        let full_b = img_b.to_rgb8();
+        if full_a.dimensions() != full_b.dimensions() {
+            let (aw, ah) = full_a.dimensions();
+            let (bw, bh) = full_b.dimensions();
+            return tool_error(
+                "dimension_mismatch",
+                format!(
+                    "compare_revisions layout=\"diff\" requires equal dimensions, but A={} is {aw}x{ah} and B={} is {bw}x{bh}",
+                    rev_a.revision_id, rev_b.revision_id,
+                ),
+                serde_json::json!({
+                    "revision_id_a": rev_a.revision_id,
+                    "a_width": aw,
+                    "a_height": ah,
+                    "revision_id_b": rev_b.revision_id,
+                    "b_width": bw,
+                    "b_height": bh,
+                    "recovery": "resize one revision to match the other's dimensions (apply_transform with a resize op) before comparing with layout=\"diff\", or use layout=\"side_by_side\"/\"stacked\" instead",
+                }),
+            );
+        }
+
+        let (heatmap, mean_abs_diff, max_abs_diff, changed_pixel_ratio) =
+            diff_heatmap(&full_a, &full_b);
+        let canvas =
+            scale_contain(image::DynamicImage::ImageRgb8(heatmap), COMPARE_LONG_EDGE).to_rgb8();
+        let (cw, ch) = canvas.dimensions();
+        let composed_bytes = tri!(encode_jpeg_q80(&canvas), |e: String| tool_error(
+            "encode_failed",
+            format!("failed to encode diff heatmap jpeg: {e}"),
+            serde_json::Value::Null
+        ));
+
+        let key = compare_key(
+            &params.revision_id_a,
+            &params.revision_id_b,
+            params.layout.as_str(),
+        );
+        let path = tri!(
+            self.store.put_preview(&key, "jpg", &composed_bytes),
+            store_error
+        );
+        let path = path.to_string_lossy().into_owned();
+
+        let side_a = CompareSide {
+            revision_id: rev_a.revision_id.clone(),
+            width: rev_a.width,
+            height: rev_a.height,
+            mime_type: rev_a.mime_type.clone(),
+            byte_size: rev_a.byte_size,
+            recipe_hash: rev_a.recipe_hash.clone(),
+        };
+        let side_b = CompareSide {
+            revision_id: rev_b.revision_id.clone(),
+            width: rev_b.width,
+            height: rev_b.height,
+            mime_type: rev_b.mime_type.clone(),
+            byte_size: rev_b.byte_size,
+            recipe_hash: rev_b.recipe_hash.clone(),
+        };
+
+        let text = format!(
+            "Diff heatmap A={} ({}x{} {}, {} bytes) vs B={} ({}x{} {}, {} bytes): mean_abs_diff={mean_abs_diff:.3}, max_abs_diff={max_abs_diff}, changed_pixel_ratio={changed_pixel_ratio:.4} -> {cw}x{ch} jpeg ({} bytes)\npath: {path}",
+            side_a.revision_id,
+            side_a.width,
+            side_a.height,
+            side_a.mime_type,
+            side_a.byte_size,
+            side_b.revision_id,
+            side_b.width,
+            side_b.height,
+            side_b.mime_type,
+            side_b.byte_size,
+            composed_bytes.len(),
+        );
+        let image_block = ContentBlock::image(
+            base64::engine::general_purpose::STANDARD.encode(&composed_bytes),
+            "image/jpeg",
+        );
+        ok_result_with(
+            text,
+            &CompareRevisionsOutput {
+                layout: params.layout.as_str().to_string(),
+                a: side_a,
+                b: side_b,
+                // diff は1枚合成で空間的な左右/上下の配置が無いので位置は意味を持たない。
+                a_position: "n/a".to_string(),
+                b_position: "n/a".to_string(),
+                width: cw,
+                height: ch,
+                mime_type: "image/jpeg".to_string(),
+                byte_size: composed_bytes.len() as u64,
+                preview_path: path,
+                mean_abs_diff: Some(mean_abs_diff),
+                max_abs_diff: Some(max_abs_diff),
+                changed_pixel_ratio: Some(changed_pixel_ratio),
             },
             vec![image_block],
         )
@@ -1801,6 +1947,103 @@ fn compare_key(revision_id_a: &str, revision_id_b: &str, layout: &str) -> String
     hasher.update(layout.as_bytes());
     let digest = hex::encode(hasher.finalize());
     format!("compare_{}", &digest[..32])
+}
+
+/// `compare_revisions` diff ヒートマップの色ランプの stop 点。
+///
+/// `(d, [r,g,b])` の4点を d の昇順に並べ、隣接する2点の間を線形補間する
+/// (固定小数点ではなく f32 で計算するが、丸めは常に `round()` で行うので
+/// 同じ入力からは常に同じバイト列が出る = 決定論)。
+///
+/// - `d=0`   -> `#101030`(near-black blue。無変化の背景を「黒」ではなく
+///   わずかに青みがかった色で塗ることで、d=0 の領域と jpeg 圧縮由来の
+///   黒つぶれを視覚的に区別できるようにする)
+/// - `d=64`  -> `#0040FF`(blue。small-but-real な差分)
+/// - `d=160` -> `#FFE800`(yellow。中程度の差分)
+/// - `d=255` -> `#FF0000`(red。最大級の差分)
+const DIFF_RAMP_STOPS: [(u8, [u8; 3]); 4] = [
+    (0, [0x10, 0x10, 0x30]),
+    (64, [0x00, 0x40, 0xFF]),
+    (160, [0xFF, 0xE8, 0x00]),
+    (255, [0xFF, 0x00, 0x00]),
+];
+
+/// 画素ごとの差分値 `d`(0..=255)を [`DIFF_RAMP_STOPS`] の区分線形ランプで色に写す。
+fn diff_ramp_color(d: u8) -> [u8; 3] {
+    for pair in DIFF_RAMP_STOPS.windows(2) {
+        let (d0, c0) = pair[0];
+        let (d1, c1) = pair[1];
+        if d <= d1 {
+            let span = (d1 - d0) as f32;
+            let t = if span <= 0.0 {
+                0.0
+            } else {
+                (d.saturating_sub(d0)) as f32 / span
+            };
+            let mut out = [0u8; 3];
+            for i in 0..3 {
+                let lo = c0[i] as f32;
+                let hi = c1[i] as f32;
+                out[i] = (lo + t * (hi - lo)).round() as u8;
+            }
+            return out;
+        }
+    }
+    // d は u8 なので最終 stop (255) を超えることはなく、ここには到達しない。
+    DIFF_RAMP_STOPS[DIFF_RAMP_STOPS.len() - 1].1
+}
+
+/// `compare_revisions` layout="diff" の中核: 同寸法 RGB8 画像2枚から
+/// (ヒートマップ, mean_abs_diff, max_abs_diff, changed_pixel_ratio) を作る。
+///
+/// - 画素ごとの `d` = 3チャンネルの絶対差の**最大値**(u8)。ヒートマップの色と
+///   `max_abs_diff` / `changed_pixel_ratio`(`d > 2` の画素の割合)はこの `d` を使う。
+/// - `mean_abs_diff` は `d` ではなく、**全チャンネル・全画素**の絶対差の単純平均
+///   (= R/G/B 3つの差分をまとめて均した「平均的などのくらいズレたか」)。
+///   `max_abs_diff` が「最悪1点」、`mean_abs_diff` が「全体としての量」を表す。
+///
+/// 入力の寸法が 0 の場合(あり得ないが防御的に)は両方 0.0 を返す。
+fn diff_heatmap(a: &RgbImage, b: &RgbImage) -> (RgbImage, f64, u8, f64) {
+    let (w, h) = a.dimensions();
+    let mut heatmap = RgbImage::new(w, h);
+    let mut sum_abs: u64 = 0;
+    let mut max_d: u8 = 0;
+    let mut changed_pixels: u64 = 0;
+    const CHANGED_THRESHOLD: u8 = 2;
+
+    for y in 0..h {
+        for x in 0..w {
+            let pa = a.get_pixel(x, y).0;
+            let pb = b.get_pixel(x, y).0;
+            let mut d: u8 = 0;
+            for c in 0..3 {
+                let diff = (pa[c] as i16 - pb[c] as i16).unsigned_abs() as u8;
+                sum_abs += diff as u64;
+                if diff > d {
+                    d = diff;
+                }
+            }
+            if d > max_d {
+                max_d = d;
+            }
+            if d > CHANGED_THRESHOLD {
+                changed_pixels += 1;
+            }
+            heatmap.put_pixel(x, y, image::Rgb(diff_ramp_color(d)));
+        }
+    }
+
+    let total_pixels = w as u64 * h as u64;
+    let (mean_abs_diff, changed_pixel_ratio) = if total_pixels == 0 {
+        (0.0, 0.0)
+    } else {
+        (
+            sum_abs as f64 / (total_pixels * 3) as f64,
+            changed_pixels as f64 / total_pixels as f64,
+        )
+    };
+
+    (heatmap, mean_abs_diff, max_d, changed_pixel_ratio)
 }
 
 /// [`StoreError::RevisionNotFound`] を、A/B のどちら側で起きたか分かる形の

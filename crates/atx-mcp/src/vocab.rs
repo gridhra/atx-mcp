@@ -661,6 +661,110 @@ pub const OPERATIONS: &[OpDoc] = &[
         ],
     },
     OpDoc {
+        name: "clone",
+        category: "filter",
+        summary: "Stamp a circular patch of pixels from one point onto another (Photoshop clone stamp).",
+        params: &[
+            ParamDoc {
+                name: "src_x",
+                type_hint: "u32",
+                requirement: "required",
+                semantics: "X of the source point pixels are copied FROM, in the current image's coordinates.",
+            },
+            ParamDoc {
+                name: "src_y",
+                type_hint: "u32",
+                requirement: "required",
+                semantics: "Y of the source point pixels are copied FROM.",
+            },
+            ParamDoc {
+                name: "dest_x",
+                type_hint: "u32",
+                requirement: "required",
+                semantics: "X of the destination point pixels are copied TO.",
+            },
+            ParamDoc {
+                name: "dest_y",
+                type_hint: "u32",
+                requirement: "required",
+                semantics: "Y of the destination point pixels are copied TO.",
+            },
+            ParamDoc {
+                name: "radius",
+                type_hint: "u32 > 0",
+                requirement: "required",
+                semantics: "Radius in pixels of the circular patch copied from src to dest.",
+            },
+            ParamDoc {
+                name: "feather_px",
+                type_hint: "f64 >= 0",
+                requirement: "optional",
+                semantics: "Softens the patch edge over this many pixels (gaussian-like falloff) so the stamp blends instead of leaving a hard disc outline. Omitted or 0 means a hard edge.",
+            },
+        ],
+        examples: &[
+            r#"{"op": "clone", "src_x": 900, "src_y": 400, "dest_x": 1200, "dest_y": 620, "radius": 40}"#,
+            r#"{"op": "clone", "src_x": 900, "src_y": 400, "dest_x": 1200, "dest_y": 620, "radius": 40, "feather_px": 8.0}"#,
+        ],
+        warnings: &[
+            "This is a straight pixel copy (source texture AND tone both move to dest); for a dust-spot/blemish fix where the surrounding tone must be preserved, use heal instead.",
+            "The source and destination circles are both clamped to the image bounds; a source circle that falls partly outside the image only copies the part that exists.",
+            "The seed/algorithm is fixed (no randomness), so the same recipe always reproduces the same pixels.",
+        ],
+    },
+    OpDoc {
+        name: "heal",
+        category: "filter",
+        summary: "Copy texture from src to dest while matching the surrounding tone at dest (Photoshop healing brush).",
+        params: &[
+            ParamDoc {
+                name: "src_x",
+                type_hint: "u32",
+                requirement: "required",
+                semantics: "X of the source point texture is sampled FROM, in the current image's coordinates.",
+            },
+            ParamDoc {
+                name: "src_y",
+                type_hint: "u32",
+                requirement: "required",
+                semantics: "Y of the source point texture is sampled FROM.",
+            },
+            ParamDoc {
+                name: "dest_x",
+                type_hint: "u32",
+                requirement: "required",
+                semantics: "X of the destination point being healed.",
+            },
+            ParamDoc {
+                name: "dest_y",
+                type_hint: "u32",
+                requirement: "required",
+                semantics: "Y of the destination point being healed.",
+            },
+            ParamDoc {
+                name: "radius",
+                type_hint: "u32 > 0",
+                requirement: "required",
+                semantics: "Radius in pixels of the circular patch healed at dest.",
+            },
+            ParamDoc {
+                name: "feather_px",
+                type_hint: "f64 >= 0",
+                requirement: "optional",
+                semantics: "Softens the patch edge over this many pixels so the healed disc blends into its surroundings. Omitted or 0 means a hard edge.",
+            },
+        ],
+        examples: &[
+            r#"{"op": "heal", "src_x": 300, "src_y": 150, "dest_x": 620, "dest_y": 210, "radius": 18}"#,
+            r#"{"op": "heal", "src_x": 300, "src_y": 150, "dest_x": 620, "dest_y": 210, "radius": 18, "feather_px": 4.0}"#,
+        ],
+        warnings: &[
+            "copies texture from src while adopting the tone around dest (texture+tone split) - this is what makes it the right op for blemishes/dust spots on a background whose brightness varies, where plain clone would paste a visibly mismatched patch.",
+            "The source and destination circles are both clamped to the image bounds.",
+            "The seed/algorithm is fixed (no randomness), so the same recipe always reproduces the same pixels.",
+        ],
+    },
+    OpDoc {
         name: "encode",
         category: "output",
         summary: "Output format/quality. At most one, and it must be last.",
@@ -769,9 +873,9 @@ pub const LAYERS_DOC: OpDoc = OpDoc {
         },
         ParamDoc {
             name: "layers[].blend_mode",
-            type_hint: "enum, 12 separable modes",
+            type_hint: "enum, 16 modes (12 separable + 4 non-separable)",
             requirement: "default: normal",
-            semantics: "One of normal | multiply | screen | overlay | darken | lighten | color_dodge | color_burn | hard_light | soft_light | difference | exclusion (the W3C separable blend modes). Applied per-channel against the composite of the layers below.",
+            semantics: "One of normal | multiply | screen | overlay | darken | lighten | color_dodge | color_burn | hard_light | soft_light | difference | exclusion (the W3C separable blend modes, applied per-channel) or hue | saturation | color | luminosity (the W3C non-separable blend modes, applied to the HSL components of the composite as a whole rather than per-channel).",
         },
         ParamDoc {
             name: "layers[].opacity",
@@ -787,7 +891,7 @@ pub const LAYERS_DOC: OpDoc = OpDoc {
         "layers is a top-level recipe field, not something you put inside \"operations\" - a recipe has EITHER a flat operations pipeline OR a layers stack (with operations as its finishing pass), never a \"layers\" op tag.",
         "The bottom layer is the backdrop: its blend_mode/opacity are still honored against whatever is beneath the stack (nothing, i.e. treated as normal/opaque, for the first layer).",
         "When layers is present, the top-level \"operations\" list runs ONCE on the composited result as the finishing pass - this is where resize and the final encode belong. encode must still be the last operation and appear at most once.",
-        "The 12 blend modes here are the separable set only (normal, multiply, screen, overlay, darken, lighten, color_dodge, color_burn, hard_light, soft_light, difference, exclusion); the non-separable set (hue/saturation/color/luminosity) is not implemented yet (ROADMAP v0.7).",
+        "16 blend modes total: the 12 W3C separable modes (normal, multiply, screen, overlay, darken, lighten, color_dodge, color_burn, hard_light, soft_light, difference, exclusion) plus the 4 non-separable modes (hue, saturation, color, luminosity) added in v0.7.",
         "recipe_hash covers the whole recipe including every layer's ops and any referenced revision ids (same rule as lut/mask references), so a layered recipe reproduces only inside a workspace holding every referenced revision.",
     ],
 };
@@ -825,7 +929,7 @@ mod tests {
     #[test]
     fn catalog_covers_every_operation_exactly_once() {
         let names = operation_names();
-        assert_eq!(names.len(), 18, "v0.3 has 18 operations");
+        assert_eq!(names.len(), 20, "v0.7 has 20 operations");
         let mut sorted = names.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -858,6 +962,27 @@ mod tests {
     #[test]
     fn every_example_deserializes_as_an_operation() {
         for op in OPERATIONS {
+            for example in op.examples {
+                let parsed: atx_core::recipe::Operation = serde_json::from_str(example)
+                    .unwrap_or_else(|e| panic!("{}: example {example} must parse: {e}", op.name));
+                let tag = serde_json::to_value(&parsed).unwrap();
+                assert_eq!(
+                    tag["op"], op.name,
+                    "{}: example must use its own op tag",
+                    op.name
+                );
+            }
+        }
+    }
+
+    /// `clone` / `heal` の examples も `atx_core::recipe::Operation` としてデシリアライズ
+    /// できること(v0.7 core 着地済み)。
+    #[test]
+    fn clone_heal_examples_deserialize_as_operations() {
+        for op in OPERATIONS
+            .iter()
+            .filter(|op| op.name == "clone" || op.name == "heal")
+        {
             for example in op.examples {
                 let parsed: atx_core::recipe::Operation = serde_json::from_str(example)
                     .unwrap_or_else(|e| panic!("{}: example {example} must parse: {e}", op.name));

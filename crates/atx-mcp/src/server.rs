@@ -74,7 +74,7 @@ Use list_assets to review the ledger (lineage, recipes, sizes). All tool results
 
 Note on ICC: when a recipe's encode output format is png, webp, or avif, any ICC color profile on the source is dropped (embedding is only supported for jpeg output), and apply_transform/render_preview report this as a warning rather than failing.
 
-Visual verification: render_preview accepts an optional `overlay` ("grid" | "thirds" | "horizon", or "mask" with a mask_revision_id) to draw composition guide lines or a mask coverage tint on the returned preview; compare_revisions places two revisions side by side (or stacked) in one inline image so before/after or A/B differences can be checked without leaving the MCP."#;
+Visual verification: render_preview accepts an optional `overlay` ("grid" | "thirds" | "horizon", or "mask" with a mask_revision_id) to draw composition guide lines or a mask coverage tint on the returned preview; compare_revisions places two revisions side by side (or stacked) in one inline image so before/after or A/B differences can be checked without leaving the MCP, or pass layout="diff" (revisions must share the same dimensions) for a single pixel-difference heatmap plus mean_abs_diff/max_abs_diff/changed_pixel_ratio stats instead of a spatial arrangement."#;
 
 /// MCP サーバ本体。ワークスペース1つに対応する。
 #[derive(Clone)]
@@ -294,6 +294,8 @@ impl AtxServer {
     /// Scale two revisions to a long edge of 640px each and compose them on one canvas
     /// (side by side, or stacked) with an 8px gap, returned inline as a JPEG. A is placed
     /// left/top, B is placed right/bottom. Useful for before/after or A/B visual checks.
+    /// layout="diff" instead requires A and B to share the exact same dimensions and returns
+    /// a single pixel-difference heatmap plus mean_abs_diff/max_abs_diff/changed_pixel_ratio.
     #[tool(
         name = "compare_revisions",
         output_schema = schema_for_output::<CompareRevisionsOutput>(),

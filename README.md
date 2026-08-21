@@ -97,7 +97,7 @@ It is created automatically if it doesn't exist.
 | `generate_mask` | Generate a deterministic grayscale mask (`linear_gradient` / `radial_gradient` / `luminosity_range` / `color_range`) as a PNG revision with the same dimensions as the reference image, to be referenced from an operation's `mask` field (idempotent) |
 | `render_preview` | Apply a recipe (or a `preset`) at low resolution (long edge ≤768) and return it as an inline image. `overlay:"grid"\|"thirds"\|"horizon"` overlays composition guide lines, and `overlay:"mask"` (with `mask_revision_id`) tints the coverage of a mask (drawn on the preview only; it has no effect on the actual transform) |
 | `apply_transform` | Apply a recipe (or a `preset`) at full resolution and produce a new revision (the same recipe always yields the same revision) |
-| `compare_revisions` | Downscale two revisions to long edge ≤640 and return them composited into a single inline image, arranged via `layout:"side_by_side"\|"stacked"` (for A/B and before/after visual comparison) |
+| `compare_revisions` | Downscale two revisions to long edge ≤640 and return them composited into a single inline image, arranged via `layout:"side_by_side"\|"stacked"` (for A/B and before/after visual comparison), or `layout:"diff"` for a single pixel-difference heatmap plus `mean_abs_diff`/`max_abs_diff`/`changed_pixel_ratio` stats (requires equal dimensions) |
 | `list_assets` | Read the revision ledger (read-only) |
 | `export_asset` | Write a revision out to a given path (an existing file is only overwritten when `overwrite:true` is explicitly set) |
 
@@ -114,11 +114,11 @@ It is created automatically if it doesn't exist.
 }
 ```
 
-Supported ops (18): `auto_orient` / `rotate` / `perspective` / `crop` (crop,
+Supported ops (20): `auto_orient` / `rotate` / `perspective` / `crop` (crop,
 pad) / `resize` (cover, contain, fill) / `adjust` / `color_matrix` / `curves` /
 `levels` / `lut` / `white_balance` / `hsl` / `blur` / `median` /
-`unsharp_mask` / `convolve` / `encode` (jpeg, png, webp, avif) /
-`strip_metadata`.
+`unsharp_mask` / `convolve` / `clone` / `heal` / `encode` (jpeg, png, webp,
+avif) / `strip_metadata`.
 The operation vocabulary is deliberately kept out of the tool schemas: call
 `list_operations` for the up-to-date catalog and `explain_operation` for one
 operation's full schema, examples and gotchas.
@@ -215,9 +215,10 @@ against its own source before it is blended onto the running composite:
 - `ops` is a normal operations list, applied to that layer's source alone.
 - `mask`, `blend_mode` (default `"normal"`) and `opacity` (default `1.0`)
   control how the layer composites onto the layers below it.
-- Blend mode is one of the 12 W3C separable modes: `normal`, `multiply`,
-  `screen`, `overlay`, `darken`, `lighten`, `color_dodge`, `color_burn`,
-  `hard_light`, `soft_light`, `difference`, `exclusion`.
+- Blend mode is one of 16 W3C modes: the 12 separable modes `normal`,
+  `multiply`, `screen`, `overlay`, `darken`, `lighten`, `color_dodge`,
+  `color_burn`, `hard_light`, `soft_light`, `difference`, `exclusion`, plus
+  the 4 non-separable modes `hue`, `saturation`, `color`, `luminosity`.
 - When `layers` is present, the top-level `operations` becomes the
   **finishing pass**, applied once to the composited result — this is where
   `resize` and the final `encode` belong (`encode` must still be last and

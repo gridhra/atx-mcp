@@ -230,6 +230,50 @@ pub enum Operation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mask: Option<MaskRef>,
     },
+    /// クローンスタンプ(v0.7)。**同一画像内**で `(src_x, src_y)` を中心とする
+    /// 半径 `radius` の円領域を `(dest_x, dest_y)` を中心とする位置へ複写する。
+    ///
+    /// - 作業空間は**線形光**(画素の混合を伴うため。`ops/mod.rs` の表)
+    /// - **マスクは付けられない**: この op は `radius` / `feather_px` という
+    ///   自前の適用領域を持っており、マスクと二重になる
+    /// - `feather_px` は円の縁を内側へ向けて滑らかに減衰させる幅 [px]。
+    ///   0(既定)なら 2 値の円になる
+    /// - src / dest の円は画像からはみ出してよい(はみ出した画素は複写しない)。
+    ///   ただし**中心そのもの**は画像内でなければならず、外れていれば
+    ///   実行時に構造化エラー(寸法は validate 時点では未知のため)
+    /// - src と dest の円が重なってもよい。読み出しは**適用前のスナップショット**
+    ///   から行うので、複写が自分の書き込み結果を巻き込んで尾を引くことはない
+    Clone {
+        src_x: u32,
+        src_y: u32,
+        dest_x: u32,
+        dest_y: u32,
+        radius: u32,
+        #[serde(default)]
+        feather_px: f64,
+    },
+    /// スポット修復(v0.7)。`clone` と同じ形状パラメータを取るが、複写ではなく
+    /// **ソースの高周波(テクスチャ)+ 目的地の低周波(トーン)**を合成する。
+    ///
+    /// ```text
+    /// detail = src_patch − gaussian_blur(src_patch, σ = radius/3)
+    /// tone   = gaussian_blur(dest_patch, σ = radius/3)
+    /// healed = clamp(detail + tone)
+    /// ```
+    ///
+    /// 目的地の明るさ・色かぶりを保ったままソースの肌理だけを移すので、
+    /// `clone` と違って継ぎ目が出にくい(DESIGN.md §9.8)。
+    /// 乱数も反復も使わないので完全に決定論的。作業空間は**線形光**、
+    /// `clone` と同じくマスクは付けられない。
+    Heal {
+        src_x: u32,
+        src_y: u32,
+        dest_x: u32,
+        dest_y: u32,
+        radius: u32,
+        #[serde(default)]
+        feather_px: f64,
+    },
     /// 出力エンコード指定。レシピ内で最後に1回のみ許可。省略時は入力フォーマット維持。
     Encode {
         format: OutputFormat,
@@ -373,9 +417,11 @@ pub enum BaseKeyword {
     Base,
 }
 
-/// separable ブレンドモード 12 種(W3C Compositing and Blending Level 1)。
+/// ブレンドモード 16 種(W3C Compositing and Blending Level 1)。
 ///
-/// 非 separable 系(hue / saturation / color / luminosity)は v0.7。
+/// separable 12 種(v0.6)+ **非 separable 4 種**(hue / saturation / color /
+/// luminosity、v0.7)。enum の**追加**なので、既存の値の serde 表現は 1 文字も
+/// 変わらず、既存レシピの `recipe_hash` は不変。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BlendMode {
@@ -404,6 +450,20 @@ pub enum BlendMode {
     Difference,
     /// `B = Cb + Cs − 2 × Cb × Cs`
     Exclusion,
+
+    // --- 非 separable(v0.7)。RGB の三つ組みに対して定義される ---
+    /// `B = SetLum(SetSat(Cs, Sat(Cb)), Lum(Cb))`
+    /// — ソースの**色相**に、backdrop の彩度と輝度を載せる。
+    Hue,
+    /// `B = SetLum(SetSat(Cb, Sat(Cs)), Lum(Cb))`
+    /// — ソースの**彩度**だけを backdrop に載せる(色相・輝度は backdrop のまま)。
+    Saturation,
+    /// `B = SetLum(Cs, Lum(Cb))`
+    /// — ソースの**色相 + 彩度**に、backdrop の輝度を載せる(着色)。
+    Color,
+    /// `B = SetLum(Cb, Lum(Cs))`
+    /// — ソースの**輝度**だけを backdrop に載せる(`color` の相補)。
+    Luminosity,
 }
 
 /// 色相域ごとの HSL シフト量。各値 -100..=100(0 = 変更なし)。
@@ -425,6 +485,8 @@ impl Operation {
     /// hsl / lut / white_balance / blur / median / unsharp_mask / convolve)。
     /// 幾何 op(resize / rotate / crop / perspective)は「一部だけリサイズ」に
     /// 意味が無いため対象外、encode / strip_metadata / auto_orient も同様。
+    /// `clone` / `heal`(v0.7)は `radius` + `feather_px` という**自前の適用領域**を
+    /// 持つので、マスクと二重定義になることを避けて対象外とする。
     pub fn mask(&self) -> Option<&MaskRef> {
         match self {
             Operation::Adjust { mask, .. }
@@ -443,6 +505,8 @@ impl Operation {
             | Operation::Crop { .. }
             | Operation::Resize { .. }
             | Operation::Perspective { .. }
+            | Operation::Clone { .. }
+            | Operation::Heal { .. }
             | Operation::Encode { .. }
             | Operation::StripMetadata { .. } => None,
         }
@@ -861,6 +925,12 @@ fn validate_operations(operations: &[Operation]) -> crate::Result<()> {
                 offset,
                 ..
             } => crate::ops::convolve::validate(index, kernel, *size, *divisor, *offset)?,
+            Operation::Clone {
+                radius, feather_px, ..
+            } => crate::ops::clone_heal::validate(index, "clone", *radius, *feather_px)?,
+            Operation::Heal {
+                radius, feather_px, ..
+            } => crate::ops::clone_heal::validate(index, "heal", *radius, *feather_px)?,
             Operation::Blur { sigma, .. } => crate::ops::blur::validate_blur(index, *sigma)?,
             Operation::Median { radius, .. } => crate::ops::blur::validate_median(index, *radius)?,
             Operation::UnsharpMask {

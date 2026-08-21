@@ -56,7 +56,7 @@ fn tools() -> (tempfile::TempDir, AtxTools) {
     (workspace, tools)
 }
 
-const V03_OPERATIONS: [&str; 18] = [
+const V03_OPERATIONS: [&str; 20] = [
     "auto_orient",
     "rotate",
     "crop",
@@ -73,6 +73,8 @@ const V03_OPERATIONS: [&str; 18] = [
     "median",
     "unsharp_mask",
     "convolve",
+    "clone",
+    "heal",
     "encode",
     "strip_metadata",
 ];
@@ -94,7 +96,7 @@ fn list_operations_returns_every_op_and_the_presets() {
     let out = structured(&result);
     let body = text(&result);
 
-    assert_eq!(out["count"], 18);
+    assert_eq!(out["count"], 20);
     let names: Vec<&str> = out["operations"]
         .as_array()
         .expect("operations must be an array")
@@ -132,9 +134,9 @@ fn list_operations_returns_every_op_and_the_presets() {
     assert!(body.contains("0.1..100"));
 
     // 段階的開示: カタログはトークン的に軽いこと
-    // (v0.5 で 18 op + 11 op に付く mask の1行、目安 ~980 tokens ≒ 4100 chars)。
+    // (v0.7 で 20 op + 11 op に付く mask の1行、目安 ~1080 tokens ≒ 4500 chars)。
     assert!(
-        body.len() < 4100,
+        body.len() < 4500,
         "the catalog must stay compact, got {} chars",
         body.len()
     );
@@ -153,7 +155,17 @@ fn list_operations_filters_by_category_and_rejects_unknown_ones() {
         .iter()
         .map(|op| op["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["blur", "median", "unsharp_mask", "convolve"]);
+    assert_eq!(
+        names,
+        [
+            "blur",
+            "median",
+            "unsharp_mask",
+            "convolve",
+            "clone",
+            "heal"
+        ]
+    );
     // プリセットは分類で絞っても常に出す(語彙の圧縮層は分類に属さない)。
     assert_eq!(
         filtered["presets"].as_array().unwrap().len(),
@@ -304,7 +316,7 @@ fn explain_operation_rejects_unknown_names_with_the_valid_list() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert_eq!(valid.len(), 18);
+    assert_eq!(valid.len(), 20);
     for op in V03_OPERATIONS {
         assert!(valid.contains(&op));
     }

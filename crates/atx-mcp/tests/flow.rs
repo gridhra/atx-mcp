@@ -744,3 +744,140 @@ fn compare_revisions_flow() {
     assert_eq!(payload["error"]["code"], "revision_not_found");
     assert_eq!(payload["error"]["details"]["side"], "b");
 }
+
+/// compare_revisions layout="diff"(v0.7): ヒートマップ画像 + 統計3値、
+/// 同一 revision 同士は差分ゼロ、寸法不一致は構造化エラー、
+/// 繰り返し呼び出しはキャッシュヒットでバイト同一(冪等)であること。
+#[test]
+fn compare_revisions_diff_flow() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let tools = AtxTools::open(workspace.path()).expect("open workspace");
+
+    let imported = structured(&tools.import_asset(&ImportAssetParams {
+        path: fixture().to_string_lossy().into_owned(),
+    }));
+    let rev_a = imported["revision"]["revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 同寸法のまま明るさだけ変えた派生 revision(diff の対象として妥当な組)。
+    let brighten_recipe: atx_core::TransformRecipe = serde_json::from_value(serde_json::json!({
+        "operations": [
+            {"op": "adjust", "brightness": 0.3},
+            {"op": "encode", "format": "png"}
+        ]
+    }))
+    .unwrap();
+    let brightened = structured(&tools.apply_transform(&TransformParams {
+        revision_id: rev_a.clone(),
+        recipe: Some(brighten_recipe),
+        preset: None,
+    }));
+    let rev_bright = brightened["revision"]["revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    fn inline_image(result: &CallToolResult) -> Vec<u8> {
+        let image = result
+            .content
+            .iter()
+            .find_map(|c| match c {
+                ContentBlock::Image(img) => Some(img),
+                _ => None,
+            })
+            .expect("compare_revisions diff must return an inline image block");
+        assert_eq!(image.mime_type, "image/jpeg");
+        base64::engine::general_purpose::STANDARD
+            .decode(&image.data)
+            .expect("inline image must be valid base64")
+    }
+
+    // --- diff: 明るさ違いのある A/B ---
+    let diff_result = tools.compare_revisions(&CompareRevisionsParams {
+        revision_id_a: rev_a.clone(),
+        revision_id_b: rev_bright.clone(),
+        layout: CompareLayout::Diff,
+    });
+    let diff = structured(&diff_result);
+    assert_eq!(diff["layout"], "diff");
+    assert_eq!(diff["a"]["revision_id"], rev_a.as_str());
+    assert_eq!(diff["b"]["revision_id"], rev_bright.as_str());
+
+    let diff_bytes = inline_image(&diff_result);
+    image::load_from_memory(&diff_bytes).expect("diff heatmap jpeg must decode");
+
+    let mean_abs_diff = diff["mean_abs_diff"]
+        .as_f64()
+        .expect("mean_abs_diff must be a number");
+    let max_abs_diff = diff["max_abs_diff"]
+        .as_u64()
+        .expect("max_abs_diff must be a number");
+    let changed_pixel_ratio = diff["changed_pixel_ratio"]
+        .as_f64()
+        .expect("changed_pixel_ratio must be a number");
+    assert!(
+        mean_abs_diff > 0.0,
+        "a visibly brightened image must have mean_abs_diff > 0, got {mean_abs_diff}"
+    );
+    assert!(
+        changed_pixel_ratio > 0.0 && changed_pixel_ratio <= 1.0,
+        "changed_pixel_ratio must be in (0, 1], got {changed_pixel_ratio}"
+    );
+    assert!(max_abs_diff > 0, "max_abs_diff must be > 0");
+
+    let summary = text(&diff_result);
+    assert!(summary.contains("mean_abs_diff"));
+    assert!(summary.contains("max_abs_diff"));
+    assert!(summary.contains("changed_pixel_ratio"));
+
+    // --- 冪等性: 同じ呼び出しの繰り返しはバイト同一(キャッシュヒット) ---
+    let again_result = tools.compare_revisions(&CompareRevisionsParams {
+        revision_id_a: rev_a.clone(),
+        revision_id_b: rev_bright.clone(),
+        layout: CompareLayout::Diff,
+    });
+    let again_bytes = inline_image(&again_result);
+    assert_eq!(
+        again_bytes, diff_bytes,
+        "repeated diff compare must hit the cache and return identical bytes"
+    );
+    let again = structured(&again_result);
+    assert_eq!(
+        again["preview_path"],
+        diff["preview_path"].as_str().unwrap()
+    );
+
+    // --- 同一 revision 同士は差分ゼロ ---
+    let same_result = tools.compare_revisions(&CompareRevisionsParams {
+        revision_id_a: rev_a.clone(),
+        revision_id_b: rev_a.clone(),
+        layout: CompareLayout::Diff,
+    });
+    let same = structured(&same_result);
+    assert_eq!(same["max_abs_diff"].as_u64().unwrap(), 0);
+    assert_eq!(same["changed_pixel_ratio"].as_f64().unwrap(), 0.0);
+    assert_eq!(same["mean_abs_diff"].as_f64().unwrap(), 0.0);
+
+    // --- 寸法不一致は構造化エラー(resize/crop で寸法が変わった派生と比較) ---
+    let resized_recipe: atx_core::TransformRecipe = serde_json::from_value(recipe()).unwrap();
+    let resized = structured(&tools.apply_transform(&TransformParams {
+        revision_id: rev_a.clone(),
+        recipe: Some(resized_recipe),
+        preset: None,
+    }));
+    let rev_resized = resized["revision"]["revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mismatch_result = tools.compare_revisions(&CompareRevisionsParams {
+        revision_id_a: rev_a,
+        revision_id_b: rev_resized,
+        layout: CompareLayout::Diff,
+    });
+    let payload = error_payload(&mismatch_result);
+    assert_eq!(payload["error"]["code"], "dimension_mismatch");
+    assert!(payload["error"]["details"]["a_width"].is_u64());
+    assert!(payload["error"]["details"]["b_width"].is_u64());
+}
