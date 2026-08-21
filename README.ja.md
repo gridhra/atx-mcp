@@ -79,15 +79,17 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 
 `--workspace`(env: `ATX_WORKSPACE`)はアセットストアのディレクトリ。存在しなければ作成される。
 
-## ツール(8)
+## ツール(10)
 
 | ツール | 役割 |
 |---|---|
+| `list_operations` | レシピ語彙の軽量カタログ。全 op を1行説明 + パラメータの型/値域ヒント付きで返し、末尾にビルトインプリセット名も載せる。`category:"geometry"\|"color"\|"filter"\|"output"` で絞り込み可(read-only) |
+| `explain_operation` | 1つの op の完全なリファレンス。パラメータ表(型・値域・必須/既定値・意味)、そのまま貼れる JSON 例、落とし穴を返す。未知の名前には有効な op 名一覧を返す(read-only) |
 | `import_asset` | ローカル画像をワークスペースへ取り込み(sha256 冪等) |
 | `inspect_image` | 寸法・EXIF・ICC・GPS 有無などの検査(read-only) |
 | `detect_tilt` | Canny+Hough(粗)+ 投影プロファイル(0.1° 未満の細分)による傾き角推定。水平族/垂直族の推定とスコア曲線も返す。confidence 低なら「補正しない」を返す(read-only) |
-| `render_preview` | レシピを低解像度(長辺 ≤768)で適用、インライン画像付きで返却。`overlay:"grid"\|"thirds"\|"horizon"` で構図確認用のガイド線を重ねられる(プレビューのみに描画、本適用には影響しない) |
-| `apply_transform` | レシピを高解像度適用し新 revision を発行(同一レシピ→同一 revision) |
+| `render_preview` | レシピ(または `preset`)を低解像度(長辺 ≤768)で適用、インライン画像付きで返却。`overlay:"grid"\|"thirds"\|"horizon"` で構図確認用のガイド線を重ねられる(プレビューのみに描画、本適用には影響しない) |
+| `apply_transform` | レシピ(または `preset`)を高解像度適用し新 revision を発行(同一レシピ→同一 revision) |
 | `compare_revisions` | 2つの revision を長辺 ≤640 に縮小し、`layout:"side_by_side"\|"stacked"` で1枚に並べてインライン画像で返却(A/B・before/after の視覚比較用) |
 | `list_assets` | revision 台帳の参照(read-only) |
 | `export_asset` | revision を指定パスへ書き出し(既存ファイルは `overwrite:true` 明示時のみ上書き) |
@@ -105,8 +107,28 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 }
 ```
 
-対応 op: `auto_orient` / `rotate` / `crop`(crop・pad)/ `resize`(cover・contain・fill)/
-`adjust`(brightness・contrast・saturation・sharpness)/ `encode`(jpeg・png・webp・avif)/ `strip_metadata`。
+対応 op: `auto_orient` / `rotate` / `perspective` / `crop`(crop・pad)/ `resize`(cover・contain・fill)/
+`adjust` / `color_matrix` / `curves` / `levels` / `blur` / `median` / `unsharp_mask` /
+`encode`(jpeg・png・webp・avif)/ `strip_metadata`。
+op 一覧はツールのスキーマにあえて埋め込んでいない。最新のカタログは `list_operations`、
+個々の op の完全なスキーマ・例・注意点は `explain_operation` で取得する。
+
+## プリセット
+
+`apply_transform` / `render_preview` は `recipe`(生の DSL)と
+`preset`([`presets/`](presets) 同梱の名前付きレシピ)のどちらか一方を受ける(排他・どちらか必須):
+
+| プリセット | 内容 |
+|---|---|
+| `eyecatch_16_9` | 16:9 に中央クロップ → 幅 1600px → WebP q82 |
+| `thumbnail_square` | 1:1 に中央クロップ → 800x800 → WebP q80 |
+| `web_optimize` | 拡大せず 2000x2000 に収める → WebP q80 |
+| `grayscale` | BT.709 輝度の `color_matrix` による白黒化 |
+| `sepia` | `color_matrix` による古典的セピア |
+
+プリセットは純粋な糖衣である: 解決後は通常のレシピとして同じパイプラインを流れ、
+`recipe_hash`(冪等キー)は**解決後のレシピ**に対して計算される。
+つまり preset 指定と、同じ内容の生レシピ指定は同一 revision に落ちる。
 
 ## 保証
 

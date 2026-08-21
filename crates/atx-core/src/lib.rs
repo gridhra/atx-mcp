@@ -3,9 +3,10 @@
 
 mod codec;
 pub mod engine;
+pub(crate) mod ops;
 mod pixel_ops;
 pub mod recipe;
-mod transform;
+pub(crate) mod transform;
 
 pub use engine::{apply_recipe, inspect_bytes, EncodedOutput, ImageInfo, ENGINE_VERSION};
 pub use recipe::{

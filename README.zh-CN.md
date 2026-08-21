@@ -80,15 +80,17 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 
 `--workspace`(环境变量:`ATX_WORKSPACE`)是资产存储所在的目录,若不存在会自动创建。
 
-## 工具(8 个)
+## 工具(10 个)
 
 | 工具 | 作用 |
 |---|---|
+| `list_operations` | 配方词汇的精简目录:列出全部操作(op)及其一行说明和参数的类型/取值范围提示,并在末尾附上内置预设名称。可用 `category:"geometry"\|"color"\|"filter"\|"output"` 筛选(只读) |
+| `explain_operation` | 单个操作的完整参考:参数表(类型、取值范围、必填/默认值、语义)、可直接粘贴的 JSON 示例以及注意事项。名称无效时会返回全部有效操作名(只读) |
 | `import_asset` | 将本地图片导入工作区(基于 sha256,幂等) |
 | `inspect_image` | 检查尺寸、EXIF、ICC 配置文件、是否含 GPS 信息等(只读) |
 | `detect_tilt` | 通过 Canny+Hough(粗定位)加投影轮廓法(精细化到 0.1° 以内)估算倾斜角度,同时返回水平/垂直族的估计值及其评分曲线。置信度低时返回"不进行校正"(只读) |
-| `render_preview` | 以低分辨率(长边 ≤768)应用配方并以内联图像返回。可通过 `overlay:"grid"\|"thirds"\|"horizon"` 叠加构图参考线(仅绘制在预览图上,不影响实际变换) |
-| `apply_transform` | 以完整分辨率应用配方并生成新的修订版本(同一配方 → 同一修订版本) |
+| `render_preview` | 以低分辨率(长边 ≤768)应用配方(或 `preset` 预设)并以内联图像返回。可通过 `overlay:"grid"\|"thirds"\|"horizon"` 叠加构图参考线(仅绘制在预览图上,不影响实际变换) |
+| `apply_transform` | 以完整分辨率应用配方(或 `preset` 预设)并生成新的修订版本(同一配方 → 同一修订版本) |
 | `compare_revisions` | 将两个修订版本缩放到长边 ≤640,通过 `layout:"side_by_side"\|"stacked"` 拼接为一张内联图像返回(用于 A/B 或前后对比的可视化) |
 | `list_assets` | 查阅修订版本台账(只读) |
 | `export_asset` | 将修订版本导出到指定路径(仅在显式设置 `overwrite:true` 时才会覆盖已存在的文件) |
@@ -106,9 +108,28 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 }
 ```
 
-支持的操作(op):`auto_orient` / `rotate` / `crop`(crop、pad)/ `resize`
-(cover、contain、fill)/ `adjust`(brightness、contrast、saturation、sharpness)/
-`encode`(jpeg、png、webp、avif)/ `strip_metadata`。
+支持的操作(op):`auto_orient` / `rotate` / `perspective` / `crop`(crop、pad)/
+`resize`(cover、contain、fill)/ `adjust` / `color_matrix` / `curves` / `levels` /
+`blur` / `median` / `unsharp_mask` / `encode`(jpeg、png、webp、avif)/ `strip_metadata`。
+操作清单刻意不写进工具的 schema:请调用 `list_operations` 获取最新目录,
+调用 `explain_operation` 获取单个操作的完整 schema、示例与注意事项。
+
+## 预设
+
+`apply_transform` 与 `render_preview` 接受 `recipe`(原始 DSL)或
+`preset`(随包提供的具名配方,见 [`presets/`](presets))之一(二者互斥,且必须有其一):
+
+| 预设 | 作用 |
+|---|---|
+| `eyecatch_16_9` | 居中裁剪为 16:9 → 宽 1600px → WebP q82 |
+| `thumbnail_square` | 居中裁剪为 1:1 → 800x800 → WebP q80 |
+| `web_optimize` | 不放大地收进 2000x2000 → WebP q80 |
+| `grayscale` | 通过 BT.709 亮度 `color_matrix` 转黑白 |
+| `sepia` | 通过 `color_matrix` 实现经典棕褐色调 |
+
+预设只是语法糖:解析后作为普通配方走同一条流水线,
+`recipe_hash`(幂等键)基于**解析后的配方**计算 ——
+因此用预设调用与写出等价的原始配方会落到同一个修订版本。
 
 ## 保证
 

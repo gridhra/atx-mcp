@@ -1,0 +1,9 @@
+{
+  "id": "t02_tilt_report_only",
+  "prompt": "この写真、水平が傾いていないか確認して。何度くらい傾いているか教えてほしい。直さなくていい、報告だけで大丈夫。",
+  "input_fixture": "tests/fixtures/synthetic_scene.jpg",
+  "success_criteria": {
+    "expect_no_new_revision": true
+  },
+  "max_turns": 5
+}

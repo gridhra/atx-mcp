@@ -1,0 +1,15 @@
+{
+  "id": "t06_idempotent_reapply",
+  "prompt": "この写真を16:9にクロップして、幅1200にリサイズして。適用したら、念のため同じ操作をもう一度apply_transformで実行して、重複したrevisionが増えていないことを確認して。",
+  "input_fixture": "tests/fixtures/synthetic_scene.jpg",
+  "success_criteria": {
+    "expect_revision": {
+      "width": 1200,
+      "aspect_ratio": "16:9",
+      "recipe_contains_ops": ["crop", "resize"],
+      "min_matches": 1,
+      "max_derived_total": 1
+    }
+  },
+  "max_turns": 8
+}

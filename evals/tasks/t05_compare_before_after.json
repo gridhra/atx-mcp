@@ -1,0 +1,12 @@
+{
+  "id": "t05_compare_before_after",
+  "prompt": "この写真にセピア調のカラーマトリックスをかけたい。適用前にcompare_revisionsで元画像と見た目の違いを確認してから、正式にapply_transformして確定させて。",
+  "input_fixture": "tests/fixtures/synthetic_scene.jpg",
+  "success_criteria": {
+    "expect_revision": {
+      "recipe_contains_ops": ["color_matrix"],
+      "min_matches": 1
+    }
+  },
+  "max_turns": 8
+}

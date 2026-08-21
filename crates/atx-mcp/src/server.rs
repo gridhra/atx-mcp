@@ -15,9 +15,10 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 
 use crate::tools::{
     ApplyTransformOutput, AtxTools, CompareRevisionsOutput, CompareRevisionsParams,
-    DetectTiltOutput, DetectTiltParams, ExportAssetOutput, ExportAssetParams, ImportAssetParams,
-    ImportOutput, InspectOutput, ListAssetsOutput, ListAssetsParams, RenderPreviewOutput,
-    RenderPreviewParams, RevisionParams, TransformParams,
+    DetectTiltOutput, DetectTiltParams, ExplainOperationOutput, ExplainOperationParams,
+    ExportAssetOutput, ExportAssetParams, ImportAssetParams, ImportOutput, InspectOutput,
+    ListAssetsOutput, ListAssetsParams, ListOperationsOutput, ListOperationsParams,
+    RenderPreviewOutput, RenderPreviewParams, RevisionParams, TransformParams,
 };
 
 /// ホスト AI 向けの使い方。initialize の `instructions` として返す。
@@ -30,7 +31,6 @@ Model of the world
 
 Recipe DSL
 A recipe is {"operations": [ ... ]}, applied strictly in order, with at most one "encode" which must be last.
-Operations: auto_orient | rotate | crop | resize | adjust | strip_metadata | encode.
 Example:
 {"operations": [
   {"op": "rotate", "angle_degrees": -1.8, "crop": "largest_inscribed_rect"},
@@ -41,7 +41,16 @@ Example:
 ]}
 EXIF orientation is always normalized into the pixels at decode time, so auto_orient is an explicit no-op.
 
+Discovering the vocabulary (the ops are deliberately NOT enumerated in the tool schemas)
+- list_operations  - compact catalog of every operation (name, one-line summary, parameter names with type/range hints) plus the built-in preset names. Start here.
+- explain_operation - full parameter table, worked examples and gotchas for one operation.
+Errors are teachers: an invalid recipe or an unknown name comes back with the valid values and a recovery step, so one extra round trip is enough to fix it.
+
+Presets (the compressed layer of the same language)
+apply_transform and render_preview accept either `recipe` (the raw DSL) or `preset` (a built-in named recipe such as web_optimize); they are mutually exclusive and exactly one is required. A preset is pure sugar: it resolves to its recipe and flows through the normal pipeline, and the recipe_hash / idempotency key is computed on the RESOLVED recipe, so a preset call and the equivalent raw recipe land on the same revision. Drop down to a raw recipe whenever you need precise control.
+
 Recommended flow
+0. list_operations / explain_operation - look up the recipe vocabulary on demand (or pick a preset).
 1. import_asset  - bring a local file into the workspace, get a revision_id.
 2. inspect_image - dimensions, format, EXIF summary, GPS/PII flag, byte size.
 3. detect_tilt   - read-only tilt candidates with a confidence. It never applies anything; a null angle means "do not correct".
@@ -140,8 +149,58 @@ impl AtxServer {
         self.tools.detect_tilt(&params)
     }
 
+    /// Compact catalog of the recipe vocabulary: every operation with a one-line
+    /// description and its parameter names with terse type/range hints, plus the
+    /// built-in preset names. Optional `category` ("geometry" | "color" | "filter" |
+    /// "output") narrows the list. Call explain_operation for the full schema of one
+    /// operation. Read-only.
+    #[tool(
+        name = "list_operations",
+        output_schema = schema_for_output::<ListOperationsOutput>(),
+        annotations(
+            title = "List operations",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn list_operations(
+        &self,
+        Parameters(params): Parameters<ListOperationsParams>,
+    ) -> CallToolResult {
+        self.tools.list_operations(&params)
+    }
+
+    /// Full reference for one recipe operation: every parameter with its type, range,
+    /// required/default status and semantics, one or two ready-to-paste JSON examples,
+    /// and the gotchas worth knowing before using it. An unknown name returns a
+    /// structured error listing every valid operation. Read-only.
+    #[tool(
+        name = "explain_operation",
+        output_schema = schema_for_output::<ExplainOperationOutput>(),
+        annotations(
+            title = "Explain operation",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn explain_operation(
+        &self,
+        Parameters(params): Parameters<ExplainOperationParams>,
+    ) -> CallToolResult {
+        self.tools.explain_operation(&params)
+    }
+
     /// Apply a transform recipe at full resolution and issue a new revision.
-    /// Idempotent: the same (revision_id, recipe) returns the existing derived revision.
+    /// Pass either `recipe` ({"operations": [...]}, applied in order, at most one
+    /// "encode" and it must be last) or `preset` (a built-in named recipe) - exactly
+    /// one of the two. Call list_operations for the operation catalog and the preset
+    /// names, explain_operation for one operation's full schema.
+    /// Idempotent: the same (revision_id, resolved recipe) returns the existing derived
+    /// revision; a preset hashes identically to the equivalent raw recipe.
     /// Note: if the recipe's encode format is png, webp, or avif, any ICC color profile
     /// on the source is dropped (embedding is only supported for jpeg output); this is
     /// reported as a warning, not an error.
@@ -165,6 +224,7 @@ impl AtxServer {
 
     /// Render a recipe as a small JPEG preview (long edge <= 768) and return it inline
     /// plus a file path, so the composition can be checked before committing to apply_transform.
+    /// Takes either `recipe` or `preset`, exactly like apply_transform.
     /// Optional `overlay` ("grid" | "thirds" | "horizon") draws semi-transparent composition
     /// guide lines on the returned preview only (never on the apply_transform output).
     /// Note: if the recipe's encode format is png, webp, or avif, any ICC color profile

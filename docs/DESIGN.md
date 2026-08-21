@@ -294,3 +294,16 @@ v1 のオペレーション: `auto_orient` / `rotate` / `crop`(aspect_ratio or �
     決定論的に再生成でき、第三者・個人の写真素材はリポジトリに含めない。
     エンジン挙動は不変なので `ENGINE_VERSION` は据え置き、ゴールデン出力 sha256 のみ
     新フィクスチャに対して張り直した(`bc05827c…`)。
+
+### 9.3 v0.2 追補(2026-08-21)
+
+- op を 7→14 に拡張: `perspective`(quad / キーストーン角、変換追跡は 3x3 射影行列へ拡張)、
+  `color_matrix`(4×5)、`curves`(Fritsch–Carlson 単調3次 → 256 LUT)、`levels`、
+  `blur` / `median` / `unsharp_mask`(ガウスカーネルは f64 生成 → 1e-6 量子化で libm 差遮断)
+- ツールを 8→10 に拡張(語彙参照系): `list_operations` / `explain_operation`。
+  §4 の表は v1 時点の記録として残し、現行のツール一覧は README とコード(vocab.rs)を正とする
+- `apply_transform` / `render_preview` に `preset`(recipe と排他)。同梱プリセット5種
+  (presets/)。冪等性キーは解決後レシピの hash
+- evals/ にエージェント eval ハーネス(実務タスク10本、リリース前の手動ゲート)
+- tests/f32_spike.rs: Phase B 前提の f32 クロスプラットフォーム決定論スパイク
+  (CI 両アームの green で実証完了となる)

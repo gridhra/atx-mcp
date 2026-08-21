@@ -1,0 +1,11 @@
+{
+  "name": "eyecatch_16_9",
+  "description": "Article eyecatch: center-crop 16:9, 1600px wide, WebP q82.",
+  "recipe": {
+    "operations": [
+      { "op": "crop", "aspect_ratio": "16:9", "anchor": "center" },
+      { "op": "resize", "width": 1600, "fit": "cover", "without_enlargement": true },
+      { "op": "encode", "format": "webp", "quality": 82 }
+    ]
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "id": "t01_straighten_eyecatch",
+  "prompt": "この写真をまっすぐにして16:9のアイキャッチにして。1600px幅、WebPで書き出して。",
+  "input_fixture": "tests/fixtures/synthetic_scene.jpg",
+  "success_criteria": {
+    "expect_revision": {
+      "mime_type": "image/webp",
+      "width": 1600,
+      "aspect_ratio": "16:9",
+      "recipe_contains_ops": ["rotate", "crop", "resize", "encode"],
+      "min_matches": 1
+    }
+  },
+  "max_turns": 8
+}

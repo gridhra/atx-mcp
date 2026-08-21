@@ -1,0 +1,13 @@
+{
+  "id": "t09_preset_use",
+  "prompt": "この写真を「eyecatch_16_9」プリセットで仕上げて。プリセット名がわからなければlist_operations等で語彙を確認してから使って。",
+  "input_fixture": "tests/fixtures/synthetic_scene.jpg",
+  "success_criteria": {
+    "expect_revision": {
+      "aspect_ratio": "16:9",
+      "recipe_contains_ops": ["crop"],
+      "min_matches": 1
+    }
+  },
+  "max_turns": 6
+}

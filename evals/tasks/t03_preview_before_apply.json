@@ -1,0 +1,14 @@
+{
+  "id": "t03_preview_before_apply",
+  "prompt": "この写真を横長16:9にトリミングしたい。本番適用の前に、まずrender_previewで構図を見せて。それで良さそうなら、そのままapply_transformまで実行して。",
+  "input_fixture": "tests/fixtures/synthetic_scene.jpg",
+  "success_criteria": {
+    "expect_revision": {
+      "aspect_ratio": "16:9",
+      "recipe_contains_ops": ["crop"],
+      "min_matches": 1,
+      "max_derived_total": 1
+    }
+  },
+  "max_turns": 10
+}

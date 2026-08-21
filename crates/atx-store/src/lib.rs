@@ -138,9 +138,8 @@ impl AssetStore {
             if line.trim().is_empty() {
                 continue;
             }
-            let revision: AssetRevision = serde_json::from_str(&line).map_err(|e| {
-                StoreError::LedgerCorrupted(format!("line {}: {}", idx + 1, e))
-            })?;
+            let revision: AssetRevision = serde_json::from_str(&line)
+                .map_err(|e| StoreError::LedgerCorrupted(format!("line {}: {}", idx + 1, e)))?;
             out.push(revision);
         }
         Ok(out)
@@ -152,8 +151,8 @@ impl AssetStore {
             .create(true)
             .append(true)
             .open(self.ledger_path())?;
-        let mut line = serde_json::to_string(revision)
-            .expect("AssetRevision serialization never fails");
+        let mut line =
+            serde_json::to_string(revision).expect("AssetRevision serialization never fails");
         line.push('\n');
         file.write_all(line.as_bytes())?;
         file.flush()?;

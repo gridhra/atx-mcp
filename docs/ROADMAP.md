@@ -113,3 +113,93 @@ Adobe の強さの一半は既存アセット(フィルタ・プリセット・L
 ## 優先順位の考え方
 
 コンテンツメディア制作の実需(本プロジェクトの原点)から見ると、価値の 8 割は Phase A+C(全体調整 + 部分調整)で出る。Phase D は「Photoshop 完備」の看板に必要だが、実務投入は A→B→C の順で回収しながら進める。
+
+---
+
+## リリース計画への具体化(2026-08-21)
+
+フェーズ A〜E を、リリース単位の作業パッケージに分解する。原則:
+**1リリース = 1つの設計判断 + 数個の op 群**。破壊的変更は v0.4 の1回に集約する。
+
+### v0.2 — 調整系の第一波 + 語彙参照ツール(Phase A 前半)
+
+- op 追加: `perspective`(4点指定 or 縦/横キーストーン角。実運用 FB P4)、
+  `color_matrix`(4×5 行列 = セピア/白黒/色相回転/チャンネルミキサーのメタ op)、
+  `curves`(チャンネル別制御点、単調3次補間 → 256 LUT)、`levels`(curves の糖衣)、
+  `blur`(gaussian σ)、`median`、`unsharp_mask`(amount/radius/threshold)
+- ツール追加(語彙参照系、Agent UX 規律 #2): `list_operations` / `explain_operation`。
+  **op 数が2桁に乗る前に必須**(inputSchema 肥大によるトークン費防止)
+- ビルトインプリセット v0: `presets/` に名前付きレシピ(eyecatch_16_9 等)を同梱し、
+  apply_transform が `preset` 名を受けられるようにする
+- エージェント eval ハーネス v0: 実務タスク 10 本(実運用 FB 由来)+ headless 実行スクリプト
+  + 成功率/往復数の記録。リリース前ゲートとして手動実行
+
+### v0.3 — データ資産の取り込み口(Phase A 後半)
+
+- op 追加: `lut`(.cube 1D/3D、四面体補間)、`white_balance`(色温度/ティント)、
+  `hsl`(8色相域別の H/S/L シフト = Lightroom HSL パネル)、`convolve`(任意カーネル ≤9×9)
+- **設計判断(このリリースの本丸)**: レシピからの他アセット参照。
+  .cube ファイルを `import_asset` でストアに入れ、`{"op":"lut","lut_revision_id":"rev_..."}`
+  と参照する。ハッシュには参照 revision id を含める(revision は不変なので決定論は保たれる)。
+  この「レシピ → アセット参照」パターンは v0.5 のマスク参照の先行実装になる
+- プリセットパック第1弾(フィルム風/EC商品/アイキャッチ各数種)を .cube + レシピで
+
+### v0.4 — 画素エンジン v2(Phase B。唯一の破壊的リリース)
+
+- 内部表現を f32 リニアライトへ。入口 sRGB EOTF → 作業空間、出口で逆変換。
+  `ENGINE_VERSION = "atx-core/2"`、v1 ゴールデンは凍結アーカイブ
+- **最大の技術リスク: f32 のクロスプラットフォーム決定論**。対策を先に規約化する:
+  - トーン系は f64 で固定アルゴリズム計算した 65536 エントリ LUT 経由(libm 差を遮断)
+  - 幾何補間は明示的丸め、SIMD 自動ベクトル化に依存する reassociation を禁止
+  - CI の mac/Linux 両アームでゴールデン一致を必須ゲート化
+  - **v0.2 期間中に小さな f32 パイプラインの spike を作り、両 OS 一致を先に実証する**
+    (ここが崩れると Phase B 全体の工法を変える必要があるため、最優先の検証項目)
+- 16bit I/O(PNG16)、`lcms2` feature flag(ICC 変換の実体化)
+
+### v0.5 — マスクと局所適用(Phase C)
+
+- マスク = グレースケール revision(v0.3 の参照パターンを再利用)
+- 調整系 op 全てに `mask: {revision_id, invert?, feather_px?}` を追加
+- 新ツール `generate_mask`(検出系/生成系): linear_gradient / radial_gradient /
+  luminosity_range / color_range。決定論的
+- `render_preview` に `overlay: "mask"`(マスク可視化)
+- ML マスク(被写体/空)は **v0.5 に含めない**。onnxruntime + モデル配布の設計
+  (サイズ・ライセンス・決定論)が別問題なので、需要を見て C2 として切り出す
+
+### v0.6 — レイヤーグラフ前半(Phase D)
+
+- レシピ DSL v2: `recipe_version: 2`、`layers: [{source, ops, mask, blend_mode, opacity}]`。
+  v1 レシピは「1レイヤー」として無損失に読み込み(ハッシュは世代分離)
+- ブレンドモード separable 系 12 種(W3C compositing 仕様値でゴールデン検証)
+
+### v0.7 — レイヤーグラフ後半(Phase D 完)
+
+- 非 separable 系(hue/saturation/color/luminosity)
+- `clone` / `heal`(PatchMatch、シード・反復固定で決定論)
+- `compare_revisions` に diff モード(差分ヒートマップ)
+
+### v0.8+ — 入出力の翼(Phase E、需要駆動)
+
+RAW(rawler)→ レンズ補正(lensfun DB)→ PSD 読み → resvg 焼き込み → LUT 書き出し。
+順序は実利用の要望順で入れ替え可。
+
+### v1.0 の定義
+
+- 完備性3条件(§冒頭)を満たす
+- eval スイート(その時点で 20+ タスク)成功率 ≥ 規定値
+- 全 op にゴールデン + proptest、クロスプラットフォーム決定論 CI ゲート
+
+### 横断リスクと先行検証
+
+| リスク | 影響 | 先行検証 |
+|---|---|---|
+| f32 クロスプラットフォーム決定論 | Phase B 以降全部 | v0.2 中に spike(最優先) |
+| レシピの他アセット参照設計 | LUT・マスク・レイヤー | v0.3 で小さく確立 |
+| スキーマ肥大によるトークン費 | Agent UX | v0.2 の語彙参照ツールで先回り |
+| op 量産時の品質劣化 | 全 op | op 仕様テンプレ(仕様→実装+ゴールデン+proptest)で工場化 |
+
+### 体制運用
+
+各リリースは今回と同じ工法で回す: 司令塔が設計判断と op 仕様書を確定 →
+Opus/Sonnet に op 単位で並列委譲(仕様テンプレ準拠)→ 統合確認 → eval → タグ。
+op 実装は互いに独立性が高く、1リリースあたりの並列度はさらに上げられる。
