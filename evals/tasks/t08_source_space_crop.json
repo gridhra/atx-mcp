@@ -1,0 +1,15 @@
+{
+  "id": "t08_source_space_crop",
+  "prompt": "この写真、まず-1.8度くらいの回転で傾きを補正してから、元画像(回転前・EXIF正規化前)のピクセル座標で x=100, y=100, width=800, height=600 の範囲を切り出したい。crop opのcoordinate_spaceにsourceを指定して。",
+  "input_fixture": "tests/fixtures/synthetic_scene.jpg",
+  "success_criteria": {
+    "expect_revision": {
+      "recipe_contains_ops": [
+        { "op": "rotate" },
+        { "op": "crop", "fields": { "coordinate_space": "source" } }
+      ],
+      "min_matches": 1
+    }
+  },
+  "max_turns": 8
+}

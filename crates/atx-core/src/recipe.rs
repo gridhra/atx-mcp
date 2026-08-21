@@ -80,6 +80,68 @@ pub enum Operation {
         #[serde(default)]
         sharpness: f64,
     },
+    /// 遠近(台形/キーストーン)補正。`quad` または `vertical_degrees`/`horizontal_degrees`
+    /// のどちらか一方の形式で指定する(排他)。射影変換のため、これ以降
+    /// `coordinate_space: "source"` の crop は射影行列経由で写像される。
+    Perspective {
+        /// 入力画像内の四角形(tl, tr, br, bl の順、ピクセル座標)。
+        /// この四角形が出力の長方形になるよう補正する。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quad: Option<[[f64; 2]; 4]>,
+        /// 縦キーストーン角(度)。正 = 上辺が奥(上すぼまりを補正)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vertical_degrees: Option<f64>,
+        /// 横キーストーン角(度)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        horizontal_degrees: Option<f64>,
+        /// 余白色(CSS hex)。省略時は白。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pad_color: Option<String>,
+    },
+    /// 4×5 カラー行列(行優先、R'G'B'A' = M·[R G B A 1])。0..1 正規化値に対して適用し、
+    /// 結果はクランプ。セピア・白黒・色相回転・チャンネルミキサーのメタ op。
+    ColorMatrix {
+        /// 長さ 20(4行 × 5列)。
+        matrix: Vec<f64>,
+    },
+    /// チャンネル別トーンカーブ。制御点 [x, y](0-255)列を単調3次補間し 256 LUT 化。
+    /// master は RGB 共通(適用順: master → 各チャンネル)。
+    Curves {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        master: Option<Vec<[u8; 2]>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        red: Option<Vec<[u8; 2]>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        green: Option<Vec<[u8; 2]>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blue: Option<Vec<[u8; 2]>>,
+    },
+    /// レベル補正(master のみ)。内部的には curves 相当の 256 LUT に落ちる。
+    Levels {
+        #[serde(default)]
+        in_black: u8,
+        #[serde(default = "default_255")]
+        in_white: u8,
+        /// 0.1..=10.0。1.0 = 変更なし。
+        #[serde(default = "default_gamma")]
+        gamma: f64,
+        #[serde(default)]
+        out_black: u8,
+        #[serde(default = "default_255")]
+        out_white: u8,
+    },
+    /// ガウスぼかし。sigma は 0.1..=100.0。
+    Blur { sigma: f64 },
+    /// メディアンフィルタ。radius は 1..=16。
+    Median { radius: u32 },
+    /// アンシャープマスク。amount 0.0..=4.0、radius(gaussian σ)0.1..=50.0、
+    /// threshold は輝度差がこの値以下の画素を保護。
+    UnsharpMask {
+        amount: f64,
+        radius: f64,
+        #[serde(default)]
+        threshold: u8,
+    },
     /// 出力エンコード指定。レシピ内で最後に1回のみ許可。省略時は入力フォーマット維持。
     Encode {
         format: OutputFormat,
@@ -94,6 +156,14 @@ pub enum Operation {
         #[serde(default)]
         scope: StripScope,
     },
+}
+
+fn default_255() -> u8 {
+    255
+}
+
+fn default_gamma() -> f64 {
+    1.0
 }
 
 fn default_true() -> bool {
@@ -311,6 +381,42 @@ pub fn validate(recipe: &TransformRecipe) -> crate::Result<()> {
     for (index, op) in recipe.operations.iter().enumerate() {
         match op {
             Operation::AutoOrient | Operation::StripMetadata { .. } => {}
+            // v0.2 で追加された op の静的検証は各実装モジュールに委譲する。
+            Operation::Perspective {
+                quad,
+                vertical_degrees,
+                horizontal_degrees,
+                pad_color,
+            } => crate::ops::perspective::validate(
+                index,
+                quad,
+                vertical_degrees,
+                horizontal_degrees,
+                pad_color,
+            )?,
+            Operation::ColorMatrix { matrix } => crate::ops::color::validate_matrix(index, matrix)?,
+            Operation::Curves {
+                master,
+                red,
+                green,
+                blue,
+            } => crate::ops::color::validate_curves(index, master, red, green, blue)?,
+            Operation::Levels {
+                in_black,
+                in_white,
+                gamma,
+                out_black,
+                out_white,
+            } => crate::ops::color::validate_levels(
+                index, *in_black, *in_white, *gamma, *out_black, *out_white,
+            )?,
+            Operation::Blur { sigma } => crate::ops::blur::validate_blur(index, *sigma)?,
+            Operation::Median { radius } => crate::ops::blur::validate_median(index, *radius)?,
+            Operation::UnsharpMask {
+                amount,
+                radius,
+                threshold,
+            } => crate::ops::blur::validate_unsharp(index, *amount, *radius, *threshold)?,
             Operation::Rotate { angle_degrees, .. } => {
                 if !angle_degrees.is_finite() || !(-360.0..=360.0).contains(angle_degrees) {
                     return Err(InvalidRecipe(format!(

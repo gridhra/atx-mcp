@@ -66,8 +66,13 @@ pub struct DetectTiltParams {
 pub struct TransformParams {
     /// 入力 revision ID("rev_...")。
     pub revision_id: String,
-    /// 変換レシピ。`{"operations": [...]}`。
-    pub recipe: TransformRecipe,
+    /// 変換レシピ。`{"operations": [...]}`。`preset` とはどちらか一方のみ指定する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<TransformRecipe>,
+    /// ビルトインプリセット名(`list_operations` の presets セクション参照)。
+    /// 指定するとそのプリセットのレシピが使われる。`recipe` とは排他。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
 }
 
 /// `render_preview` の引数(`TransformParams` に guide overlay を足したもの)。
@@ -75,12 +80,31 @@ pub struct TransformParams {
 pub struct RenderPreviewParams {
     /// 入力 revision ID("rev_...")。
     pub revision_id: String,
-    /// 変換レシピ。`{"operations": [...]}`。
-    pub recipe: TransformRecipe,
+    /// 変換レシピ。`{"operations": [...]}`。`preset` とはどちらか一方のみ指定する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<TransformRecipe>,
+    /// ビルトインプリセット名。`recipe` とは排他。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
     /// 構図確認用のガイド線。`"grid"`(1/8 刻みの格子)| `"thirds"`(三分割法)|
     /// `"horizon"`(1/12 刻みの水平線のみ、傾き目視用)。省略時はガイドなし。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay: Option<String>,
+}
+
+/// `list_operations` の引数。
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+pub struct ListOperationsParams {
+    /// 絞り込む分類(`"geometry"` | `"color"` | `"filter"` | `"output"`)。省略時は全件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+}
+
+/// `explain_operation` の引数。
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct ExplainOperationParams {
+    /// 説明したい op 名(`{"op": "..."}` に書く名前)。
+    pub operation: String,
 }
 
 /// `compare_revisions` のレイアウト。
@@ -262,6 +286,57 @@ pub struct CompareRevisionsOutput {
 pub struct ListAssetsOutput {
     pub count: usize,
     pub revisions: Vec<RevisionSummary>,
+}
+
+/// `list_operations` のカタログ1行。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct OperationCatalogEntry {
+    pub name: String,
+    pub category: String,
+    pub summary: String,
+    /// `"name*: type range"`(`*` = 必須、`=x` = 既定値、`?` = 任意)の簡潔な列。
+    pub params: Vec<String>,
+}
+
+/// プリセットのカタログ1行。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PresetCatalogEntry {
+    pub name: String,
+    pub description: String,
+}
+
+/// `list_operations` の structuredContent。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ListOperationsOutput {
+    pub count: usize,
+    pub operations: Vec<OperationCatalogEntry>,
+    /// ビルトインプリセット(`apply_transform` / `render_preview` の `preset` に渡せる名前)。
+    pub presets: Vec<PresetCatalogEntry>,
+    /// 次の一手(完全なスキーマは explain_operation)。
+    pub next: String,
+}
+
+/// `explain_operation` のパラメータ1行。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ExplainParamEntry {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_hint: String,
+    /// `"required"` | `"optional"` | `"default: ..."`。
+    pub requirement: String,
+    pub semantics: String,
+}
+
+/// `explain_operation` の structuredContent。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ExplainOperationOutput {
+    pub name: String,
+    pub category: String,
+    pub summary: String,
+    pub params: Vec<ExplainParamEntry>,
+    /// そのまま `operations` に入れられる JSON 断片(文字列)。
+    pub examples: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 /// `export_asset` の structuredContent。
@@ -615,15 +690,188 @@ impl AtxTools {
         )
     }
 
+    // -- 3b. list_operations ------------------------------------------------
+
+    /// レシピ語彙の軽量カタログを返す(read-only)。
+    ///
+    /// ROADMAP §Agent UX #2「語彙の段階的開示」: `apply_transform` の inputSchema に
+    /// 全 op を埋め込まず、必要になった時だけこのツールで一覧を取る。
+    /// 完全なパラメータ表・例・注意点は `explain_operation` 側。
+    pub fn list_operations(&self, params: &ListOperationsParams) -> CallToolResult {
+        if let Some(category) = params.category.as_deref() {
+            if !crate::vocab::CATEGORIES.contains(&category) {
+                return tool_error(
+                    "invalid_category",
+                    format!(
+                        "unknown category {category:?}; valid values are {:?}",
+                        crate::vocab::CATEGORIES
+                    ),
+                    serde_json::json!({
+                        "given": category,
+                        "valid_values": crate::vocab::CATEGORIES,
+                        "recovery": "call list_operations again with category omitted or one of the valid values",
+                    }),
+                );
+            }
+        }
+
+        let selected: Vec<&'static crate::vocab::OpDoc> = crate::vocab::OPERATIONS
+            .iter()
+            .filter(|op| match params.category.as_deref() {
+                Some(category) => op.category == category,
+                None => true,
+            })
+            .collect();
+
+        let entries: Vec<OperationCatalogEntry> = selected
+            .iter()
+            .map(|op| OperationCatalogEntry {
+                name: op.name.to_string(),
+                category: op.category.to_string(),
+                summary: op.summary.to_string(),
+                params: op.params.iter().map(|p| p.compact()).collect(),
+            })
+            .collect();
+
+        let presets: Vec<PresetCatalogEntry> = crate::presets::all()
+            .into_iter()
+            .map(|p| PresetCatalogEntry {
+                name: p.name,
+                description: p.description,
+            })
+            .collect();
+
+        let mut text = format!(
+            "{} recipe operations{} (params: name* = required, name? = optional, =x or (def) = default):",
+            entries.len(),
+            match params.category.as_deref() {
+                Some(c) => format!(" in category {c}"),
+                None => String::new(),
+            }
+        );
+        for entry in &entries {
+            text.push_str(&format!(
+                "\n- {} [{}] {}{}",
+                entry.name,
+                entry.category,
+                entry.summary,
+                if entry.params.is_empty() {
+                    String::new()
+                } else {
+                    format!(" | {}", entry.params.join(", "))
+                }
+            ));
+        }
+        if !presets.is_empty() {
+            text.push_str("\nPresets (pass preset=<name> instead of recipe):");
+            for preset in &presets {
+                text.push_str(&format!("\n- {}: {}", preset.name, preset.description));
+            }
+        }
+        let next =
+            "call explain_operation {\"operation\":\"<name>\"} for full params, examples and gotchas".to_string();
+        text.push_str(&format!("\n{next}."));
+
+        ok_result(
+            text,
+            &ListOperationsOutput {
+                count: entries.len(),
+                operations: entries,
+                presets,
+                next,
+            },
+        )
+    }
+
+    // -- 3c. explain_operation ----------------------------------------------
+
+    /// 1つの op の完全な仕様(パラメータ表・例・落とし穴)を返す(read-only)。
+    pub fn explain_operation(&self, params: &ExplainOperationParams) -> CallToolResult {
+        let doc = match crate::vocab::find(params.operation.trim()) {
+            Some(doc) => doc,
+            None => {
+                let valid = crate::vocab::operation_names();
+                let suggestions = crate::vocab::did_you_mean(&params.operation);
+                return tool_error(
+                    "unknown_operation",
+                    format!(
+                        "unknown operation {:?}; valid operations are {}",
+                        params.operation,
+                        valid.join(", ")
+                    ),
+                    serde_json::json!({
+                        "given": params.operation,
+                        "valid_values": valid,
+                        "did_you_mean": suggestions,
+                        "recovery": "call explain_operation again with one of valid_values, or list_operations for the catalog",
+                    }),
+                );
+            }
+        };
+
+        let param_entries: Vec<ExplainParamEntry> = doc
+            .params
+            .iter()
+            .map(|p| ExplainParamEntry {
+                name: p.name.to_string(),
+                type_hint: p.type_hint.to_string(),
+                requirement: p.requirement.to_string(),
+                semantics: p.semantics.to_string(),
+            })
+            .collect();
+
+        let mut text = format!("{} [{}] — {}\n", doc.name, doc.category, doc.summary);
+        if param_entries.is_empty() {
+            text.push_str("Parameters: none.\n");
+        } else {
+            text.push_str("Parameters:\n");
+            for p in &param_entries {
+                text.push_str(&format!(
+                    "- {} ({}, {}): {}\n",
+                    p.name, p.type_hint, p.requirement, p.semantics
+                ));
+            }
+        }
+        text.push_str("Examples (drop straight into \"operations\"):\n");
+        for example in doc.examples {
+            text.push_str(&format!("- {example}\n"));
+        }
+        if !doc.warnings.is_empty() {
+            text.push_str("Watch out:\n");
+            for warning in doc.warnings {
+                text.push_str(&format!("- {warning}\n"));
+            }
+        }
+
+        ok_result(
+            text.trim_end(),
+            &ExplainOperationOutput {
+                name: doc.name.to_string(),
+                category: doc.category.to_string(),
+                summary: doc.summary.to_string(),
+                params: param_entries,
+                examples: doc.examples.iter().map(|e| e.to_string()).collect(),
+                warnings: doc.warnings.iter().map(|w| w.to_string()).collect(),
+            },
+        )
+    }
+
     // -- 4. apply_transform -------------------------------------------------
 
     /// レシピを高解像度で適用し、新しい revision を発行する。
     ///
     /// 冪等性: `(source_revision_id, recipe_hash)` が台帳に既存なら、
     /// 変換自体を走らせずに既存 revision を返す(ショートサーキット)。
+    ///
+    /// `preset` を渡した場合は解決後のレシピがそのまま以降の処理に流れる
+    /// (= `recipe_hash` は解決後のレシピに対して計算される。プリセットは純粋な糖衣)。
     pub fn apply_transform(&self, params: &TransformParams) -> CallToolResult {
-        tri!(atx_core::recipe::validate(&params.recipe), atx_error);
-        let recipe_hash = tri!(atx_core::recipe_hash(&params.recipe), atx_error);
+        let recipe = match resolve_recipe(params.recipe.as_ref(), params.preset.as_deref()) {
+            Ok(recipe) => recipe,
+            Err(result) => return result,
+        };
+        tri!(atx_core::recipe::validate(&recipe), atx_error);
+        let recipe_hash = tri!(atx_core::recipe_hash(&recipe), atx_error);
         let source = tri!(self.store.get_revision(&params.revision_id), store_error);
 
         // --- 冪等ショートサーキット: 既存派生があれば再変換しない ---
@@ -654,13 +902,13 @@ impl AtxTools {
 
         let bytes = tri!(self.store.read_bytes(&params.revision_id), store_error);
         let output = tri!(
-            atx_core::apply_recipe(&bytes, &params.recipe, &self.limits),
+            atx_core::apply_recipe(&bytes, &recipe, &self.limits),
             atx_error
         );
         let revision = tri!(
             self.store.record_derivation(
                 &source.revision_id,
-                &params.recipe,
+                &recipe,
                 &recipe_hash,
                 &output.bytes,
                 &output.mime_type,
@@ -671,7 +919,8 @@ impl AtxTools {
         );
         let summary = RevisionSummary::new(&self.store, &revision);
         let text = format!(
-            "Applied recipe to {} -> {} ({}x{} {}, {} bytes){}\npath: {}",
+            "Applied {}recipe to {} -> {} ({}x{} {}, {} bytes){}\npath: {}",
+            preset_note(params.preset.as_deref()),
             params.revision_id,
             summary.revision_id,
             summary.width,
@@ -710,14 +959,16 @@ impl AtxTools {
     /// `apply_transform` と同等の画素処理コストがかかる。
     /// 代わりに「プレビューで見た構図 = 本適用の構図」が厳密に一致する。
     pub fn render_preview(&self, params: &RenderPreviewParams) -> CallToolResult {
-        tri!(atx_core::recipe::validate(&params.recipe), atx_error);
+        let recipe = match resolve_recipe(params.recipe.as_ref(), params.preset.as_deref()) {
+            Ok(recipe) => recipe,
+            Err(result) => return result,
+        };
+        tri!(atx_core::recipe::validate(&recipe), atx_error);
         if let Some(overlay) = params.overlay.as_deref() {
             if !OVERLAY_VALUES.contains(&overlay) {
                 return tool_error(
                     "invalid_overlay",
-                    format!(
-                        "unknown overlay {overlay:?}; valid values are {OVERLAY_VALUES:?}"
-                    ),
+                    format!("unknown overlay {overlay:?}; valid values are {OVERLAY_VALUES:?}"),
                     serde_json::json!({
                         "given": overlay,
                         "valid_values": OVERLAY_VALUES,
@@ -726,11 +977,12 @@ impl AtxTools {
                 );
             }
         }
-        // 冪等キーはユーザレシピのハッシュ(プレビュー用に差し替えた encode は含めない)。
-        let recipe_hash = tri!(atx_core::recipe_hash(&params.recipe), atx_error);
+        // 冪等キーは(プリセット解決後の)ユーザレシピのハッシュ。
+        // プレビュー用に差し替えた encode は含めない。
+        let recipe_hash = tri!(atx_core::recipe_hash(&recipe), atx_error);
         tri!(self.store.get_revision(&params.revision_id), store_error);
 
-        let preview_recipe = preview_recipe_of(&params.recipe);
+        let preview_recipe = preview_recipe_of(&recipe);
         let bytes = tri!(self.store.read_bytes(&params.revision_id), store_error);
         let output = tri!(
             atx_core::apply_recipe(&bytes, &preview_recipe, &self.limits),
@@ -742,14 +994,13 @@ impl AtxTools {
         // #FF3355 を ~60% 不透明度でブレンドする(実装が単純で、どんな背景でも
         // 見失いにくいため。per-pixel 適応は今回は見送った)。
         let final_bytes = match params.overlay.as_deref() {
-            Some(overlay) => tri!(
-                draw_overlay_jpeg(&output.bytes, overlay),
-                |e: String| tool_error(
+            Some(overlay) => tri!(draw_overlay_jpeg(&output.bytes, overlay), |e: String| {
+                tool_error(
                     "overlay_render_failed",
                     format!("failed to draw overlay {overlay:?}: {e}"),
                     serde_json::Value::Null,
                 )
-            ),
+            }),
             None => output.bytes.clone(),
         };
 
@@ -761,8 +1012,9 @@ impl AtxTools {
         let path = path.to_string_lossy().into_owned();
 
         let text = format!(
-            "Preview of {} with this recipe: {}x{} jpeg ({} bytes, long edge <= {}).{} This is a downscaled proof; call apply_transform with the same recipe for the full-resolution revision.{}\npath: {}",
+            "Preview of {} with this {}recipe: {}x{} jpeg ({} bytes, long edge <= {}).{} This is a downscaled proof; call apply_transform with the same recipe for the full-resolution revision.{}\npath: {}",
             params.revision_id,
+            preset_note(params.preset.as_deref()),
             output.width,
             output.height,
             final_bytes.len(),
@@ -833,16 +1085,15 @@ impl AtxTools {
         let scaled_b = scale_contain(img_b, COMPARE_LONG_EDGE).to_rgb8();
 
         let canvas = match params.layout {
-            CompareLayout::SideBySide => {
-                compose_side_by_side(&scaled_a, &scaled_b, COMPARE_GAP_PX)
-            }
+            CompareLayout::SideBySide => compose_side_by_side(&scaled_a, &scaled_b, COMPARE_GAP_PX),
             CompareLayout::Stacked => compose_stacked(&scaled_a, &scaled_b, COMPARE_GAP_PX),
         };
         let (cw, ch) = canvas.dimensions();
-        let composed_bytes = tri!(
-            encode_jpeg_q80(&canvas),
-            |e: String| tool_error("encode_failed", format!("failed to encode comparison jpeg: {e}"), serde_json::Value::Null)
-        );
+        let composed_bytes = tri!(encode_jpeg_q80(&canvas), |e: String| tool_error(
+            "encode_failed",
+            format!("failed to encode comparison jpeg: {e}"),
+            serde_json::Value::Null
+        ));
 
         let key = compare_key(
             &params.revision_id_a,
@@ -1088,6 +1339,72 @@ fn fmt_angle(a: Option<f64>) -> String {
     }
 }
 
+/// `recipe` / `preset` のどちらか一方から、実際に適用するレシピを決める。
+///
+/// プリセットは**純粋な糖衣**である: 解決後は生レシピと完全に同じ経路を通り、
+/// `recipe_hash`(= 冪等キー)は**解決後のレシピ**に対して計算される。
+/// したがって `preset: "web_optimize"` と、その中身をそのまま書いた生レシピは
+/// 同じ revision に落ちる。
+fn resolve_recipe(
+    recipe: Option<&TransformRecipe>,
+    preset: Option<&str>,
+) -> Result<TransformRecipe, CallToolResult> {
+    match (recipe, preset) {
+        (Some(_), Some(preset)) => Err(tool_error(
+            "recipe_and_preset_conflict",
+            format!(
+                "recipe and preset are mutually exclusive, but both were given (preset {preset:?})"
+            ),
+            serde_json::json!({
+                "preset": preset,
+                "valid_presets": crate::presets::preset_names(),
+                "recovery": "call again with either recipe (a raw {\"operations\": [...]} DSL) or preset (a built-in name), not both",
+            }),
+        )),
+        (None, None) => Err(tool_error(
+            "recipe_or_preset_required",
+            "one of recipe or preset is required",
+            serde_json::json!({
+                "valid_presets": crate::presets::preset_names(),
+                "recovery": "pass recipe = {\"operations\": [...]} (call list_operations / explain_operation for the vocabulary), or preset = one of valid_presets",
+            }),
+        )),
+        (Some(recipe), None) => Ok(recipe.clone()),
+        (None, Some(name)) => match crate::presets::resolve(name) {
+            Ok(preset) => Ok(preset.recipe),
+            Err(crate::presets::PresetError::Unknown) => Err(tool_error(
+                "unknown_preset",
+                format!(
+                    "unknown preset {name:?}; valid presets are {}",
+                    crate::presets::preset_names().join(", ")
+                ),
+                serde_json::json!({
+                    "given": name,
+                    "valid_values": crate::presets::preset_names(),
+                    "recovery": "call list_operations to see the presets with their descriptions, then retry with one of valid_values (or pass a raw recipe instead)",
+                }),
+            )),
+            Err(crate::presets::PresetError::Malformed(reason)) => Err(tool_error(
+                "preset_malformed",
+                format!("built-in preset {name:?} could not be parsed: {reason}"),
+                serde_json::json!({
+                    "given": name,
+                    "reason": reason,
+                    "recovery": "this is a server bug; pass an explicit recipe instead",
+                }),
+            )),
+        },
+    }
+}
+
+/// テキストサマリ用: プリセット由来なら `"preset \"x\" "` を、生レシピなら空文字を返す。
+fn preset_note(preset: Option<&str>) -> String {
+    match preset {
+        Some(name) => format!("preset {name:?} "),
+        None => String::new(),
+    }
+}
+
 fn preview_recipe_of(recipe: &TransformRecipe) -> TransformRecipe {
     let mut operations: Vec<Operation> = recipe
         .operations
@@ -1229,7 +1546,10 @@ fn draw_overlay_jpeg(jpeg_bytes: &[u8], overlay: &str) -> Result<Vec<u8>, String
             (1..8u32).map(|i| w.saturating_mul(i) / 8).collect(),
         ),
         "thirds" => (vec![h / 3, (h * 2) / 3], vec![w / 3, (w * 2) / 3]),
-        "horizon" => ((1..12u32).map(|i| h.saturating_mul(i) / 12).collect(), Vec::new()),
+        "horizon" => (
+            (1..12u32).map(|i| h.saturating_mul(i) / 12).collect(),
+            Vec::new(),
+        ),
         other => return Err(format!("unknown overlay {other:?}")),
     };
 

@@ -1,0 +1,10 @@
+{
+  "name": "web_optimize",
+  "description": "Web delivery: fit inside 2000x2000 without upscaling, WebP q80.",
+  "recipe": {
+    "operations": [
+      { "op": "resize", "width": 2000, "height": 2000, "fit": "contain", "without_enlargement": true },
+      { "op": "encode", "format": "webp", "quality": 80 }
+    ]
+  }
+}

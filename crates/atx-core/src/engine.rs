@@ -283,6 +283,65 @@ pub fn apply_recipe(
             } => {
                 img = pixel_ops::adjust(&img, *brightness, *contrast, *saturation, *sharpness);
             }
+            Operation::Perspective {
+                quad,
+                vertical_degrees,
+                horizontal_degrees,
+                pad_color,
+            } => {
+                let (out, warns, step) = crate::ops::perspective::apply(
+                    &img,
+                    quad,
+                    vertical_degrees,
+                    horizontal_degrees,
+                    pad_color,
+                )
+                .map_err(|e| fail(e.to_string()))?;
+                img = out;
+                // 射影ステップ。これ以降 `coordinate_space: "source"` の矩形は
+                // 3x3 射影行列を経由して写像される(`crate::transform` 参照)。
+                xf = xf.then(step);
+                warnings.extend(
+                    warns
+                        .into_iter()
+                        .map(|w| format!("operations[{index}] (perspective): {w}")),
+                );
+            }
+            Operation::ColorMatrix { matrix } => {
+                img = crate::ops::color::color_matrix(&img, matrix);
+            }
+            Operation::Curves {
+                master,
+                red,
+                green,
+                blue,
+            } => {
+                img = crate::ops::color::curves(&img, master, red, green, blue);
+            }
+            Operation::Levels {
+                in_black,
+                in_white,
+                gamma,
+                out_black,
+                out_white,
+            } => {
+                img = crate::ops::color::levels(
+                    &img, *in_black, *in_white, *gamma, *out_black, *out_white,
+                );
+            }
+            Operation::Blur { sigma } => {
+                img = crate::ops::blur::gaussian_blur(&img, *sigma);
+            }
+            Operation::Median { radius } => {
+                img = crate::ops::blur::median(&img, *radius);
+            }
+            Operation::UnsharpMask {
+                amount,
+                radius,
+                threshold,
+            } => {
+                img = crate::ops::blur::unsharp_mask(&img, *amount, *radius, *threshold);
+            }
             Operation::StripMetadata { scope } => {
                 strip = Some(*scope);
             }
@@ -367,6 +426,13 @@ fn op_name(op: &Operation) -> &'static str {
         Operation::Resize { .. } => "resize",
         Operation::Adjust { .. } => "adjust",
         Operation::Encode { .. } => "encode",
+        Operation::Perspective { .. } => "perspective",
+        Operation::ColorMatrix { .. } => "color_matrix",
+        Operation::Curves { .. } => "curves",
+        Operation::Levels { .. } => "levels",
+        Operation::Blur { .. } => "blur",
+        Operation::Median { .. } => "median",
+        Operation::UnsharpMask { .. } => "unsharp_mask",
         Operation::StripMetadata { .. } => "strip_metadata",
     }
 }

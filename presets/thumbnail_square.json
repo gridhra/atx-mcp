@@ -1,0 +1,11 @@
+{
+  "name": "thumbnail_square",
+  "description": "Square thumbnail: center-crop 1:1, 800x800, WebP q80.",
+  "recipe": {
+    "operations": [
+      { "op": "crop", "aspect_ratio": "1:1", "anchor": "center" },
+      { "op": "resize", "width": 800, "height": 800, "fit": "cover", "without_enlargement": true },
+      { "op": "encode", "format": "webp", "quality": 80 }
+    ]
+  }
+}

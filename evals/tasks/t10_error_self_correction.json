@@ -1,0 +1,14 @@
+{
+  "id": "t10_error_self_correction",
+  "prompt": "この写真をPNGに変換して、16:9にクロップして。crop opは aspect_ratio と rect を両方書いて厳密に指定してみて欲しい(細かい仕様は気にせず、まず投げてみて、エラーが返ってきたら構造化エラーのrecoveryに従って直して、最終的に成功させて)。",
+  "input_fixture": "tests/fixtures/synthetic_scene.jpg",
+  "success_criteria": {
+    "expect_revision": {
+      "mime_type": "image/png",
+      "aspect_ratio": "16:9",
+      "recipe_contains_ops": ["crop", "encode"],
+      "min_matches": 1
+    }
+  },
+  "max_turns": 10
+}

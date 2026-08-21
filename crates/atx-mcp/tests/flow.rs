@@ -195,7 +195,8 @@ fn full_flow_import_inspect_detect_preview_apply_export() {
     // --- 4. render_preview -------------------------------------------------
     let preview_result = tools.render_preview(&RenderPreviewParams {
         revision_id: source_rev.clone(),
-        recipe: serde_json::from_value(recipe()).unwrap(),
+        recipe: Some(serde_json::from_value(recipe()).unwrap()),
+        preset: None,
         overlay: None,
     });
     let preview = structured(&preview_result);
@@ -230,7 +231,8 @@ fn full_flow_import_inspect_detect_preview_apply_export() {
     // --- 5. apply_transform ------------------------------------------------
     let applied = structured(&tools.apply_transform(&TransformParams {
         revision_id: source_rev.clone(),
-        recipe: serde_json::from_value(recipe()).unwrap(),
+        recipe: Some(serde_json::from_value(recipe()).unwrap()),
+        preset: None,
     }));
     assert_eq!(applied["reused"], Value::Bool(false));
     assert_eq!(applied["engine_version"], atx_core::ENGINE_VERSION);
@@ -273,7 +275,8 @@ fn full_flow_import_inspect_detect_preview_apply_export() {
     // --- 6. 冪等性: 同じレシピをもう一度 → 同一 revision、再変換なし ---------
     let again = structured(&tools.apply_transform(&TransformParams {
         revision_id: source_rev.clone(),
-        recipe: serde_json::from_value(recipe()).unwrap(),
+        recipe: Some(serde_json::from_value(recipe()).unwrap()),
+        preset: None,
     }));
     assert_eq!(again["reused"], Value::Bool(true));
     assert_eq!(again["revision"]["revision_id"], derived_rev.as_str());
@@ -379,13 +382,16 @@ fn errors_are_structured_and_actionable() {
         .to_string();
     let invalid = tools.apply_transform(&TransformParams {
         revision_id: rev,
-        recipe: serde_json::from_value(serde_json::json!({
-            "operations": [
-                {"op": "encode", "format": "png"},
-                {"op": "auto_orient"}
-            ]
-        }))
-        .unwrap(),
+        recipe: Some(
+            serde_json::from_value(serde_json::json!({
+                "operations": [
+                    {"op": "encode", "format": "png"},
+                    {"op": "auto_orient"}
+                ]
+            }))
+            .unwrap(),
+        ),
+        preset: None,
     });
     let payload = error_payload(&invalid);
     assert_eq!(payload["error"]["code"], "invalid_recipe");
@@ -413,10 +419,12 @@ fn tool_registration_matches_the_design_contract() {
             "apply_transform",
             "compare_revisions",
             "detect_tilt",
+            "explain_operation",
             "export_asset",
             "import_asset",
             "inspect_image",
             "list_assets",
+            "list_operations",
             "render_preview",
         ]
     );
@@ -445,7 +453,11 @@ fn tool_registration_matches_the_design_contract() {
 
         let read_only = matches!(
             tool.name.as_ref(),
-            "inspect_image" | "detect_tilt" | "list_assets"
+            "inspect_image"
+                | "detect_tilt"
+                | "list_assets"
+                | "list_operations"
+                | "explain_operation"
         );
         assert_eq!(ann.read_only_hint, Some(read_only), "{}", tool.name);
         match tool.name.as_ref() {
@@ -470,6 +482,16 @@ fn tool_registration_matches_the_design_contract() {
     assert!(
         instructions.contains("ICC"),
         "instructions must call out the png/webp/avif ICC drop upfront"
+    );
+    // 語彙参照ツールとプリセットが「発見の道筋」として instructions に載っていること
+    // (ROADMAP §Agent UX の規律 #2 / #3)。
+    assert!(instructions.contains("list_operations"));
+    assert!(instructions.contains("explain_operation"));
+    assert!(instructions.contains("preset"));
+    // op を instructions 側で列挙しないこと(列挙は list_operations の役目)。
+    assert!(
+        !instructions.contains("auto_orient | rotate"),
+        "instructions must not enumerate the operation vocabulary inline"
     );
 }
 
@@ -505,12 +527,16 @@ fn render_preview_overlay_variants() {
 
     let base_result = tools.render_preview(&RenderPreviewParams {
         revision_id: rev.clone(),
-        recipe: serde_json::from_value(recipe()).unwrap(),
+        recipe: Some(serde_json::from_value(recipe()).unwrap()),
+        preset: None,
         overlay: None,
     });
     let base_structured = structured(&base_result);
     let base_bytes = preview_jpeg_bytes(&base_result);
-    let base_path = base_structured["preview_path"].as_str().unwrap().to_string();
+    let base_path = base_structured["preview_path"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let (base_w, base_h) = {
         let img = image::load_from_memory(&base_bytes).unwrap();
         (img.width(), img.height())
@@ -520,7 +546,8 @@ fn render_preview_overlay_variants() {
     for overlay in ["grid", "thirds", "horizon"] {
         let result = tools.render_preview(&RenderPreviewParams {
             revision_id: rev.clone(),
-            recipe: serde_json::from_value(recipe()).unwrap(),
+            recipe: Some(serde_json::from_value(recipe()).unwrap()),
+            preset: None,
             overlay: Some(overlay.to_string()),
         });
         let structured_out = structured(&result);
@@ -552,7 +579,8 @@ fn render_preview_overlay_variants() {
         // 同じ呼び出しをもう一度 -> キャッシュヒットでバイト列は完全一致。
         let again = tools.render_preview(&RenderPreviewParams {
             revision_id: rev.clone(),
-            recipe: serde_json::from_value(recipe()).unwrap(),
+            recipe: Some(serde_json::from_value(recipe()).unwrap()),
+            preset: None,
             overlay: Some(overlay.to_string()),
         });
         let again_bytes = preview_jpeg_bytes(&again);
@@ -567,7 +595,8 @@ fn render_preview_overlay_variants() {
     // invalid overlay -> 構造化エラーで有効値一覧を返す。
     let invalid = tools.render_preview(&RenderPreviewParams {
         revision_id: rev,
-        recipe: serde_json::from_value(recipe()).unwrap(),
+        recipe: Some(serde_json::from_value(recipe()).unwrap()),
+        preset: None,
         overlay: Some("scanlines".to_string()),
     });
     let payload = error_payload(&invalid);
@@ -597,7 +626,8 @@ fn compare_revisions_flow() {
 
     let applied = structured(&tools.apply_transform(&TransformParams {
         revision_id: rev_a.clone(),
-        recipe: serde_json::from_value(recipe()).unwrap(),
+        recipe: Some(serde_json::from_value(recipe()).unwrap()),
+        preset: None,
     }));
     let rev_b = applied["revision"]["revision_id"]
         .as_str()
@@ -686,7 +716,10 @@ fn compare_revisions_flow() {
     let (side_bytes, _) = compare_jpeg(&side_result);
     assert_eq!(again_bytes, side_bytes);
     let again = structured(&again_result);
-    assert_eq!(again["preview_path"], side["preview_path"].as_str().unwrap());
+    assert_eq!(
+        again["preview_path"],
+        side["preview_path"].as_str().unwrap()
+    );
 
     // --- 存在しない revision は構造化エラー ---
     let missing = tools.compare_revisions(&CompareRevisionsParams {

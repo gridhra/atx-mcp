@@ -85,15 +85,17 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 `--workspace` (env: `ATX_WORKSPACE`) is the directory used as the asset store.
 It is created automatically if it doesn't exist.
 
-## Tools (8)
+## Tools (10)
 
 | Tool | Role |
 |---|---|
+| `list_operations` | Compact catalog of the recipe vocabulary: every operation with a one-line description and terse parameter hints, plus the built-in preset names. Optional `category:"geometry"\|"color"\|"filter"\|"output"` narrows it (read-only) |
+| `explain_operation` | Full reference for one operation: parameter table (type, range, required/default, semantics), ready-to-paste JSON examples and gotchas. An unknown name returns the list of valid ones (read-only) |
 | `import_asset` | Import a local image into the workspace (sha256-idempotent) |
 | `inspect_image` | Inspect dimensions, EXIF, ICC profile, presence of GPS data, etc. (read-only) |
 | `detect_tilt` | Estimate tilt angle via Canny+Hough (coarse) plus a projection profile (sub-0.1° refinement). Also returns horizontal/vertical family estimates and their score curves. Returns "do not correct" when confidence is low (read-only) |
-| `render_preview` | Apply a recipe at low resolution (long edge ≤768) and return it as an inline image. `overlay:"grid"\|"thirds"\|"horizon"` overlays composition guide lines (drawn on the preview only; it has no effect on the actual transform) |
-| `apply_transform` | Apply a recipe at full resolution and produce a new revision (the same recipe always yields the same revision) |
+| `render_preview` | Apply a recipe (or a `preset`) at low resolution (long edge ≤768) and return it as an inline image. `overlay:"grid"\|"thirds"\|"horizon"` overlays composition guide lines (drawn on the preview only; it has no effect on the actual transform) |
+| `apply_transform` | Apply a recipe (or a `preset`) at full resolution and produce a new revision (the same recipe always yields the same revision) |
 | `compare_revisions` | Downscale two revisions to long edge ≤640 and return them composited into a single inline image, arranged via `layout:"side_by_side"\|"stacked"` (for A/B and before/after visual comparison) |
 | `list_assets` | Read the revision ledger (read-only) |
 | `export_asset` | Write a revision out to a given path (an existing file is only overwritten when `overwrite:true` is explicitly set) |
@@ -111,9 +113,32 @@ It is created automatically if it doesn't exist.
 }
 ```
 
-Supported ops: `auto_orient` / `rotate` / `crop` (crop, pad) / `resize`
-(cover, contain, fill) / `adjust` (brightness, contrast, saturation,
-sharpness) / `encode` (jpeg, png, webp, avif) / `strip_metadata`.
+Supported ops: `auto_orient` / `rotate` / `perspective` / `crop` (crop, pad) /
+`resize` (cover, contain, fill) / `adjust` / `color_matrix` / `curves` /
+`levels` / `blur` / `median` / `unsharp_mask` / `encode` (jpeg, png, webp,
+avif) / `strip_metadata`.
+The operation vocabulary is deliberately kept out of the tool schemas: call
+`list_operations` for the up-to-date catalog and `explain_operation` for one
+operation's full schema, examples and gotchas.
+
+## Presets
+
+`apply_transform` and `render_preview` take either `recipe` (the raw DSL) or
+`preset` (a built-in named recipe from [`presets/`](presets)) — exactly one of
+the two:
+
+| Preset | What it does |
+|---|---|
+| `eyecatch_16_9` | Center-crop to 16:9, resize to 1600px wide, WebP q82 |
+| `thumbnail_square` | Center-crop to 1:1, resize to 800x800, WebP q80 |
+| `web_optimize` | Fit inside 2000x2000 without upscaling, WebP q80 |
+| `grayscale` | Black and white via a BT.709 luma `color_matrix` |
+| `sepia` | Classic sepia tone via `color_matrix` |
+
+A preset is pure sugar: it resolves to its recipe and flows through the normal
+pipeline, and the `recipe_hash` (the idempotency key) is computed on the
+**resolved** recipe — so a preset call and the equivalent raw recipe land on the
+same revision.
 
 ## Guarantees
 

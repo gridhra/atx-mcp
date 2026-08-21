@@ -116,7 +116,10 @@ fn derivation_inherits_asset_id_across_chain() {
         )
         .unwrap();
     assert_eq!(derived2.asset_id, source.asset_id);
-    assert_eq!(derived2.source_revision_id.as_deref(), Some(derived1.revision_id.as_str()));
+    assert_eq!(
+        derived2.source_revision_id.as_deref(),
+        Some(derived1.revision_id.as_str())
+    );
 }
 
 #[test]
@@ -167,7 +170,9 @@ fn list_revisions_filters_by_asset_id() {
     assert_eq!(filtered.len(), 2);
     assert!(filtered.iter().all(|r| r.asset_id == a.asset_id));
     assert!(filtered.iter().any(|r| r.revision_id == a.revision_id));
-    assert!(filtered.iter().any(|r| r.revision_id == a_derived.revision_id));
+    assert!(filtered
+        .iter()
+        .any(|r| r.revision_id == a_derived.revision_id));
 
     let all = store.list_revisions(None).unwrap();
     assert_eq!(all.len(), 3);
@@ -238,9 +243,15 @@ fn preview_key_sanitization_rejects_path_traversal() {
     ));
 
     // valid key works and is deterministic (no rewrite on repeat call)
-    let path1 = store.put_preview("rev_abc_hash_def", "webp", b"preview bytes").unwrap();
+    let path1 = store
+        .put_preview("rev_abc_hash_def", "webp", b"preview bytes")
+        .unwrap();
     let path2 = store
-        .put_preview("rev_abc_hash_def", "webp", b"different bytes should not overwrite")
+        .put_preview(
+            "rev_abc_hash_def",
+            "webp",
+            b"different bytes should not overwrite",
+        )
         .unwrap();
     assert_eq!(path1, path2);
     let contents = std::fs::read(&path1).unwrap();
