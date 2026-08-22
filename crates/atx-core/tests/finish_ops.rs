@@ -176,6 +176,63 @@ fn horizontal_flip_mirrors_x() {
     assert_eq!(out.get_pixel(0, 0), src.get_pixel(3, 0));
 }
 
+/// 回帰: flip も座標変換へ畳み込まれる(`coordinate_space: "source"` が追従する)。
+///
+/// 16x8、左端 4 列だけ赤・残り青の画像。水平反転すると赤は右端 4 列へ移る。
+/// **SOURCE 座標**の矩形 `4x8+0+0`(= 元画像の赤帯)を切り出したのだから、
+/// 結果は赤でなければならない。flip を xf へ合成していなかった頃は反転前の位置を
+/// そのまま切り出してしまい、青が返っていた。
+#[test]
+fn source_space_crop_follows_a_flip() {
+    let mut src = RgbaImage::new(16, 8);
+    for y in 0..8 {
+        for x in 0..16 {
+            let color = if x < 4 {
+                Rgba([255, 0, 0, 255])
+            } else {
+                Rgba([0, 0, 255, 255])
+            };
+            src.put_pixel(x, y, color);
+        }
+    }
+    let json = format!(
+        r#"{{"operations":[{{"op":"flip","direction":"horizontal"}},
+            {{"op":"crop","coordinate_space":"source",
+              "rect":{{"x":0,"y":0,"width":4,"height":8}}}},{PNG_ENCODE}]}}"#
+    );
+    let out = run(&src, &json);
+    assert_eq!(out.dimensions(), (4, 8));
+    for px in out.pixels() {
+        assert_eq!(
+            px,
+            &Rgba([255, 0, 0, 255]),
+            "source-space crop lost the flip"
+        );
+    }
+
+    // 垂直も同じ(上 2 行だけ赤の 4x8 → 反転後も SOURCE の赤帯が取れる)。
+    let mut src = RgbaImage::from_pixel(4, 8, Rgba([0, 0, 255, 255]));
+    for y in 0..2 {
+        for x in 0..4 {
+            src.put_pixel(x, y, Rgba([255, 0, 0, 255]));
+        }
+    }
+    let json = format!(
+        r#"{{"operations":[{{"op":"flip","direction":"vertical"}},
+            {{"op":"crop","coordinate_space":"source",
+              "rect":{{"x":0,"y":0,"width":4,"height":2}}}},{PNG_ENCODE}]}}"#
+    );
+    let out = run(&src, &json);
+    assert_eq!(out.dimensions(), (4, 2));
+    for px in out.pixels() {
+        assert_eq!(
+            px,
+            &Rgba([255, 0, 0, 255]),
+            "source-space crop lost the flip"
+        );
+    }
+}
+
 /// 垂直反転は `out(x, y) = in(x, h - 1 - y)`。
 #[test]
 fn vertical_flip_mirrors_y() {

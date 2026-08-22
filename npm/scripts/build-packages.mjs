@@ -50,9 +50,10 @@ if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version)) {
   process.exit(2);
 }
 
-// The repository URL carries a gridhra placeholder until the repo is
-// created. In CI we know the real owner, and npm provenance requires the
-// package's repository URL to match the building repo, so substitute it.
+// gridhra/atx-mcp is the real repository, but npm provenance requires the
+// package's repository URL to match the building repo exactly (matters for
+// forks or a future rename), so substitute it from CI's own view when
+// available rather than hardcoding the assumption.
 const realRepo = process.env.GITHUB_REPOSITORY;
 const fixOwner = (s) =>
   realRepo ? s.replaceAll("gridhra/atx-mcp", realRepo) : s;

@@ -11,8 +11,8 @@ use crate::codec;
 use crate::linear::{pad_to_linear, pad_to_srgb, LinearImage, Space};
 use crate::pixel_ops;
 use crate::recipe::{
-    parse_aspect_ratio, parse_hex_color, CoordinateSpace, Operation, OutputFormat, StripScope,
-    TransformRecipe,
+    parse_aspect_ratio, parse_hex_color, CoordinateSpace, FlipDirection, Operation, OutputFormat,
+    StripScope, TransformRecipe,
 };
 use crate::transform::{map_source_rect, Affine};
 use crate::{AtxError, Limits, Result};
@@ -135,7 +135,8 @@ pub fn inspect_bytes(bytes: &[u8], limits: &Limits) -> Result<ImageInfo> {
 /// `Crop { rect, coordinate_space: Source }` のために、エンジンは
 /// 「**入力画像(EXIF orientation 正規化前)の画素座標 → 現在のパイプライン座標**」の
 /// 2D アフィン変換を保持し、幾何 op ごとに合成していく
-/// (orientation 正規化 / rotate / crop / pad / resize。adjust・encode・strip は座標を動かさない)。
+/// (orientation 正規化 / rotate / crop / pad / resize / flip / perspective。
+/// adjust・encode・strip は座標を動かさない)。
 /// 詳細は `crate::transform` と `recipe::CoordinateSpace` を参照。
 /// レシピが参照する他アセット(LUT 等)の実体を解決する。
 /// atx-core はストア実装に依存しないため、呼び出し側(atx-mcp / CLI / テスト)が実装する。
@@ -200,6 +201,7 @@ pub fn apply_recipe_with_assets(
     // 1 回の apply_recipe 内でのマスク解決キャッシュ(同じ MaskRef + 同じ寸法は 1 回だけ)。
     let mut runner = OpRunner {
         assets,
+        limits,
         masks: crate::ops::mask::MaskCache::new(),
     };
 
@@ -387,6 +389,23 @@ fn decode_normalized(bytes: &[u8], limits: &Limits, space: Space) -> Result<Deco
     })
 }
 
+/// limits 検査つきの汎用ラスタデコード(色空間の解釈も orientation の正規化もしない)。
+///
+/// 入力画像とレイヤーソースは `decode_normalized` を通るが、マスク画像のように
+/// 「向きも空間も関係なく画素だけが欲しい」経路も **同じ検査**(バイトサイズ →
+/// フォーマット判定 → 寸法 → デコーダのアロケーション上限)を通す必要がある。
+/// 検査を書き写さずに済むよう、両者の共通部分をここに 1 本だけ切り出してある。
+pub(crate) fn decode_checked(bytes: &[u8], limits: &Limits) -> Result<DynamicImage> {
+    check_byte_limit(bytes, limits)?;
+    let reader = build_reader(bytes, limits)?;
+    let decoder = reader
+        .into_decoder()
+        .map_err(|e| AtxError::Decode(e.to_string()))?;
+    let (width, height) = decoder.dimensions();
+    check_pixel_limit(width, height, limits)?;
+    DynamicImage::from_decoder(decoder).map_err(|e| AtxError::Decode(e.to_string()))
+}
+
 /// パイプラインの可変状態(単一パイプラインでも、レイヤー内のネストパイプラインでも同じ)。
 struct PipelineState {
     img: LinearImage,
@@ -401,6 +420,8 @@ struct PipelineState {
 /// (同じ `MaskRef` + 同じ寸法はレイヤーをまたいでも 1 回しか解決しない)。
 struct OpRunner<'a> {
     assets: &'a dyn AssetResolver,
+    /// マスク画像のデコードにも入力画像と同じ上限を適用する。
+    limits: &'a Limits,
     masks: crate::ops::mask::MaskCache,
 }
 
@@ -478,7 +499,7 @@ fn composite_layers(
                     Some(mask) => Some(
                         runner
                             .masks
-                            .resolve(mask, bw, bh, runner.assets)
+                            .resolve(mask, bw, bh, runner.assets, runner.limits)
                             .map_err(|e| layer_error(i, e))?
                             .to_vec(),
                     ),
@@ -718,7 +739,21 @@ impl OpRunner<'_> {
                     );
                 }
                 Operation::Flip { direction } => {
+                    // flip も幾何 op なので座標変換へ畳み込む(畳み込まないと後続の
+                    // `crop { coordinate_space: "source" }` が反転前の位置を切り出す)。
+                    // 連続座標では反転は厳密に線形: 水平は `u' = w − u`、垂直は `v' = h − v`
+                    // (EXIF orientation 2 / 4 の `pixel_ops::orientation_affine` と同じ形)。
+                    let (w, h) = st.img.dimensions();
+                    let step = match direction {
+                        FlipDirection::Horizontal => {
+                            Affine::linear(-1.0, 0.0, w as f64, 0.0, 1.0, 0.0)
+                        }
+                        FlipDirection::Vertical => {
+                            Affine::linear(1.0, 0.0, 0.0, 0.0, -1.0, h as f64)
+                        }
+                    };
                     st.img = crate::ops::finish::flip(&st.img, *direction);
+                    st.xf = st.xf.then(step);
                 }
                 Operation::Vignette {
                     strength,
@@ -744,8 +779,8 @@ impl OpRunner<'_> {
                 }
                 Operation::Pixelate { block_size, region } => {
                     ensure_space(&mut st.img, &mut st.space, Space::Linear);
-                    st.img = crate::ops::pixelate::apply(&st.img, *block_size, region)
-                        .map_err(|e| fail(e.to_string()))?;
+                    st.img =
+                        crate::ops::pixelate::apply(&st.img, *block_size, region).map_err(fail)?;
                 }
                 Operation::AutoLevels {
                     clip_percent,
@@ -915,8 +950,13 @@ impl OpRunner<'_> {
                 }
                 let weights = self
                     .masks
-                    .resolve(&mask, w, h, self.assets)
-                    .map_err(|e| fail(e.to_string()))?;
+                    .resolve(&mask, w, h, self.assets, self.limits)
+                    // 上限超過は「op の失敗」ではなく入力ガードなので、そのまま返す
+                    // (呼び出し側が LimitExceeded として区別できるように)。
+                    .map_err(|e| match e {
+                        limit @ AtxError::LimitExceeded(_) => limit,
+                        other => fail(other.to_string()),
+                    })?;
                 st.img = crate::ops::mask::blend(&before, &st.img, weights);
             }
         }

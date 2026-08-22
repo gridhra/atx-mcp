@@ -1,6 +1,6 @@
 {
   "name": "soft_vignette",
-  "description": "Building block: a soft, subtle vignette on its own, for stacking after other looks (no resize/encode).",
+  "description": "Single-op building block: a soft, subtle vignette (no resize/encode). Presets do not chain - copy this op into a bigger recipe (see explain_operation) rather than applying a second preset.",
   "recipe": {
     "operations": [
       { "op": "vignette", "strength": 0.2, "radius": 0.7, "feather": 0.5 }

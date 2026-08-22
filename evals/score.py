@@ -269,7 +269,21 @@ def score_task_file(task_json_path: Path, task_dir: Path, workspace_dir: Path | 
 
     ws = workspace_dir if workspace_dir is not None else (task_dir / "workspace")
     ledger_path = ws / "assets.jsonl"
-    ledger = load_ledger(ledger_path)
+
+    # 台帳の破損(不正 JSON 行)は評価不能なので即 fail 扱いにする。ここで拾わずに
+    # 上へ伝播させると run.sh 側では stderr トレースバックしか残らず、
+    # 「なぜこのタスクが FAIL したか」が結果 JSON から読み取れなくなる。
+    try:
+        ledger = load_ledger(ledger_path)
+    except ValueError as e:
+        return {
+            "id": task["id"],
+            "passed": False,
+            "max_turns": task.get("max_turns"),
+            "workspace": str(ws),
+            "ledger_lines": None,
+            "detail": {"error": "ledger_corrupted", "message": str(e)},
+        }
 
     passed, detail = evaluate(task["success_criteria"], ledger)
     return {
@@ -624,6 +638,39 @@ def run_selftests() -> None:
     # --- substitute_task_dir ---
     substituted = substitute_task_dir({"dest_path": "{{TASK_DIR}}/export/output.jpg"}, "/tmp/task42")
     assert substituted["dest_path"] == "/tmp/task42/export/output.jpg"
+
+    # --- corrupted ledger: load_ledger raises, score_task_file surfaces it instead of crashing ---
+    with tempfile.TemporaryDirectory() as td:
+        task_dir = Path(td)
+        workspace_dir = task_dir / "workspace"
+        workspace_dir.mkdir()
+        ledger_path = workspace_dir / "assets.jsonl"
+        ledger_path.write_text(
+            json.dumps(_mk_import()) + "\n" + "{not valid json\n",
+            encoding="utf-8",
+        )
+
+        try:
+            load_ledger(ledger_path)
+            raise AssertionError("expected load_ledger to raise ValueError on corrupted line")
+        except ValueError as e:
+            assert "line 2" in str(e), f"expected corruption to be pinned to line 2, got: {e}"
+
+        task_json_path = task_dir / "task.json"
+        task_json_path.write_text(
+            json.dumps(
+                {
+                    "id": "t_corrupted_ledger_selftest",
+                    "success_criteria": {"expect_no_new_revision": True},
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = score_task_file(task_json_path, task_dir, workspace_dir)
+        assert result["passed"] is False, f"corrupted ledger must not score as passed: {result}"
+        assert result["detail"].get("error") == "ledger_corrupted", (
+            f"expected surfaced ledger_corrupted detail, got: {result['detail']}"
+        )
 
 
 if __name__ == "__main__":

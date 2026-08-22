@@ -273,9 +273,38 @@ fn explain_operation_layers_documents_the_recipe_structure() {
         );
     }
 
+    // 寸法規則は「各レイヤーの ops の**後**に、backdrop (layers[0]) と比べる」であって、
+    // 「source が base と同寸法」ではない。直し方(そのレイヤーの ops に resize/crop)も
+    // 書いてあること。
+    let warnings = serde_json::to_string(&out["warnings"]).unwrap();
+    assert!(
+        warnings.contains("AFTER EACH LAYER'S OWN ops") && warnings.contains("backdrop"),
+        "the dimension rule must be stated as an after-ops check against the backdrop: {warnings}"
+    );
+    assert!(
+        warnings.contains("resize/crop to THAT layer's ops"),
+        "the dimension warning must name the fix: {warnings}"
+    );
+    // backdrop の blend_mode / opacity / mask は「尊重される」のではなく**拒否される**。
+    assert!(
+        warnings.contains("REJECTED unless blend_mode is"),
+        "layers[0] must be documented as rejecting non-normal blend/opacity/mask: {warnings}"
+    );
+    // ops は省略可能で、禁止されるのは encode / strip_metadata。
+    let ops_param = out["params"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "layers[].ops")
+        .expect("layers[].ops must be documented")
+        .clone();
+    assert_eq!(ops_param["requirement"], "default: []");
+    let semantics = ops_param["semantics"].as_str().unwrap();
+    assert!(semantics.contains("encode") && semantics.contains("strip_metadata"));
+
     // list_operations のカタログは op のみで、layers は含まれない(構造は別リファレンス)。
     let catalog = structured(&tools.list_operations(&Default::default()));
-    let names: Vec<&str> = catalog["operations"]
+    let names: Vec<&str> = catalog["ops"]
         .as_array()
         .unwrap()
         .iter()

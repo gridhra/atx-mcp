@@ -17,7 +17,6 @@
     "url": "git+https://github.com/gridhra/atx-mcp.git"
   },
   "bin": {
-    "atx-mcp": "bin/atx-mcp.js",
     "atx-mcp": "bin/atx-mcp.js"
   },
   "files": [

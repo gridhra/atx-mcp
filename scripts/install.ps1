@@ -18,7 +18,6 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# NOTE: owner is a placeholder until the repo exists (see RELEASING.md step 0).
 $Repo = "gridhra/atx-mcp"
 
 $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture

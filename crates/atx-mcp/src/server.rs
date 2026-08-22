@@ -26,8 +26,8 @@ use crate::tools::{
 pub const INSTRUCTIONS: &str = r#"Deterministic, non-generative image transformation over an immutable local asset store.
 
 Model of the world
-- Every image lives in the workspace as an immutable *revision* ("rev_..."). Originals are never modified, overwritten, or deleted; every transform produces a NEW revision that records the recipe that produced it.
-- Transforms are pure and deterministic: the same input revision plus the same recipe always yields the same revision (the server short-circuits and returns the existing one instead of re-encoding).
+- Every image lives in the workspace as an immutable *revision* ("rev_..."). Originals are never modified or deleted; every transform produces a NEW revision recording the recipe that produced it.
+- Transforms are pure and deterministic: the same input revision plus the same recipe always yields the same revision (the server short-circuits and returns the existing one).
 - Nothing here is generative. Pixels are only decoded, geometrically transformed, adjusted, and re-encoded.
 
 Recipe DSL
@@ -41,41 +41,32 @@ Example:
   {"op": "encode", "format": "webp", "quality": 82}
 ]}
 EXIF orientation is always normalized into the pixels at decode time, so auto_orient is an explicit no-op.
-LUT workflow: a .cube 3D LUT is an asset, not an image - import_asset the .cube file first, then reference the revision_id it returns from the recipe as {"op": "lut", "lut_revision_id": "rev_...", "strength": 1.0}.
-SVG / watermark workflow: an .svg is a VECTOR asset, not a raster image - import_asset the .svg file first, then stamp it from a recipe as {"op": "svg_overlay", "svg_revision_id": "rev_...", "x": 24, "y": 24, "width": 320, "opacity": 0.25, "blend_mode": "normal"} (x/y are the top-left corner in the CURRENT image's coordinates and may be negative; omit width/height to use the SVG's intrinsic size). Text is never rendered - atx loads no system fonts so that the same recipe reproduces byte-for-byte on any machine, so convert text to paths before importing.
-Mask workflow (local adjustments): a mask is a grayscale image revision (white = apply fully, black = leave alone) - create one with generate_mask (linear/radial gradient, luminosity range, color range) or import_asset your own, then attach it to any tone/filter operation as "mask": {"revision_id": "rev_...", "invert": false, "feather_px": 0}, and check the coverage with render_preview overlay="mask".
-
-Layered recipes: a recipe may carry {"layers": [...]} instead of (or alongside) a flat operations list. Layers composite bottom-to-top: each layer is {"source": "base" | {"revision_id": "rev_..."}, "ops": [...], "mask"?, "blend_mode"? (one of the 16 W3C blend modes - 12 separable + 4 non-separable - default "normal"), "opacity"? (0..1, default 1.0)}, its own ops run against its own source, and the result blends onto the running composite. Every layer's source must match the base image's dimensions exactly. When layers are present, the top-level operations becomes the FINISHING pass applied once to the composited result - resize and the final encode belong there, and encode must still be last and appear at most once. Call explain_operation {"operation":"layers"} for the full reference. Example:
-{"layers": [
-  {"source": "base", "ops": []},
-  {"source": {"revision_id": "rev_..."}, "ops": [{"op": "blur", "sigma": 8}], "blend_mode": "multiply", "opacity": 0.6}
-], "operations": [
-  {"op": "resize", "width": 1600},
-  {"op": "encode", "format": "webp", "quality": 82}
-]}
+LUT workflow: a .cube 3D LUT is an asset, not an image - import_asset it first, then reference the returned id as {"op": "lut", "lut_revision_id": "rev_...", "strength": 1.0}.
+SVG / watermark workflow: an .svg is a VECTOR asset - import_asset it first, then stamp it as {"op": "svg_overlay", "svg_revision_id": "rev_...", "x": 24, "y": 24, "width": 320, "opacity": 0.25} (x/y = top-left in the CURRENT image; text is never rendered, so convert text to paths first).
+Mask workflow (local adjustments): make a grayscale mask revision with generate_mask (or import_asset your own), attach it to any tone/filter operation as "mask": {"revision_id": "rev_...", "invert": false, "feather_px": 0}, and check the coverage with render_preview overlay="mask".
+Layered recipes: a recipe may carry {"layers": [...]} - a bottom-to-top stack composited with the 16 W3C blend modes, after which the top-level operations run once as the finishing pass (resize and encode belong there). Call explain_operation {"operation":"layers"} for the full reference before writing one.
 
 Discovering the vocabulary (the ops are deliberately NOT enumerated in the tool schemas)
-- list_operations  - compact catalog of every operation (name, one-line summary, parameter names with type/range hints) plus the built-in preset names. Start here.
-- explain_operation - full parameter table, worked examples and gotchas for one operation.
-Errors are teachers: an invalid recipe or an unknown name comes back with the valid values and a recovery step, so one extra round trip is enough to fix it.
+- list_operations  - compact catalog of every operation (name, category) plus the built-in preset names. Start here.
+- explain_operation - full parameter table, examples and gotchas for one operation.
+Errors are teachers: an invalid recipe or an unknown name comes back with the valid values and a recovery step, so one round trip is enough to fix it.
 
-Presets (the compressed layer of the same language)
-apply_transform and render_preview accept either `recipe` (the raw DSL) or `preset` (a built-in named recipe such as web_optimize); they are mutually exclusive and exactly one is required. A preset is pure sugar: it resolves to its recipe and flows through the normal pipeline, and the recipe_hash / idempotency key is computed on the RESOLVED recipe, so a preset call and the equivalent raw recipe land on the same revision. Drop down to a raw recipe whenever you need precise control.
+Presets: apply_transform and render_preview take either `recipe` (the raw DSL) or `preset` (a built-in named recipe such as web_optimize) - mutually exclusive, exactly one required. A preset is pure sugar: the recipe_hash is computed on the RESOLVED recipe, so a preset call and the equivalent raw recipe land on the same revision.
 
 Recommended flow
 0. list_operations / explain_operation - look up the recipe vocabulary on demand (or pick a preset).
 1. import_asset  - bring a local file into the workspace, get a revision_id.
 2. inspect_image - dimensions, format, EXIF summary, GPS/PII flag, byte size.
-3. detect_tilt   - read-only tilt candidates with a confidence. It never applies anything; a null angle means "do not correct".
-4. render_preview- run a candidate recipe and get a <=768px inline JPEG plus a file path, to check the composition cheaply.
+3. detect_tilt   - read-only tilt candidates with a confidence; a null angle means "do not correct".
+4. render_preview- run a candidate recipe, get a <=768px inline JPEG plus a file path, to check composition cheaply.
 5. apply_transform - run the same recipe at full resolution, producing a new revision.
-6. export_asset  - copy a revision out of the workspace. It refuses to overwrite an existing file unless you pass overwrite=true, which you should only do after the user confirms.
+6. export_asset  - copy a revision out of the workspace (refuses to overwrite unless overwrite=true; ask the user first, and it never writes inside the workspace store).
 
-Use list_assets to review the ledger (lineage, recipes, sizes). All tool results carry both a human-readable text summary with absolute paths and machine-readable structuredContent; prefer the structured fields for chaining.
+Use list_assets to review the ledger (lineage, recipes, sizes). Every result carries a human-readable text summary with absolute paths plus machine-readable structuredContent; prefer the structured fields for chaining.
 
-Note on ICC: when a recipe's encode output format is png, webp, or avif, any ICC color profile on the source is dropped (embedding is only supported for jpeg output), and apply_transform/render_preview report this as a warning rather than failing.
+Note on ICC: for png/webp/avif encode output any ICC color profile on the source is dropped (embedding is jpeg-only) and reported as a warning, not an error.
 
-Visual verification: render_preview accepts an optional `overlay` ("grid" | "thirds" | "horizon", or "mask" with a mask_revision_id) to draw composition guide lines or a mask coverage tint on the returned preview; compare_revisions places two revisions side by side (or stacked) in one inline image so before/after or A/B differences can be checked without leaving the MCP, or pass layout="diff" (revisions must share the same dimensions) for a single pixel-difference heatmap plus mean_abs_diff/max_abs_diff/changed_pixel_ratio stats instead of a spatial arrangement."#;
+Visual verification: render_preview takes an optional `overlay` ("grid" | "thirds" | "horizon", or "mask" with a mask_revision_id); compare_revisions shows two revisions side by side or stacked inline, or layout="diff" (same dimensions) for a difference heatmap plus mean/max/changed-ratio stats."#;
 
 /// MCP サーバ本体。ワークスペース1つに対応する。
 #[derive(Clone)]

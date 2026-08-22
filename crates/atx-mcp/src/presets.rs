@@ -132,12 +132,20 @@ pub fn preset_names() -> Vec<&'static str> {
     PRESET_FILES.iter().map(|(name, _)| *name).collect()
 }
 
-/// 埋め込み JSON をすべてパースして返す。パースに失敗するプリセットは
-/// ビルド時点のバグなのでユニットテストで弾く(実行時は該当プリセットを飛ばす)。
+/// 埋め込み JSON をすべてパースして返す。
+///
+/// 中身は `include_str!` のコンパイル時定数なので、パース失敗は**ビルド時点のバグ**で
+/// あって実行時の入力エラーではない。黙って該当プリセットを落とすと
+/// 「カタログから1つ消えているのに誰も気づかない」という最悪の壊れ方をするので、
+/// ファイル名を添えて panic する(テストで全件パースを担保している)。
 pub fn all() -> Vec<Preset> {
     PRESET_FILES
         .iter()
-        .filter_map(|(_, json)| serde_json::from_str::<Preset>(json).ok())
+        .map(|(name, json)| {
+            serde_json::from_str::<Preset>(json).unwrap_or_else(|e| {
+                panic!("embedded preset {name}.json is malformed (build-time bug): {e}")
+            })
+        })
         .collect()
 }
 
@@ -192,32 +200,18 @@ mod tests {
         assert_eq!(names, sorted, "PRESET_FILES must be sorted and unique");
     }
 
-    /// v0.1 op のみで構成されたプリセットは、いま atx-core の validate を通る。
+    /// **全**プリセットが atx-core の validate を通ること。
+    ///
+    /// op のバージョンごとに名前を手で数えた個別テストは、新しいプリセットを
+    /// 足したときに黙って検証から漏れる。表 (`PRESET_FILES`) 自体を回して
+    /// 「登録されているものは全部 valid」を1本で担保する。
     #[test]
-    fn v1_only_presets_pass_core_validate() {
-        for name in ["eyecatch_16_9", "thumbnail_square", "web_optimize"] {
+    fn every_preset_passes_core_validate() {
+        for (name, _) in PRESET_FILES {
             let preset = resolve(name).expect("preset must resolve");
             atx_core::recipe::validate(&preset.recipe)
                 .unwrap_or_else(|e| panic!("preset {name} must be a valid recipe: {e}"));
         }
-    }
-
-    /// color_matrix / curves 系プリセットの validate(v0.2 の color op で実装済み)。
-    #[test]
-    fn color_presets_pass_core_validate() {
-        for name in ["film_soft", "grayscale", "sepia"] {
-            let preset = resolve(name).expect("preset must resolve");
-            atx_core::recipe::validate(&preset.recipe)
-                .unwrap_or_else(|e| panic!("preset {name} must be a valid recipe: {e}"));
-        }
-    }
-
-    /// v0.3 op(white_balance)を使うプリセットの validate。
-    #[test]
-    fn v03_presets_pass_core_validate() {
-        let preset = resolve("product_clean").expect("preset must resolve");
-        atx_core::recipe::validate(&preset.recipe)
-            .unwrap_or_else(|e| panic!("preset product_clean must be a valid recipe: {e}"));
     }
 
     #[test]
@@ -225,34 +219,10 @@ mod tests {
         assert!(matches!(resolve("nope"), Err(PresetError::Unknown)));
     }
 
-    /// v0.3.0 op(gradient_map)を使うプリセットの validate。
-    /// gradient_map の validate は着地済み(`ops::gradient::validate_stops`)。
+    /// `all()` は表の全件を返す(壊れた JSON を黙って落とさない)。
     #[test]
-    fn gradient_map_preset_passes_core_validate() {
-        let preset = resolve("duotone_navy_cream").expect("preset must resolve");
-        atx_core::recipe::validate(&preset.recipe)
-            .unwrap_or_else(|e| panic!("preset duotone_navy_cream must be a valid recipe: {e}"));
-    }
-
-    /// v0.3.0 op(vignette / grain / auto_levels)を使うプリセット。
-    /// これらの `validate` は他 2 エージェントが並行実装中で、この時点では
-    /// `todo!()` のため呼ぶとパニックする。ops が着地したら ignore を外すこと。
-    #[test]
-    fn vignette_grain_auto_levels_presets_pass_core_validate() {
-        for name in [
-            "film_warm",
-            "film_cool",
-            "film_grain_strong",
-            "grain_fine",
-            "portrait_soft",
-            "landscape_punch",
-            "soft_vignette",
-            "product_white",
-            "architecture_clean",
-        ] {
-            let preset = resolve(name).expect("preset must resolve");
-            atx_core::recipe::validate(&preset.recipe)
-                .unwrap_or_else(|e| panic!("preset {name} must be a valid recipe: {e}"));
-        }
+    fn all_returns_every_registered_preset() {
+        let names: Vec<String> = all().into_iter().map(|p| p.name).collect();
+        assert_eq!(names, preset_names());
     }
 }

@@ -13,6 +13,17 @@ use crate::{AtxError::InvalidRecipe, Result};
 const MIN_STOPS: usize = 2;
 const MAX_STOPS: usize = 8;
 
+/// 隣り合う `position` に要求する最小間隔。
+///
+/// canonical JSON(`recipe::canonical_json`)は数値を **1e-6 グリッド**へ量子化する。
+/// それより近い 2 点は正規化の時点で同じ値に潰れるので、「生のレシピは validate を
+/// 通るのに、エコーバックされた正規形は validate に落ちる」という
+/// エコー冪等性の破れが起きる。グリッドと同じ刻みを validate 側にも要求して閉じる。
+const MIN_POSITION_GAP: f64 = 1e-6;
+/// `MIN_POSITION_GAP` ちょうどの間隔を二進浮動小数の丸め誤差(`0.500001 - 0.5` は
+/// 1e-6 をわずかに下回る)で弾かないための許容。
+const GAP_SLACK: f64 = 1e-15;
+
 /// BT.709 輝度係数(sRGB 符号値ベース)。
 const LUMA_R: f64 = 0.2126;
 const LUMA_G: f64 = 0.7152;
@@ -21,7 +32,8 @@ const LUMA_B: f64 = 0.0722;
 /// stops の静的検証。
 ///
 /// - 個数は 2..=8
-/// - `position` は有限かつ 0.0..=1.0、狭義単調増加(重複・逆転はエラー)
+/// - `position` は有限かつ 0.0..=1.0、狭義単調増加。さらに隣接点の間隔は
+///   **canonical JSON の 1e-6 グリッド以上**(それより近いと正規化で潰れる)
 /// - `color` は `recipe::parse_hex_color` でパース可能な CSS hex
 ///
 /// # hex のアルファについて
@@ -52,9 +64,12 @@ pub fn validate_stops(index: usize, stops: &[GradientStop]) -> Result<()> {
             )));
         }
         if let Some(p) = prev {
-            if stop.position <= p {
+            if stop.position - p < MIN_POSITION_GAP - GAP_SLACK {
                 return Err(fail(format!(
-                    "stops[{i}].position must be strictly increasing, got {} after {}",
+                    "stops[{i}].position must be strictly increasing with at least \
+                     {MIN_POSITION_GAP} between stops (canonical JSON quantizes positions to the \
+                     1e-6 grid, so closer stops collapse into a duplicate and the echoed-back \
+                     recipe would no longer validate), got {} after {}",
                     stop.position, p
                 )));
             }
@@ -178,6 +193,25 @@ mod tests {
     fn validate_rejects_non_increasing_positions() {
         let err = validate_stops(0, &[stop(0.5, "#000000"), stop(0.5, "#ffffff")]);
         assert!(err.is_err());
+    }
+
+    /// 回帰: 1e-6 グリッドより近い 2 点は validate で弾く。
+    ///
+    /// 以前は「狭義単調増加」しか見ていなかったため、5e-7 差の stops が validate を
+    /// 通り、canonical JSON へ落とした瞬間に同じ position へ潰れて
+    /// 「エコーバックしたレシピが validate に落ちる」状態になっていた。
+    #[test]
+    fn validate_rejects_stops_closer_than_the_quantization_grid() {
+        let err = validate_stops(0, &[stop(0.5, "#000000"), stop(0.500_000_5, "#ffffff")])
+            .expect_err("sub-grid separation must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("1e-6 grid"), "{msg}");
+    }
+
+    /// 1e-6 ちょうど離れていれば受理する(グリッド上で別の点になる)。
+    #[test]
+    fn validate_accepts_stops_exactly_one_grid_step_apart() {
+        assert!(validate_stops(0, &[stop(0.5, "#000000"), stop(0.500_001, "#ffffff")]).is_ok());
     }
 
     #[test]

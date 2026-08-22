@@ -1,8 +1,12 @@
-# evals/ — エージェント eval ハーネス(v0.2)
+# evals/ — エージェント eval ハーネス
 
 ROADMAP.md「Agent UX の規律 #5」対応: 実務タスクを Claude Code の headless 実行(`claude -p`)で
 実際に atx-mcp サーバへ接続させ、成功率・往復数を計測する。**リリース前ゲート**として手動実行する。
 CI には組み込まない(§下記コスト注意)。
+
+(このハーネス自体は ROADMAP.md の計画上の作業パッケージ plan-v0.2 で導入されたもの。
+ハーネスのコードとタスク一覧は現在も継続してメンテされている現行版であり、
+「v0.2 時点のスナップショット」ではない)
 
 ## ⚠️ コスト注意
 
@@ -129,9 +133,9 @@ python3 evals/score.py --selftest
 
 ## 既知の制約
 
-- `t09_preset_use` はビルトインプリセット(`presets/` + `apply_transform` の `preset` 引数、
-  ROADMAP v0.2)を前提にしている。プリセット機構が未実装の間は意図的に失敗しうる
-  (別トラックで並行実装中)。実装後にこのタスクが green になることも回帰確認の一部。
+- `t09_preset_use` はビルトインプリセット(`presets/` + `apply_transform` の `preset` 引数)を
+  前提にしている。プリセット機構は実装済みで、`presets/` には 30 本のプリセットが
+  同梱されている(docs/DESIGN.md §9.10)。このタスクは通常どおり green であることを期待する。
 - 採点は台帳(`assets.jsonl`)ベースが基本。往復数・トークン消費量は `transcript.json` に
   残るが、`run.sh` の集計 JSON では現状 `claude_exit_code` のみを記録している。
   ターン数の詳細比較が要る場合は `transcript.json` を直接見ること。

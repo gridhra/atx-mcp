@@ -11,7 +11,6 @@
 
 const { spawn } = require("node:child_process");
 
-// NOTE: owner is a placeholder until the repo exists (see RELEASING.md step 0).
 const REPO_URL = "https://github.com/gridhra/atx-mcp";
 
 const PLATFORMS = {
@@ -36,7 +35,11 @@ function resolveBinary() {
       error:
         `the platform package "${pkg}" is not installed.\n` +
         `This usually means the install ran with --no-optional, or with a\n` +
-        `different --os/--cpu than the machine you are running on.`,
+        `different --os/--cpu than the machine you are running on. It can also\n` +
+        `mean the platform package for this release hasn't been published yet\n` +
+        `(win32-x64 in particular is sometimes delayed by npm's spam-detection\n` +
+        `hold) — check the GitHub release page for available downloads:\n` +
+        `  ${REPO_URL}/releases`,
     };
   }
 }

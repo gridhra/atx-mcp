@@ -45,6 +45,14 @@ use crate::{AtxError, Result};
 
 /// ラスタ 1 辺の上限(validate)。実務のロゴ・ウォーターマークには十分広い。
 const MAX_RASTER_EDGE: u32 = 32_768;
+/// 貼り付け位置 `x` / `y` の絶対値上限(validate)。
+///
+/// `x` / `y` は「画像の外へ出た分はクリップする」という仕様上、負値も含めて自由に
+/// 取れるが、`i64` を無制限に受けると `apply` の `x + rx` が桁あふれして
+/// debug ビルドで panic する。最大画素数(100MP ⇒ 1 辺は高々 1e8 未満)より広い
+/// 1e8 を上限にすれば、実用上の配置(画像の外へ大きく逃がす)は全て表現でき、
+/// かつ加算が `i64` の範囲に収まる。
+const MAX_OFFSET: i64 = 100_000_000;
 /// ラスタ画素数の上限(実行時)。`Limits::max_pixels` の既定と同じ 100MP。
 const MAX_RASTER_PIXELS: u64 = 100_000_000;
 
@@ -57,6 +65,8 @@ pub(crate) const TEXT_WARNING: &str =
 pub fn validate(
     index: usize,
     svg_revision_id: &str,
+    x: i64,
+    y: i64,
     opacity: f64,
     width: Option<u32>,
     height: Option<u32>,
@@ -76,6 +86,15 @@ pub fn validate(
         return Err(AtxError::InvalidRecipe(format!(
             "operations[{index}] (svg_overlay): opacity must be within 0.0..=1.0, got {opacity}"
         )));
+    }
+    for (name, v) in [("x", x), ("y", y)] {
+        if v.unsigned_abs() > MAX_OFFSET as u64 {
+            return Err(AtxError::InvalidRecipe(format!(
+                "operations[{index}] (svg_overlay): {name} must be within \
+                 -{MAX_OFFSET}..={MAX_OFFSET} (the overlay is clipped to the image anyway; \
+                 wider offsets only overflow the placement arithmetic), got {v}"
+            )));
+        }
     }
     for (name, v) in [("width", width), ("height", height)] {
         if let Some(v) = v {
@@ -271,7 +290,9 @@ pub(crate) fn rasterize(
 
 /// ラスタを `(x, y)`(左上・現在の画像座標)へ合成する。
 ///
-/// - 画像の外へ出た部分は**クリップ**する(負の座標も可)
+/// - 画像の外へ出た部分は**クリップ**する(負の座標も可)。位置の加算は
+///   `saturating_add`(validate が `|x|, |y| <= MAX_OFFSET` を保証しているので
+///   本来飽和しないが、算術の安全性を validate だけに依存させない)
 /// - 画素合成はレイヤー合成と**同じ関数** [`crate::ops::blend::composite_px`]
 ///   (αs = ラスタのアルファ × opacity、マスク重みは 1.0)
 /// - `img` は呼び出し側で sRGB 符号値空間にしてあること
@@ -286,12 +307,12 @@ pub(crate) fn apply(
     let (cw, ch) = img.dimensions();
     let (rw, rh) = raster.dimensions();
     for ry in 0..rh {
-        let iy = y + ry as i64;
+        let iy = y.saturating_add(ry as i64);
         if iy < 0 || iy >= ch as i64 {
             continue;
         }
         for rx in 0..rw {
-            let ix = x + rx as i64;
+            let ix = x.saturating_add(rx as i64);
             if ix < 0 || ix >= cw as i64 {
                 continue;
             }
@@ -368,14 +389,61 @@ mod tests {
 
     #[test]
     fn validate_matrix() {
-        assert!(validate(0, "rev_x", 1.0, None, None).is_ok());
-        assert!(validate(0, "", 1.0, None, None).is_err());
-        assert!(validate(0, "nope", 1.0, None, None).is_err());
-        assert!(validate(0, "rev_x", 1.5, None, None).is_err());
-        assert!(validate(0, "rev_x", f64::NAN, None, None).is_err());
-        assert!(validate(0, "rev_x", 1.0, Some(0), None).is_err());
-        assert!(validate(0, "rev_x", 1.0, None, Some(0)).is_err());
-        assert!(validate(0, "rev_x", 1.0, Some(MAX_RASTER_EDGE + 1), None).is_err());
+        assert!(validate(0, "rev_x", 0, 0, 1.0, None, None).is_ok());
+        assert!(validate(0, "", 0, 0, 1.0, None, None).is_err());
+        assert!(validate(0, "nope", 0, 0, 1.0, None, None).is_err());
+        assert!(validate(0, "rev_x", 0, 0, 1.5, None, None).is_err());
+        assert!(validate(0, "rev_x", 0, 0, f64::NAN, None, None).is_err());
+        assert!(validate(0, "rev_x", 0, 0, 1.0, Some(0), None).is_err());
+        assert!(validate(0, "rev_x", 0, 0, 1.0, None, Some(0)).is_err());
+        assert!(validate(0, "rev_x", 0, 0, 1.0, Some(MAX_RASTER_EDGE + 1), None).is_err());
+    }
+
+    /// 回帰: 青天井の `x` / `y` は validate で弾く。
+    ///
+    /// 以前は範囲検査が無く、`x = i64::MAX` が `apply` の `x + rx` を桁あふれさせて
+    /// debug ビルドで panic していた(release では巻き戻って別の場所へ描かれる)。
+    #[test]
+    fn validate_rejects_unbounded_offsets() {
+        for (x, y) in [
+            (i64::MAX, 0),
+            (i64::MIN, 0),
+            (0, i64::MAX),
+            (MAX_OFFSET + 1, 0),
+            (0, -MAX_OFFSET - 1),
+        ] {
+            let err = validate(0, "rev_x", x, y, 1.0, None, None)
+                .expect_err("out-of-range offset must be rejected");
+            assert!(err.to_string().contains("svg_overlay"), "{err}");
+        }
+        // 上限ちょうどは通る(画像の外へ大きく逃がす配置は仕様の範囲内)。
+        assert!(validate(0, "rev_x", -MAX_OFFSET, MAX_OFFSET, 1.0, None, None).is_ok());
+    }
+
+    /// 回帰: 上限いっぱいの負オフセットでも桁あふれせず、全部クリップされるだけ。
+    #[test]
+    fn extreme_negative_placement_clips_without_overflow() {
+        let mut img = LinearImage::from_pixel(4, 4, [0.0, 0.0, 0.0, 1.0]);
+        let raster = LinearImage::from_pixel(4, 4, [1.0, 1.0, 1.0, 1.0]);
+        apply(
+            &mut img,
+            &raster,
+            -MAX_OFFSET,
+            -MAX_OFFSET,
+            BlendMode::Normal,
+            1.0,
+        );
+        assert_eq!(img.get(0, 0), [0.0, 0.0, 0.0, 1.0]);
+        // 飽和加算なので i64::MAX でも panic しない(validate の後段の belt-and-braces)。
+        apply(
+            &mut img,
+            &raster,
+            i64::MAX,
+            i64::MAX,
+            BlendMode::Normal,
+            1.0,
+        );
+        assert_eq!(img.get(3, 3), [0.0, 0.0, 0.0, 1.0]);
     }
 
     /// 負の座標でも panic せず、はみ出し部分だけクリップされる。

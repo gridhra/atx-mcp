@@ -4,7 +4,7 @@
   "recipe": {
     "operations": [
       { "op": "crop", "aspect_ratio": "16:9", "anchor": "center" },
-      { "op": "resize", "width": 1600, "fit": "cover", "without_enlargement": true },
+      { "op": "resize", "width": 1600, "fit": "cover", "without_enlargement": false },
       { "op": "encode", "format": "webp", "quality": 82 }
     ]
   }

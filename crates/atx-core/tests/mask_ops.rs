@@ -555,6 +555,58 @@ fn undecodable_mask_reports_the_id() {
     assert!(msg.contains("image"), "{msg}");
 }
 
+/// 回帰: マスク画像のデコードにも `Limits` が効く。
+///
+/// 以前は `image::load_from_memory` を無検査で呼んでいたため、本体の入力には
+/// 上限があるのに **マスク経由なら任意サイズのアセットをデコードできた**
+/// (デコード爆弾の抜け道)。今は入力画像と同じ検査を通し、超過は
+/// `AtxError::LimitExceeded` として構造化されたまま返る。
+#[test]
+fn oversized_mask_bytes_hit_the_limit_instead_of_allocating() {
+    let input = gray_input(8, 8, 128);
+    // 8x8 の入力より大きく、かつバイト上限を跨ぐマスク(ノイズ入りで圧縮を効かせない)。
+    let mask = gray_png(256, 256, |x, y| {
+        (x.wrapping_mul(37) ^ y.wrapping_mul(101)) as u8
+    });
+    assert!(
+        input.len() < mask.len(),
+        "the fixture must fit under the cap"
+    );
+    let limits = Limits {
+        max_bytes: (mask.len() - 1) as u64,
+        ..Limits::default()
+    };
+
+    let err = apply_recipe_with_assets(
+        &input,
+        &recipe(&curves_recipe(&mask_json("rev_big", false, 0.0))),
+        &limits,
+        &MockAssets::new(&[("rev_big", mask.clone())]),
+    )
+    .expect_err("an over-limit mask must be rejected");
+    assert!(
+        matches!(err, atx_core::AtxError::LimitExceeded(_)),
+        "expected a structural limit error, got {err:?}"
+    );
+
+    // 画素数の上限でも同じ(ヘッダの寸法だけで弾ける = フルデコードしない)。
+    let limits = Limits {
+        max_pixels: 1_000,
+        ..Limits::default()
+    };
+    let err = apply_recipe_with_assets(
+        &input,
+        &recipe(&curves_recipe(&mask_json("rev_big", false, 0.0))),
+        &limits,
+        &MockAssets::new(&[("rev_big", mask)]),
+    )
+    .expect_err("an over-limit mask must be rejected");
+    assert!(
+        matches!(err, atx_core::AtxError::LimitExceeded(_)),
+        "expected a structural limit error, got {err:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 7. ゴールデン(フィクスチャ + 放射マスク + curves + jpeg)
 // ---------------------------------------------------------------------------

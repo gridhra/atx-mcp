@@ -20,9 +20,15 @@ use std::collections::HashMap;
 use crate::engine::AssetResolver;
 use crate::linear::{quantize_1e6, LinearImage};
 use crate::recipe::MaskRef;
-use crate::{AtxError, Result};
+use crate::{AtxError, Limits, Result};
 
 /// `feather_px` の上限(現在の画像座標でのガウス σ)。
+///
+/// なお `ops::blur` のカーネル半径は `ceil(3σ)` を **255 で頭打ち**にしているので、
+/// `feather_px > 85` では σ に対してカーネルが足りず、理想のガウスより裾の短い
+/// 低域通過になる(重みは量子化後の合計で正規化されるため、平面の値域は 0..1 の
+/// ままで破綻はしない)。実務上の影響は小さいが、「feather_px を上げ続ければ
+/// いくらでもぼけ幅が広がる」わけではない。
 const MAX_FEATHER_PX: f64 = 200.0;
 
 /// BT.709 輝度係数(sRGB 符号値に対してそのまま掛ける。上のモジュールコメント参照)。
@@ -85,6 +91,7 @@ impl MaskCache {
         width: u32,
         height: u32,
         assets: &dyn AssetResolver,
+        limits: &Limits,
     ) -> Result<&[f32]> {
         let key = MaskKey {
             revision_id: mask.revision_id.clone(),
@@ -94,7 +101,7 @@ impl MaskCache {
             height,
         };
         if !self.entries.contains_key(&key) {
-            let weights = resolve_mask(mask, width, height, assets)?;
+            let weights = resolve_mask(mask, width, height, assets, limits)?;
             self.entries.insert(key.clone(), weights);
         }
         Ok(&self.entries[&key])
@@ -102,20 +109,29 @@ impl MaskCache {
 }
 
 /// マスク revision を読み、`width`×`height` の重み平面へ解決する(キャッシュなし)。
+///
+/// デコードは **入力画像・レイヤーソースと同じ `Limits` 検査**を通す
+/// (`engine::decode_checked`)。マスクは呼び出し側が自由に指す任意のアセットなので、
+/// ここだけ無検査でデコードすると「本体には上限があるのにマスク経由なら
+/// デコード爆弾を通せる」抜け道になる。上限超過は構造化された
+/// `AtxError::LimitExceeded` のまま返す(「壊れた画像」ではなく「大きすぎる画像」
+/// だと呼び出し側が区別できるように)。
 pub fn resolve_mask(
     mask: &MaskRef,
     width: u32,
     height: u32,
     assets: &dyn AssetResolver,
+    limits: &Limits,
 ) -> Result<Vec<f32>> {
     let id = &mask.revision_id;
     let bytes = assets
         .read_revision(id)
         .map_err(|e| AtxError::InvalidRecipe(format!("mask asset {id} could not be read: {e}")))?;
-    let decoded = image::load_from_memory(&bytes).map_err(|e| {
-        AtxError::InvalidRecipe(format!(
-            "mask asset {id} is not a decodable image (any raster format is accepted): {e}"
-        ))
+    let decoded = crate::engine::decode_checked(&bytes, limits).map_err(|e| match e {
+        limit @ AtxError::LimitExceeded(_) => limit,
+        other => AtxError::InvalidRecipe(format!(
+            "mask asset {id} is not a decodable image (any raster format is accepted): {other}"
+        )),
     })?;
     let rgba = decoded.to_rgba8();
     let (mw, mh) = rgba.dimensions();

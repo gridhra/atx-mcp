@@ -363,32 +363,27 @@ pub struct ListAssetsOutput {
     pub revisions: Vec<RevisionSummary>,
 }
 
-/// `list_operations` のカタログ1行。
+/// `list_operations` のカタログ1行(**機械可読の最小形**)。
+///
+/// 要約・パラメータ表記はテキストサマリ側にだけ載せる: structuredContent と
+/// テキストの両方に同じ散文を積むと 1 回の呼び出しで ~4.7k tokens を焼いてしまうため
+/// (ROADMAP §Agent UX の規律 #2「語彙の段階的開示」= カタログの予算を守る)。
+/// 完全な仕様が要るときは `explain_operation` を呼ぶ。
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct OperationCatalogEntry {
     pub name: String,
     pub category: String,
-    pub summary: String,
-    /// `"name*: type range"`(`*` = 必須、`=x` = 既定値、`?` = 任意)の簡潔な列。
-    pub params: Vec<String>,
 }
 
-/// プリセットのカタログ1行。
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct PresetCatalogEntry {
-    pub name: String,
-    pub description: String,
-}
-
-/// `list_operations` の structuredContent。
+/// `list_operations` の structuredContent(compact machine form)。
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ListOperationsOutput {
     pub count: usize,
-    pub operations: Vec<OperationCatalogEntry>,
-    /// ビルトインプリセット(`apply_transform` / `render_preview` の `preset` に渡せる名前)。
-    pub presets: Vec<PresetCatalogEntry>,
-    /// 次の一手(完全なスキーマは explain_operation)。
-    pub next: String,
+    /// op の名前と分類だけ。要約・パラメータはテキスト側 / `explain_operation` 側。
+    pub ops: Vec<OperationCatalogEntry>,
+    /// ビルトインプリセット名(`apply_transform` / `render_preview` の `preset` に渡せる)。
+    /// 説明はテキストサマリ側にだけ載せる。
+    pub presets: Vec<String>,
 }
 
 /// `explain_operation` のパラメータ1行。
@@ -541,6 +536,12 @@ fn atx_error(err: AtxError) -> CallToolResult {
 
 /// 画像でない revision に画像ツールを向けたときの構造化エラー。
 fn not_an_image(revision_id: &str, mime_type: &str) -> CallToolResult {
+    not_an_image_side(revision_id, mime_type, None)
+}
+
+/// [`not_an_image`] の side 付き版(`compare_revisions` の A/B のように、
+/// どちらの引数が悪いのかを名指しできる呼び出し元のため)。
+fn not_an_image_side(revision_id: &str, mime_type: &str, side: Option<&str>) -> CallToolResult {
     let hint = if mime_type == CUBE_MIME {
         "this is an imported .cube 3D LUT asset, not an image; reference it from a recipe as {\"op\": \"lut\", \"lut_revision_id\": \"...\"} instead of inspecting it"
     } else if mime_type == SVG_MIME {
@@ -548,14 +549,19 @@ fn not_an_image(revision_id: &str, mime_type: &str) -> CallToolResult {
     } else {
         "call list_assets and pick a revision whose mime_type starts with \"image/\""
     };
+    let where_ = match side {
+        Some(side) => format!(" (revision_id_{side})"),
+        None => String::new(),
+    };
     tool_error(
         "not_an_image",
         format!(
-            "revision {revision_id:?} has mime_type {mime_type:?} and is not an image, so it cannot be inspected"
+            "revision {revision_id:?}{where_} has mime_type {mime_type:?} and is not an image, so it cannot be inspected"
         ),
         serde_json::json!({
             "revision_id": revision_id,
             "mime_type": mime_type,
+            "side": side,
             "recovery": hint,
         }),
     )
@@ -895,6 +901,12 @@ impl AtxTools {
 
     /// 傾き角候補を返す(read-only、自動適用はしない)。
     pub fn detect_tilt(&self, params: &DetectTiltParams) -> CallToolResult {
+        let revision = tri!(self.store.get_revision(&params.revision_id), store_error);
+        // 画像でない revision(.cube LUT / SVG 等)はデコードを試みず、
+        // inspect_image と同じ構造化エラーで返す。
+        if !is_raster_image(&revision.mime_type) {
+            return not_an_image(&params.revision_id, &revision.mime_type);
+        }
         let bytes = tri!(self.store.read_bytes(&params.revision_id), store_error);
         let info = tri!(atx_core::inspect_bytes(&bytes, &self.limits), atx_error);
         let image = tri!(
@@ -991,18 +1003,22 @@ impl AtxTools {
             .map(|op| OperationCatalogEntry {
                 name: op.name.to_string(),
                 category: op.category.to_string(),
-                summary: op.summary.to_string(),
-                params: op.params.iter().map(|p| p.compact()).collect(),
+            })
+            .collect();
+        // 人間可読テキスト用の詳細(要約 + パラメータ表記)。structuredContent には載せない。
+        let params_line: Vec<String> = selected
+            .iter()
+            .map(|op| {
+                op.params
+                    .iter()
+                    .map(|p| p.compact())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             })
             .collect();
 
-        let presets: Vec<PresetCatalogEntry> = crate::presets::all()
-            .into_iter()
-            .map(|p| PresetCatalogEntry {
-                name: p.name,
-                description: p.description,
-            })
-            .collect();
+        let presets = crate::presets::all();
+        let preset_names: Vec<String> = presets.iter().map(|p| p.name.clone()).collect();
 
         let mut text = format!(
             "{} recipe operations{} (params: name* = required, name? = optional, =x or (def) = default):",
@@ -1012,16 +1028,16 @@ impl AtxTools {
                 None => String::new(),
             }
         );
-        for entry in &entries {
+        for (op, params) in selected.iter().zip(&params_line) {
             text.push_str(&format!(
                 "\n- {} [{}] {}{}",
-                entry.name,
-                entry.category,
-                entry.summary,
-                if entry.params.is_empty() {
+                op.name,
+                op.category,
+                op.summary,
+                if params.is_empty() {
                     String::new()
                 } else {
-                    format!(" | {}", entry.params.join(", "))
+                    format!(" | {params}")
                 }
             ));
         }
@@ -1031,17 +1047,16 @@ impl AtxTools {
                 text.push_str(&format!("\n- {}: {}", preset.name, preset.description));
             }
         }
-        let next =
-            "call explain_operation {\"operation\":\"<name>\"} for full params, examples and gotchas".to_string();
-        text.push_str(&format!("\n{next}."));
+        text.push_str(
+            "\ncall explain_operation {\"operation\":\"<name>\"} for full params, examples and gotchas.",
+        );
 
         ok_result(
             text,
             &ListOperationsOutput {
                 count: entries.len(),
-                operations: entries,
-                presets,
-                next,
+                ops: entries,
+                presets: preset_names,
             },
         )
     }
@@ -1511,6 +1526,14 @@ impl AtxTools {
             Err(e) => return store_error(e),
         };
 
+        // 画像でない revision(.cube LUT / SVG 等)はデコードを試みず、
+        // inspect_image と同じ構造化エラーを「どちら側か」付きで返す。
+        for (rev, side) in [(&rev_a, "a"), (&rev_b, "b")] {
+            if !is_raster_image(&rev.mime_type) {
+                return not_an_image_side(&rev.revision_id, &rev.mime_type, Some(side));
+            }
+        }
+
         let bytes_a = tri!(self.store.read_bytes(&params.revision_id_a), store_error);
         let bytes_b = tri!(self.store.read_bytes(&params.revision_id_b), store_error);
 
@@ -1800,10 +1823,16 @@ impl AtxTools {
             }
         };
 
-        // ワークスペースの管理領域(objects / previews)への書き込みは常に拒否する。
-        let objects = self.store.root().join("objects");
-        let previews = self.store.root().join("previews");
-        if dest.starts_with(&objects) || dest.starts_with(&previews) {
+        // ワークスペース root 配下への書き込みは**一律に**拒否する。
+        // objects / previews だけでなく台帳(assets.jsonl)も、将来増えるファイルも同じ:
+        // 不変ストアの管理領域へ export するのが正当なケースは存在しない。
+        //
+        // 比較は**両側を canonicalize してから**行う: macOS の /tmp は
+        // /private/tmp へのシンボリックリンクなので、文字列比較だけでは
+        // シンボリックリンク経由のパスが素通りしてしまう。
+        let ws_root = real_prefix(self.store.root());
+        let dest_real = real_prefix(&dest);
+        if dest_real.starts_with(&ws_root) {
             return tool_error(
                 "dest_inside_workspace",
                 format!(
@@ -1812,8 +1841,9 @@ impl AtxTools {
                 ),
                 serde_json::json!({
                     "dest_path": dest.to_string_lossy(),
-                    "workspace": self.store.root().to_string_lossy(),
-                    "recovery": "choose a destination outside <workspace>/objects and <workspace>/previews",
+                    "resolved_dest_path": dest_real.to_string_lossy(),
+                    "workspace": ws_root.to_string_lossy(),
+                    "recovery": "choose a destination outside the workspace directory entirely (objects/, previews/ and the assets.jsonl ledger all live there)",
                 }),
             );
         }
@@ -2307,6 +2337,34 @@ fn draw_mask_overlay_jpeg(jpeg_bytes: &[u8], mask_bytes: &[u8]) -> Result<Vec<u8
     }
 
     encode_jpeg_q80(&rgb)
+}
+
+/// パスの「実在する最長の祖先」を `canonicalize` し、残りの成分をそのまま付け直す。
+///
+/// `export_asset` の書き出し先はまだ存在しないので `canonicalize` を直接は呼べないが、
+/// 親ディレクトリまでは実在する。macOS の `/tmp` → `/private/tmp` のように
+/// **祖先がシンボリックリンク**だと文字列比較でのワークスペース判定を素通りしてしまうため、
+/// 「ワークスペース内か」を判定する前に両側をこの関数へ通す。
+/// どの祖先も canonicalize できない場合は入力をそのまま返す(判定は字句比較に退化する)。
+fn real_prefix(path: &Path) -> PathBuf {
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        if let Ok(real) = cursor.canonicalize() {
+            let mut out = real;
+            for part in suffix.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match cursor.file_name() {
+            Some(name) => suffix.push(name.to_os_string()),
+            None => return path.to_path_buf(),
+        }
+        if !cursor.pop() {
+            return path.to_path_buf();
+        }
+    }
 }
 
 /// 相対パスを cwd 基準の絶対パスにし、`.` / `..` を字句的に畳む。

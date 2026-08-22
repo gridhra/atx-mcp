@@ -2,28 +2,17 @@
 
 メンテナ向け。リリースはタグ push で全自動。
 
-## 0. 一度だけ: `gridhra` プレースホルダの置換
+## 0. (履歴) `gridhra` プレースホルダの置換
 
-リポジトリ作成前に書いたため、GitHub owner はリテラル `gridhra` になっている。
-実際の owner に置換する:
+リポジトリ作成前に `gridhra` を仮の owner 名として書いていたが、
+現在は実在する GitHub owner(`gridhra/atx-mcp`)なので、この節の置換作業は
+**もう不要**。過去に存在した手順の記録として残す。
 
-```sh
-# 対象を確認
-grep -rn gridhra . --exclude-dir=target --exclude-dir=.git --exclude-dir=node_modules
-
-# 置換(YOUR_ORG を実際の owner に)
-grep -rl gridhra . --exclude-dir=target --exclude-dir=.git --exclude-dir=node_modules \
-  | xargs sed -i '' 's/gridhra/YOUR_ORG/g'      # macOS / BSD sed
-# GNU sed (Linux) の場合は:  xargs sed -i 's/gridhra/YOUR_ORG/g'
-```
-
-`RELEASING.md` 自身にも文字列が残るが無害(この節の説明文)。
-
-> CI の中では、`npm/scripts/build-packages.mjs` が publish 時に `$GITHUB_REPOSITORY`
-> を使って `gridhra/atx-mcp` を自動置換する。npm provenance は
-> package.json の repository URL がビルド元リポジトリと一致することを要求するため、
-> 置換を忘れても npm publish は壊れない。ただし README とインストーラの URL は
-> 直らないので、上記の置換は必ず行うこと。
+なお `npm/scripts/build-packages.mjs` は publish 時に `$GITHUB_REPOSITORY`
+(CI が自ら知っているビルド元リポジトリ)で `gridhra/atx-mcp` の文字列を
+上書きする。npm provenance は package.json の repository URL がビルド元
+リポジトリと一致することを要求するため、フォークや将来のリポジトリ移転が
+あっても npm publish 自体は壊れないようにするための仕組み。
 
 ## 1. npm 認証 — Trusted Publishing(OIDC、トークン不要)
 
@@ -67,13 +56,15 @@ publish 後、上記の Trusted Publisher を登録すれば以後のバージ�
 # 1) workspace version を上げる(Cargo.toml [workspace.package] の version 1 箇所)
 vim Cargo.toml
 cargo check --workspace          # Cargo.lock を追従させる
-git add -A && git commit -m "Release v0.2.0"
+git add -A && git commit -m "Release vX.Y.Z"
 
 # 2) タグを打って push
-git tag v0.2.0
+git tag vX.Y.Z
 git push origin main
-git push origin v0.2.0
+git push origin vX.Y.Z
 ```
+
+(`vX.Y.Z` は実際のバージョン、例: `v0.3.0`、に読み替える)
 
 以降は `.github/workflows/release.yml` が実行する:
 
@@ -81,14 +72,29 @@ git push origin v0.2.0
    (バイナリ + LICENSE + README を同梱)を作成
 2. **release** — 全アーカイブを集めて `SHA256SUMS` を生成し、GitHub Release を作成
 3. **npm** — アーティファクトから npm パッケージ群を組み立て、
-   `npm publish --provenance --access public` する(認証は Trusted Publishing / OIDC)
+   `npm publish --provenance --access public` する(認証は Trusted Publishing / OIDC)。
+   各パッケージの publish 前に `npm view <name>@<version>` で既存 publish 有無を
+   確認し、既に publish 済みならスキップする(部分失敗後の再実行を安全にするため)
 
 npm パッケージのバージョンは常にタグ(先頭 `v` を除いたもの)。
 Cargo の version とタグは手動で一致させる必要がある — **不一致のままタグを打たないこと**
 (`atx-mcp --version` が Cargo.toml の値を返すため)。
 
 失敗したリリースを作り直す場合は、Actions の "Release" ワークフローを
-`workflow_dispatch` で既存タグを指定して再実行できる。
+`workflow_dispatch` で既存タグを指定して再実行できる。npm publish ステップは
+上記の idempotency guard によりすでに publish 済みのパッケージを安全に飛ばすので、
+一部パッケージだけ失敗したケースの再実行にそのまま使える。
+
+### win32 npm publish の既知の許容(意図的)
+
+`atx-mcp-win32-x64` パッケージは npm のスパム誤検知にたびたび引っかかり、
+解除申請中で publish が失敗することがある。`release.yml` はこのパッケージに限り
+**publish 失敗を warning にとどめてワークフローを続行**する(他 5 パッケージの
+publish は通常どおり止める)。この寛容化は暫定措置で、npm 側のスパムブロックが
+解除され安定して publish できるようになったら外してよい。win32 パッケージが
+未 publish の間、`npm/atx-mcp/bin/atx-mcp.js` は該当プラットフォームパッケージが
+見つからないときのフォールバックメッセージで、この可能性(未 publish)と
+GitHub Release ページへの誘導を出す。
 
 ## 3. ビルド環境の前提(変更時の注意)
 
