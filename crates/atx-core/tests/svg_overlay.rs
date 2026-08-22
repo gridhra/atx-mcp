@@ -196,6 +196,19 @@ fn validate_matrix() {
             r#""svg_revision_id":"rev_a","x":0,"y":0,"width":40000"#,
             "1..=32768",
         ),
+        // 配置座標(回帰): 青天井の x / y は `apply` の加算を桁あふれさせていた。
+        (
+            r#""svg_revision_id":"rev_a","x":9223372036854775807,"y":0"#,
+            "x must be within",
+        ),
+        (
+            r#""svg_revision_id":"rev_a","x":0,"y":-9223372036854775808"#,
+            "y must be within",
+        ),
+        (
+            r#""svg_revision_id":"rev_a","x":100000001,"y":0"#,
+            "x must be within",
+        ),
     ];
     for (fields, needle) in bad {
         let json = format!(r#"{{"operations":[{{"op":"svg_overlay",{fields}}}]}}"#);
@@ -211,6 +224,23 @@ fn validate_matrix() {
         r#","opacity":0.5,"blend_mode":"multiply""#,
     ));
     assert!(atx_core::recipe::validate(&ok).is_ok());
+    // 上限いっぱいの大きな負オフセットは通る(全部クリップされるだけ)。
+    let ok = recipe(&overlay_json(-100_000_000, -100_000_000, ""));
+    assert!(atx_core::recipe::validate(&ok).is_ok());
+}
+
+/// 回帰: 上限いっぱいの負オフセットは panic せず、キャンバスを 1 画素も変えない。
+#[test]
+fn extreme_negative_placement_leaves_the_canvas_untouched() {
+    let src = canvas(8, 8, GRAY);
+    let out = run(
+        &src,
+        &overlay_json(-100_000_000, -100_000_000, ""),
+        &MockAssets::badge(),
+    );
+    for px in out.pixels() {
+        assert_eq!(px.0, GRAY_PX, "the overlay is entirely off-canvas");
+    }
 }
 
 /// `svg_overlay` はマスクを取らない(`deny_unknown_fields` が弾く)。

@@ -338,8 +338,16 @@ fn export_into_the_workspace_store_is_refused() {
         .unwrap()
         .to_string();
 
-    for sub in ["objects", "previews"] {
-        let dest = tools.store().root().join(sub).join("sneaky.jpg");
+    // objects / previews だけでなく、台帳(assets.jsonl)も root 直下の任意のファイルも
+    // すべて拒否する: 不変ストアの中へ export するのが正当なケースは存在しない。
+    for rel in [
+        "objects/sneaky.jpg",
+        "previews/sneaky.jpg",
+        "assets.jsonl",
+        "whatever.jpg",
+    ] {
+        let dest = tools.store().root().join(rel);
+        let ledger_before = std::fs::read(tools.store().root().join("assets.jsonl")).ok();
         let refused = tools.export_asset(&ExportAssetParams {
             revision_id: rev.clone(),
             dest_path: dest.to_string_lossy().into_owned(),
@@ -347,10 +355,52 @@ fn export_into_the_workspace_store_is_refused() {
         });
         assert_eq!(
             error_payload(&refused)["error"]["code"],
-            "dest_inside_workspace"
+            "dest_inside_workspace",
+            "export to {rel} must be refused"
         );
-        assert!(!dest.exists());
+        if rel == "assets.jsonl" {
+            assert_eq!(
+                std::fs::read(&dest).ok(),
+                ledger_before,
+                "the ledger must be untouched"
+            );
+        } else {
+            assert!(!dest.exists());
+        }
     }
+}
+
+/// シンボリックリンク経由でワークスペース内を指すパスも拒否すること。
+/// (macOS の /tmp → /private/tmp のように、素の文字列比較では素通りしてしまう。)
+#[test]
+fn export_through_a_symlink_into_the_workspace_is_refused() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let tools = AtxTools::open(workspace.path()).expect("open workspace");
+    let imported = structured(&tools.import_asset(&ImportAssetParams {
+        path: fixture().to_string_lossy().into_owned(),
+    }));
+    let rev = imported["revision"]["revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // <outside>/link -> <workspace>/objects
+    let outside = tempfile::tempdir().expect("tempdir");
+    let link = outside.path().join("link");
+    std::os::unix::fs::symlink(tools.store().root().join("objects"), &link).expect("symlink");
+
+    let dest = link.join("sneaky.jpg");
+    let refused = tools.export_asset(&ExportAssetParams {
+        revision_id: rev,
+        dest_path: dest.to_string_lossy().into_owned(),
+        overwrite: true,
+    });
+    assert_eq!(
+        error_payload(&refused)["error"]["code"],
+        "dest_inside_workspace",
+        "a symlinked path into the store must be refused"
+    );
+    assert!(!dest.exists());
 }
 
 #[test]
@@ -501,6 +551,27 @@ fn tool_registration_matches_the_design_contract() {
     assert!(
         !instructions.contains("auto_orient | rotate"),
         "instructions must not enumerate the operation vocabulary inline"
+    );
+    // instructions は毎セッションの固定費なので予算を持つ。JSON 例は1つ(flat recipe)だけ。
+    assert!(
+        instructions.len() < 4700,
+        "instructions must stay within budget, got {} chars",
+        instructions.len()
+    );
+    assert_eq!(
+        instructions.matches("\n{\"operations\": [\n").count(),
+        1,
+        "only the flat recipe example belongs inline; layers go through explain_operation"
+    );
+    assert!(
+        instructions.contains("explain_operation {\"operation\":\"layers\"}"),
+        "the layers reference must be discoverable from the instructions"
+    );
+    // v0.6 の寸法規則を instructions 側で誤って言い切らないこと
+    // (実際は「各レイヤーの ops の後に backdrop と比較」)。
+    assert!(
+        !instructions.contains("must match the base image's dimensions"),
+        "the layer dimension rule must not be restated (wrongly) here"
     );
 }
 

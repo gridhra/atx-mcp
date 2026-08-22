@@ -564,8 +564,9 @@ pub struct HslShift {
 impl Operation {
     /// この op に付いた局所適用マスク(あれば)。
     ///
-    /// マスクを持てるのは**調整系 11 op のみ**(adjust / color_matrix / curves / levels /
-    /// hsl / lut / white_balance / blur / median / unsharp_mask / convolve)。
+    /// マスクを持てるのは**調整・フィルタ系 14 op のみ**(adjust / color_matrix / curves /
+    /// levels / hsl / lut / white_balance / blur / median / unsharp_mask / convolve /
+    /// grain / gradient_map / auto_levels)。
     /// 幾何 op(resize / rotate / crop / perspective)は「一部だけリサイズ」に
     /// 意味が無いため対象外、encode / strip_metadata / auto_orient も同様。
     /// `clone` / `heal`(v0.7)は `radius` + `feather_px` という**自前の適用領域**を
@@ -1059,11 +1060,21 @@ fn validate_operations(operations: &[Operation]) -> crate::Result<()> {
             } => crate::ops::clone_heal::validate(index, "heal", *radius, *feather_px)?,
             Operation::SvgOverlay {
                 svg_revision_id,
+                x,
+                y,
                 opacity,
                 width,
                 height,
                 ..
-            } => crate::ops::svg::validate(index, svg_revision_id, *opacity, *width, *height)?,
+            } => crate::ops::svg::validate(
+                index,
+                svg_revision_id,
+                *x,
+                *y,
+                *opacity,
+                *width,
+                *height,
+            )?,
             Operation::Flip { .. } => {}
             Operation::Vignette {
                 strength,

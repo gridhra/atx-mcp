@@ -151,7 +151,16 @@ EOF
     set -e
 
     score_json=$(python3 "$SCRIPT_DIR/score.py" "$task_json" --task-dir "$task_dir" --workspace "$workspace_dir" || true)
-    passed=$(printf '%s' "$score_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('passed', False))" 2>/dev/null || echo "False")
+    score_passed=$(printf '%s' "$score_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('passed', False))" 2>/dev/null || echo "False")
+    # claude_exit を pass 判定へ折り込む: claude プロセスが非0終了(クラッシュ/タイムアウト等)
+    # した回は、たとえ台帳の状態が偶然 score.py の条件を満たしていても FAIL 扱いにする。
+    # これがないと expect_no_new_revision タスクは「何もしていない」ことしか見ないため、
+    # claude が異常終了して本当に何もできなかった実行が PASS になってしまう。
+    if [ "$claude_exit" -eq 0 ] && [ "$score_passed" = "True" ]; then
+        passed="True"
+    else
+        passed="False"
+    fi
 
     python3 -c "
 import json, sys

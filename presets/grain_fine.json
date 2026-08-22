@@ -1,6 +1,6 @@
 {
   "name": "grain_fine",
-  "description": "Building block: light, fine, deterministic film grain on its own, for stacking after other looks (no resize/encode).",
+  "description": "Single-op building block: light, fine, deterministic film grain (no resize/encode). Presets do not chain - copy this op into a bigger recipe (see explain_operation) rather than applying a second preset.",
   "recipe": {
     "operations": [
       { "op": "grain", "amount": 0.1, "size": 1, "monochrome": true, "seed": 0 }

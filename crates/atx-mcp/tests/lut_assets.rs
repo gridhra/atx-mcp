@@ -121,6 +121,29 @@ fn inspect_image_rejects_a_cube_revision_with_a_structured_error() {
         .contains("lut"));
 }
 
+/// detect_tilt も非画像 revision(.cube)を inspect_image と同じ
+/// `not_an_image` 構造化エラーで弾くこと(以前はデコードを試みて別のエラーになっていた)。
+#[test]
+fn detect_tilt_rejects_a_cube_revision_with_a_structured_error() {
+    let (_ws, tools) = tools();
+    let imported = structured(&tools.import_asset(&ImportAssetParams {
+        path: cube_fixture().to_string_lossy().into_owned(),
+    }));
+    let rev = imported["revision"]["revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let result = tools.detect_tilt(&atx_mcp::tools::DetectTiltParams {
+        revision_id: rev.clone(),
+        max_abs_angle: None,
+    });
+    let payload = error_payload(&result);
+    assert_eq!(payload["error"]["code"], "not_an_image");
+    assert_eq!(payload["error"]["details"]["mime_type"], CUBE_MIME);
+    assert_eq!(payload["error"]["details"]["revision_id"], rev.as_str());
+}
+
 /// lut op が存在しない revision を参照した場合、画素処理に入る前に
 /// 「どの op の、どの参照が壊れているか」を含む構造化エラーで返る。
 /// これはリゾルバ段の失敗なので、atx-core の lut 実装状況に依存しない。

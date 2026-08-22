@@ -247,6 +247,11 @@ fn pixelate_region_leaves_outside_pixels_byte_identical() {
     }
 }
 
+/// region が画像から外れたときのエラー。engine が `AtxError::Operation` へ
+/// **1 回だけ**包む(op 側は平文メッセージを返す)。
+/// 以前は op 側でも `InvalidRecipe` を作っていたため、
+/// "operation 0 (pixelate) failed: invalid recipe: pixelate: ..." のように
+/// "invalid recipe:" が二重に付いていた。
 #[test]
 fn pixelate_region_fully_outside_image_is_an_error() {
     let img = RgbaImage::from_pixel(4, 4, Rgba([1, 2, 3, 255]));
@@ -255,6 +260,33 @@ fn pixelate_region_fully_outside_image_is_an_error() {
         r###"{"operations":[{"op":"pixelate","block_size":2,"region":{"x":100,"y":100,"width":4,"height":4}}]}"###,
     );
     assert!(msg.contains("pixelate"), "{msg}");
+    assert!(msg.contains("does not intersect"), "{msg}");
+    assert!(
+        !msg.contains("invalid recipe"),
+        "the engine wraps this as an operation failure, not a recipe error: {msg}"
+    );
+}
+
+/// 回帰: ブロック平均はプリマルチプライで取る(透明画素が色を持ち込まない)。
+///
+/// 不透明な赤 + 完全に透明な緑の 2 画素を 1 ブロックで平均する。
+/// ストレートアルファのまま平均していた頃は、リニア光の平均 0.5 が符号値 188 に
+/// なって `[188, 188, 0, 128]` = くすんだ黄色が返っていた。プリマルチプライすれば
+/// 色は赤のまま、アルファだけが半分になる(blur / resize と同じ規約)。
+#[test]
+fn pixelate_does_not_bleed_transparent_pixel_color() {
+    let mut img = RgbaImage::new(2, 1);
+    img.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+    img.put_pixel(1, 0, Rgba([0, 255, 0, 0]));
+    let out = run(
+        &img,
+        r###"{"operations":[{"op":"pixelate","block_size":2},{"op":"encode","format":"png"}]}"###,
+    );
+    for x in 0..2 {
+        let p = out.get_pixel(x, 0).0;
+        assert_eq!([p[0], p[1], p[2]], [255, 0, 0], "pixel {x}: {p:?}");
+        assert!(approx(p[3], 128, 1), "pixel {x} alpha: {p:?}");
+    }
 }
 
 #[test]

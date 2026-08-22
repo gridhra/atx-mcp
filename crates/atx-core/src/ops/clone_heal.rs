@@ -238,8 +238,37 @@ fn extract_patch(img: &LinearImage, cx: u32, cy: u32, radius: u32) -> LinearImag
     patch
 }
 
+/// 画像の対角長(切り上げ、最低 1)。`heal` の実効半径の上限。
+fn diagonal_cap(img: &LinearImage) -> u32 {
+    let (w, h) = img.dimensions();
+    let d = ((w as f64) * (w as f64) + (h as f64) * (h as f64))
+        .sqrt()
+        .ceil();
+    (d as u32).max(1)
+}
+
 /// スポット修復。ソースの高周波 + 目的地の低周波を合成して円領域へ載せる。
 /// アルゴリズムの根拠はモジュールコメントと DESIGN.md §9.8。
+///
+/// # 実効半径は画像の対角長で頭打ちにする
+///
+/// `heal` は一辺 `2·radius+1` の正方パッチを 2 枚取り出してぼかす。`radius` の
+/// 上限 2048 をそのまま使うと 4097×4097×2 枚 = 1.6GB を確保することになり、
+/// **8×8 の画像に radius 2048 を指定しただけでメモリを食い潰す**。
+/// 対角長より大きい円は画像全体を覆い切っているので、実効半径をそこで打ち切っても
+/// 「どの画素に効くか」は変わらない(フェザ帯の重み分布だけが、対角長を半径とした
+/// 円のものになる)。打ち切りは黙って行う: `heal` の戻り値は画像だけで警告経路が
+/// 無く、指定できる最大半径は静的検証の側で説明されているため。
+///
+/// # 大きな半径とカーネル上限(`blur` との相互作用)
+///
+/// 低周波の抽出は `ops::blur::gaussian_blur(σ = radius/3)` をそのまま使うが、
+/// blur のカーネル半径は 255 で頭打ちになる。したがって **`radius > 765` では
+/// σ に対してカーネルが足りず**、理想のガウスより裾の短い低域通過になる
+/// (= テクスチャ + トーン分解が文書どおりの厳密な形からわずかにずれる)。
+/// 実害は小さい: 打ち切られる裾の重みはごく僅かで、`detail` と `tone` の双方に
+/// 同じカーネルが掛かるため誤差の大半は相殺する。それでも「radius を上げ続ければ
+/// いくらでも滑らかなトーンになる」わけではないことは意識しておくこと。
 pub fn apply_heal(
     img: &LinearImage,
     src_x: u32,
@@ -250,6 +279,8 @@ pub fn apply_heal(
     feather_px: f64,
 ) -> std::result::Result<LinearImage, String> {
     check_centers("heal", img, src_x, src_y, dest_x, dest_y)?;
+    // 実効半径の頭打ち(上のドキュメント参照)。パッチ確保の前に行う。
+    let radius = radius.min(diagonal_cap(img));
     let mut out = img.clone();
     let Some((x0, y0, x1, y1)) = dest_bounds(img, dest_x, dest_y, radius) else {
         return Ok(out);
@@ -351,6 +382,32 @@ mod tests {
         assert!(err.contains("src center"), "{err}");
         let err = apply_heal(&img, 0, 0, 0, 9, 2, 0.0).unwrap_err();
         assert!(err.contains("dest center"), "{err}");
+    }
+
+    /// 回帰: 小さな画像に巨大な radius を渡してもメモリを食い潰さない。
+    ///
+    /// 以前は radius をそのままパッチの一辺(2r+1)に使っていたため、8x8 の画像 +
+    /// radius 2048 で 4097x4097 の f32 RGBA パッチを 2 枚 = 1.6GB 確保していた。
+    /// 実効半径を対角長(ceil)で頭打ちにすると、出力は「その半径で呼んだ場合」と
+    /// **完全に一致**する。
+    #[test]
+    fn oversized_radius_is_capped_at_the_image_diagonal() {
+        let mut img = LinearImage::from_pixel(8, 8, [0.3, 0.4, 0.5, 1.0]);
+        img.set(2, 2, [0.9, 0.1, 0.2, 1.0]);
+        img.set(5, 6, [0.0, 0.8, 0.4, 1.0]);
+
+        let started = std::time::Instant::now();
+        let huge = apply_heal(&img, 2, 2, 5, 5, MAX_RADIUS, 3.0).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "capped heal must stay cheap, took {:?}",
+            started.elapsed()
+        );
+
+        // ceil(sqrt(8² + 8²)) = 12。
+        assert_eq!(diagonal_cap(&img), 12);
+        let capped = apply_heal(&img, 2, 2, 5, 5, 12, 3.0).unwrap();
+        assert_eq!(huge.data, capped.data);
     }
 
     /// 一様画像の heal は恒等(detail = 0、tone = 元の値)。

@@ -1,6 +1,6 @@
 # asset-transform-mcp — 要件定義・設計書
 
-作成日: 2026-08-21 / ステータス: v1 実装済(M0+M1+M2 の大半)。実装で確定した差分は §9 を参照
+作成日: 2026-08-21 / ステータス: 実装は §9 の追補群が正(v0.1 の M0-M2 から Phase A-E 相当まで完走)。本文(§1-§8)は当初設計、実装で確定した差分・追加語彙は §9 を参照
 
 汎用 AI エージェント向けの、**決定論的(非生成)アセット変換 MCP サーバ**。Rust 製。
 編集意図(「水平にして 16:9 に整えて軽く明るく」)を、再現可能・監査可能な変換レシピとして実行する層を提供する。
@@ -429,9 +429,11 @@ ROADMAP の Phase C 前半。調整系 op に `mask` を付けると、その op
 - `MaskRef { revision_id: String, invert: bool = false, feather_px: f64 = 0.0 }`
   (`deny_unknown_fields`)。参照は **画像 revision**(任意ラスタフォーマット)で、
   §9.4 の LUT 参照と同じ「revision 不変性 → ハッシュ決定論」のパターンに乗る
-- `mask` を持てるのは **調整系 11 op のみ**:
+- `mask` を持てるのは **調整・フィルタ系 op のみ**(v0.5 時点 11、§9.10 の
+  grain / gradient_map / auto_levels 追加で現在 14):
   `adjust` / `color_matrix` / `curves` / `levels` / `hsl` / `lut` /
-  `white_balance` / `blur` / `median` / `unsharp_mask` / `convolve`。
+  `white_balance` / `blur` / `median` / `unsharp_mask` / `convolve` /
+  `grain` / `gradient_map` / `auto_levels`。
   幾何 op(`resize` / `rotate` / `crop` / `perspective`)は「一部だけリサイズ」に
   意味が無いので対象外、`encode` / `strip_metadata` / `auto_orient` も同様
   (`deny_unknown_fields` により静的に弾かれる)
@@ -1036,3 +1038,54 @@ usvg の `resolve_svg_size` の裏返し)。固有サイズが無く、かつ `w
 - フィクスチャ `tests/fixtures/badge.svg` は 40x20 の完全な自作
   (viewBox 全面の不透明な青矩形 + 黄円)。矩形が画素格子に一致するので
   **全画素が完全不透明** = 厳密な等値でプローブできる
+
+### 9.10 v0.3.0 追補(2026-08-22): 仕上げ 6 op + プリセット 7→30
+
+ROADMAP の Phase E 続き。レシピ語彙が 21 → **27** に増え(§9.9 時点の
+`svg_overlay` を含む)、`presets/` が 7 本から **30 本**へ拡充された。実装は
+`crates/atx-core/src/ops/{finish.rs, gradient.rs, pixelate.rs, auto_levels.rs}`。
+`ENGINE_VERSION` は据え置き(`atx-core/2`)、既存ゴールデンはすべて据え置きで
+green(新 op 6 本ぶんのゴールデンを追加)。
+
+追加した 6 op はいずれも `ops/mod.rs` の作業空間表(`op_space`)に明示的な
+エントリを持つ(表の空欄を許さない既存規律を踏襲):
+
+- **`flip`**(空間: なし) — バッファ要素の純粋な置換で画素値に触れないため、
+  現在の作業空間がどちらでも結果は同じ。`engine::op_space` は `None` を返し、
+  空間変換を挟まない。水平反転を 2 回かけると恒等がバイト同一で成り立つのは
+  この性質による
+- **`vignette`**(空間: リニア光) — 周辺減光/増光を露光係数として実装。
+  画像中心からの正規化距離 `d`(半対角比)に対し `radius..radius+feather` を
+  **smoothstep**(3 次エルミート `s = t^2(3-2t)`)で滑らかに減衰させる。
+  cosine 版ではなく多項式を選んだのは、画素ループへ `libm`(`cos`)を持ち込まない
+  という `ops/mod.rs` の決定論規約に従うため(両者の形状差は最大 ~2.8%で
+  見た目には出ない)。ゲインは f64 で計算後 1e-6 グリッドへ量子化して f32 化し、
+  RGB へ固定順序で掛ける(アルファ不変)。`strength` 負で増光、上限は
+  あえてクランプしない(出口の `unit_to_u8`/`unit_to_u16` が最終的に飽和させる)
+- **`grain`**(空間: sRGB 符号値) — 座標(ブロック拡大)と `seed`・チャンネル
+  添字から **splitmix64** の整数ミックスでノイズ値を引く、決定論的フィルム粒状。
+  乱数クレートを使わず浮動小数を一切経由しないため、値はプラットフォームを
+  跨いで厳密に同じ。`size` はブロック拡大(1 なら画素単位の粒)、
+  `monochrome` は輝度のみを変調
+- **`gradient_map`**(空間: sRGB 符号値) — 画素の BT.709 輝度(sRGB 符号値
+  ベース)を 0..1 に取り、`stops`(position 昇順)の線形補間色へ写像する
+  デュオトーン/グラデーションマップ。端の外側は端の色でクランプ。色パースは
+  `recipe::parse_hex_color` を再利用(`#rrggbbaa` の 8 桁も受理するが、
+  停止点色は不透明として扱いピクセルのアルファは不変)
+- **`pixelate`**(空間: リニア光) — ブロック平均を**リニア光**で行う
+  (平均 = 光の合成という原則どおり)。`region` 省略時は全面、指定時は
+  ブロック格子の原点を region 左上に合わせて部分モザイクの見た目を安定させる。
+  端の半端ブロックは実画素数で平均。決定論は固定順序の f64 累算で担保
+- **`auto_levels`**(空間: sRGB 符号値) — sRGB f32 空間で 256 ビンの
+  ヒストグラムを取り、上下 `clip_percent`% の分位点を 0..1 へ線形伸長する
+  (`levels` の `in_black`/`in_white` を自動決定するのと等価)。
+  `per_channel=false` は BT.709 輝度のヒストグラムで単一の伸長を全チャンネルへ、
+  `true` はチャンネル別(色被り補正だが色相が動く旨を vocab で警告)。
+  ヒストグラムは固定ビン・整数カウントなので入力画像に対して決定論的
+
+#### プリセット: 7 → 30
+
+`presets/` に上記 6 op と `svg_overlay` を活用した実務ユースケースを積み増した
+(SNS 比率書き出し、フィルム調グレーディング、白黒バリエーション、
+プロダクト撮影の仕上げ等)。個々のプリセットは通常のレシピ JSON であり、
+語彙・決定論規約に新しい例外は導入していない。

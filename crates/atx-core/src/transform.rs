@@ -108,6 +108,19 @@ impl Transform {
     }
 
     /// `self` を適用した後に `next` を適用する合成(= 行列積 `next * self`)。
+    ///
+    /// 積は `m22 > 0` の正規形へ戻す。行列積は `m22` を保存せず
+    /// (アフィン → 射影の合成では `m22 = 1 + m20·dx + m21·dy` になる)、
+    /// 平行移動が大きいと**符号まで反転する**。そのままにすると
+    /// 「`w > 0` = 地平線の手前」という `map_box` の不変条件が壊れ、
+    /// カメラの手前にある正常な矩形まで「写像不能」と判定されてしまう
+    /// (公開レシピからは「大きな crop / pad のあとに perspective」で到達する)。
+    ///
+    /// 正規化は **符号の反転だけ**で行う(`m22` で割って 1 に揃えることはしない)。
+    /// 同次行列は定数倍の自由度を持つので写像はどちらでも同じだが、
+    /// `-1` 倍は f64 で厳密な操作なのに対し `1/m22` 倍は丸め誤差を持ち込み、
+    /// この行列をそのまま warp 係数に使う `ops::perspective` の出力バイト列が動く。
+    /// 不変条件が要求しているのは符号だけなので、厳密な方を採る。
     pub(crate) fn then(self, next: Transform) -> Transform {
         let mut m = [[0.0f64; 3]; 3];
         for (i, row) in m.iter_mut().enumerate() {
@@ -115,6 +128,13 @@ impl Transform {
                 *v = next.m[i][0] * self.m[0][j]
                     + next.m[i][1] * self.m[1][j]
                     + next.m[i][2] * self.m[2][j];
+            }
+        }
+        if m[2][2] < 0.0 {
+            for row in &mut m {
+                for v in row {
+                    *v = -*v;
+                }
             }
         }
         Transform { m }
@@ -412,6 +432,31 @@ mod tests {
         assert!(!c.is_affine());
         // (90, 0) → +10 で (100, 0) → 透視除算で (50, 0)
         assert_eq!(c.map(90.0, 0.0), (50.0, 0.0));
+    }
+
+    /// 回帰: アフィン(大きな平行移動)→ 射影 の合成でも `m22 > 0` の正規形が保たれる。
+    ///
+    /// 行列積は `m22` を保存しない。`translate(-200, 0)` のあとに `w = 1 + 0.01u` の
+    /// 射影を掛けると積の `m22` は `1 + 0.01 × (−200) = −1` になり、正規化しないと
+    /// 画像内の全点で `w < 0` = 「地平線の向こう」と誤判定されて `map_box` が
+    /// `None` を返していた(同次行列の定数倍は写像を変えないのだから、これは
+    /// 符号規約の取りこぼしでしかない)。
+    ///
+    /// 公開レシピからは「大きな crop / pad のあとに perspective」で到達する
+    /// (crop は `translate` を、perspective は `m20 ≠ 0` の射影を xf へ畳み込む)。
+    #[test]
+    fn large_translation_then_projective_keeps_the_positive_w_normal_form() {
+        let a = Transform::translate(-200.0, 0.0);
+        let p = Transform::projective([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.01, 0.0, 1.0]]);
+        let c = a.then(p);
+        // 積の m22 は 1 + 0.01 × (−200) = −1。符号だけを反転して正規形に戻す。
+        assert_eq!(c.m[2][2], 1.0, "m22 must be normalized positive: {:?}", c.m);
+        let b = c
+            .map_box(0.0, 0.0, 10.0, 10.0)
+            .expect("a rect in front of the camera must map");
+        // 写像そのものは正規化前と同じ(定数倍の自由度)。
+        // (0, 0) → 平行移動で (−200, 0)、w = 1 + 0.01×(−200) = −1 なので像は (200, 0)。
+        assert!((b.0 - 200.0).abs() < 1e-9, "{b:?}");
     }
 
     /// 地平線を跨ぐ矩形は写像不能として弾く(外接矩形が像を含まないため)。

@@ -11,7 +11,6 @@ members = [
 version = "0.3.0"
 edition = "2021"
 license = "MIT"
-# NOTE: owner is a placeholder until the repo exists (see RELEASING.md step 0).
 repository = "https://github.com/gridhra/atx-mcp"
 keywords = ["mcp", "image", "transform", "deterministic", "assets"]
 categories = ["multimedia::images", "command-line-utilities"]

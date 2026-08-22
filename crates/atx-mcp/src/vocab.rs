@@ -65,7 +65,7 @@ pub const CATEGORIES: [&str; 4] = ["geometry", "color", "filter", "output"];
 
 /// 局所適用マスク(v0.5)の共有パラメータ説明。
 ///
-/// トーン系・フィルタ系の 11 op が同じ `mask` フィールドを取るので、
+/// トーン系・フィルタ系の 14 op が同じ `mask` フィールドを取るので、
 /// **説明は1箇所だけ**持ち、各 op の `params` から同じ定数を参照する。
 /// カタログ(`list_operations`)には `compact()` の1行
 /// `mask?: {revision_id,invert,feather_px}` だけが出て、
@@ -84,7 +84,7 @@ pub const MASK_PARAM: ParamDoc = ParamDoc {
         and check its coverage with render_preview overlay=\"mask\". The referenced revision id is part of the recipe hash, so the recipe only reproduces inside a workspace that holds that mask.",
 };
 
-/// 11 の調整・フィルタ op に共通で付ける `mask` の注意書き(実体は1つ)。
+/// 14 の調整・フィルタ op に共通で付ける `mask` の注意書き(実体は1つ)。
 pub const MASK_WARNING: &str = "Optional `mask` restricts this operation to part of the image \
     (white = full strength, black = untouched). Order matters: masked and unmasked ops still run \
     strictly in sequence, and a geometric op (rotate/crop/resize/perspective) after a masked op \
@@ -274,15 +274,15 @@ pub const OPERATIONS: &[OpDoc] = &[
             },
             ParamDoc {
                 name: "vertical_degrees",
-                type_hint: "f64 deg",
+                type_hint: "f64 -45..45",
                 requirement: "optional",
-                semantics: "Vertical keystone angle; positive means the top edge leans away (corrects a converging top).",
+                semantics: "Vertical keystone angle in degrees, limited to -45..=45; positive means the top edge leans away (corrects a converging top). Outside that range is a validation error, not a clamp.",
             },
             ParamDoc {
                 name: "horizontal_degrees",
-                type_hint: "f64 deg",
+                type_hint: "f64 -45..45",
                 requirement: "optional",
-                semantics: "Horizontal keystone angle.",
+                semantics: "Horizontal keystone angle in degrees, limited to -45..=45 exactly like vertical_degrees.",
             },
             ParamDoc {
                 name: "pad_color",
@@ -297,6 +297,8 @@ pub const OPERATIONS: &[OpDoc] = &[
         ],
         warnings: &[
             "The two forms are mutually exclusive: either quad, or one/both of vertical_degrees / horizontal_degrees.",
+            "quad must be a STRICTLY CONVEX quadrilateral listed in the order top-left, top-right, bottom-right, bottom-left (clockwise on screen, y pointing down). A concave, self-intersecting, degenerate (3 collinear points) or reversed-order quad is a hard validation error, not a silently mirrored result.",
+            "vertical_degrees / horizontal_degrees are each limited to -45..=45 degrees; a larger angle is a validation error.",
             "This is a projective transform, so the corners of the result are filled with pad_color unless you crop afterwards.",
             "detect_tilt reports horizontal- and vertical-line families separately; a disagreement between them is the signal that you want perspective rather than rotate.",
         ],
@@ -307,9 +309,9 @@ pub const OPERATIONS: &[OpDoc] = &[
         summary: "4x5 color matrix (B&W, sepia, hue rotate, channel mixer).",
         params: &[ParamDoc {
             name: "matrix",
-            type_hint: "f64[20]",
+            type_hint: "f64[20] |v|<=8",
             requirement: "required",
-            semantics: "Row-major 4x5 matrix M with [R',G',B',A'] = M * [R,G,B,A,1], applied to values normalized to 0..1 and then clamped. The 5th column of each row is a constant offset in 0..1 units.",
+            semantics: "Row-major 4x5 matrix M with [R',G',B',A'] = M * [R,G,B,A,1], applied to values normalized to 0..1 and then clamped. The 5th column of each row is a constant offset in 0..1 units. Every element must be finite with |v| <= 8.0 (normal color matrices sit within -2..2; 8 leaves room for a strong channel mixer).",
         },
         MASK_PARAM,
         ],
@@ -318,7 +320,7 @@ pub const OPERATIONS: &[OpDoc] = &[
             r#"{"op": "color_matrix", "matrix": [0.393,0.769,0.189,0,0, 0.349,0.686,0.168,0,0, 0.272,0.534,0.131,0,0, 0,0,0,1,0]}"#,
         ],
         warnings: &[
-            "The matrix must have exactly 20 elements; the identity is [1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,1,0].",
+            "The matrix must have exactly 20 elements, each finite with |v| <= 8.0; the identity is [1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,1,0].",
             "Alpha is part of the matrix. Keep the last row as 0,0,0,1,0 unless you intend to change transparency.",
             "The two examples above are exactly the built-in grayscale and sepia presets; use preset=\"grayscale\" / \"sepia\" instead of retyping them.",
                     MASK_WARNING,
@@ -331,27 +333,27 @@ pub const OPERATIONS: &[OpDoc] = &[
         params: &[
             ParamDoc {
                 name: "master",
-                type_hint: "[[u8;2]]",
+                type_hint: "[[u8;2]] 1..32 pts",
                 requirement: "optional",
-                semantics: "Control points [x, y] with x,y in 0..255, applied to R, G and B before the per-channel curves.",
+                semantics: "1 to 32 control points [x, y] with x,y in 0..255, applied to R, G and B before the per-channel curves.",
             },
             ParamDoc {
                 name: "red",
-                type_hint: "[[u8;2]]",
+                type_hint: "[[u8;2]] 1..32 pts",
                 requirement: "optional",
-                semantics: "Control points applied to the red channel only.",
+                semantics: "1 to 32 control points applied to the red channel only.",
             },
             ParamDoc {
                 name: "green",
-                type_hint: "[[u8;2]]",
+                type_hint: "[[u8;2]] 1..32 pts",
                 requirement: "optional",
-                semantics: "Control points applied to the green channel only.",
+                semantics: "1 to 32 control points applied to the green channel only.",
             },
             ParamDoc {
                 name: "blue",
-                type_hint: "[[u8;2]]",
+                type_hint: "[[u8;2]] 1..32 pts",
                 requirement: "optional",
-                semantics: "Control points applied to the blue channel only.",
+                semantics: "1 to 32 control points applied to the blue channel only.",
             },
         MASK_PARAM,
         ],
@@ -361,6 +363,7 @@ pub const OPERATIONS: &[OpDoc] = &[
         ],
         warnings: &[
             "Control point x values must be strictly increasing; duplicate x is a validation error.",
+            "Each channel takes 1..=32 control points; an empty list or more than 32 points is a validation error.",
             "Order matters: master runs first, then the per-channel curves on the result.",
             "An omitted channel is the identity; a single point makes that channel constant.",
                     MASK_WARNING,
@@ -409,6 +412,7 @@ pub const OPERATIONS: &[OpDoc] = &[
         ],
         warnings: &[
             "Everything defaults to the identity, so an empty levels op does nothing.",
+            "in_black must be strictly less than in_white, but the OUTPUT range only has to satisfy out_black <= out_white: an inverted output range is a validation error, while a crushed one (out_black == out_white, a flat fill) is allowed on purpose.",
             "It compiles down to the same 256-entry LUT path as curves; use curves when you need shaped, non-linear control.",
                     MASK_WARNING,
         ],
@@ -691,15 +695,15 @@ pub const OPERATIONS: &[OpDoc] = &[
             },
             ParamDoc {
                 name: "radius",
-                type_hint: "u32 > 0",
+                type_hint: "u32 1..2048",
                 requirement: "required",
-                semantics: "Radius in pixels of the circular patch copied from src to dest.",
+                semantics: "Radius in pixels of the circular patch copied from src to dest; must be within 1..=2048.",
             },
             ParamDoc {
                 name: "feather_px",
-                type_hint: "f64 >= 0",
-                requirement: "optional",
-                semantics: "Softens the patch edge over this many pixels (gaussian-like falloff) so the stamp blends instead of leaving a hard disc outline. Omitted or 0 means a hard edge.",
+                type_hint: "f64 0..200",
+                requirement: "default: 0",
+                semantics: "Softens the patch edge over this many pixels (gaussian-like falloff, 0..=200) so the stamp blends instead of leaving a hard disc outline. Omitted or 0 means a hard edge.",
             },
         ],
         examples: &[
@@ -743,15 +747,15 @@ pub const OPERATIONS: &[OpDoc] = &[
             },
             ParamDoc {
                 name: "radius",
-                type_hint: "u32 > 0",
+                type_hint: "u32 1..2048",
                 requirement: "required",
-                semantics: "Radius in pixels of the circular patch healed at dest.",
+                semantics: "Radius in pixels of the circular patch healed at dest; must be within 1..=2048.",
             },
             ParamDoc {
                 name: "feather_px",
-                type_hint: "f64 >= 0",
-                requirement: "optional",
-                semantics: "Softens the patch edge over this many pixels so the healed disc blends into its surroundings. Omitted or 0 means a hard edge.",
+                type_hint: "f64 0..200",
+                requirement: "default: 0",
+                semantics: "Softens the patch edge over this many pixels (0..=200) so the healed disc blends into its surroundings. Omitted or 0 means a hard edge.",
             },
         ],
         examples: &[
@@ -821,6 +825,7 @@ pub const OPERATIONS: &[OpDoc] = &[
         warnings: &[
             "TEXT IS NOT RENDERED. atx never loads system fonts, because the installed fonts differ from machine to machine and would break byte-for-byte reproducibility. An SVG containing <text> renders its shapes but not its glyphs, and reports a warning. Convert text to paths (outlines) in your vector editor before importing.",
             "The SVG must be in the workspace: import_asset the .svg file FIRST, then reference the revision_id it returns. A recipe pointing at an unknown id fails with a structured error before any pixel work happens.",
+            "Each of width/height is limited to 1..=32768, and the rasterized overlay may not exceed 100,000,000 pixels in total (width * height) - a bigger request is a structured error at run time, not a silent downscale.",
             "An SVG with no intrinsic size (no viewBox and no absolute width/height on the root <svg>) is a structured error unless you give BOTH width and height - the engine will not silently fall back to a default size. import_asset reports the intrinsic size (0x0 means it has none).",
             "inspect_image refuses an SVG revision on purpose - it is a vector asset, not a raster image. So do apply_transform/render_preview when pointed AT the SVG: the SVG is what you reference from a recipe, not what you transform.",
             "x/y are the TOP-LEFT corner, not the centre, and are interpreted in the image as it is at THIS point of the pipeline - put the overlay after your resize/crop, or the watermark lands in the wrong place and at the wrong scale.",
@@ -1100,31 +1105,31 @@ pub const LAYERS_DOC: OpDoc = OpDoc {
             name: "layers[].source",
             type_hint: "\"base\" | {revision_id}",
             requirement: "required",
-            semantics: "\"base\" means the input revision passed to apply_transform/render_preview. {\"revision_id\": \"rev_...\"} references any other revision already in this workspace. Every layer's source must have EXACTLY the same dimensions as the base image; a mismatch is a structured error before any pixel work happens.",
+            semantics: "\"base\" means the input revision passed to apply_transform/render_preview. {\"revision_id\": \"rev_...\"} references any other revision already in this workspace. A source of any size is accepted: what must match is the layer's size AFTER its own ops (see layers[].ops), not the size of the source revision itself.",
         },
         ParamDoc {
             name: "layers[].ops",
             type_hint: "Operation[]",
-            requirement: "required",
-            semantics: "A normal operations list (any op except a second-level layers stack), applied to this layer's own source before it is composited. May be empty (use the source unchanged).",
+            requirement: "default: []",
+            semantics: "A normal operations list applied to this layer's own source before it is composited; omit it (or pass []) to use the source unchanged. Any op is allowed EXCEPT encode and strip_metadata, which are finishing-pass-only and rejected inside a layer. This is also where you put the resize/crop that brings the layer to the backdrop's dimensions.",
         },
         ParamDoc {
             name: "layers[].mask",
             type_hint: "{revision_id,invert,feather_px}",
             requirement: "optional",
-            semantics: "Same shape and semantics as the per-op mask (white = this layer contributes fully at that pixel, black = the backdrop shows through unchanged there), applied at composite time on top of blend_mode/opacity.",
+            semantics: "Same shape and semantics as the per-op mask (white = this layer contributes fully at that pixel, black = the backdrop shows through unchanged there), applied at composite time on top of blend_mode/opacity. Rejected on layers[0]: the backdrop has nothing underneath it to show through.",
         },
         ParamDoc {
             name: "layers[].blend_mode",
             type_hint: "enum, 16 modes (12 separable + 4 non-separable)",
             requirement: "default: normal",
-            semantics: "One of normal | multiply | screen | overlay | darken | lighten | color_dodge | color_burn | hard_light | soft_light | difference | exclusion (the W3C separable blend modes, applied per-channel) or hue | saturation | color | luminosity (the W3C non-separable blend modes, applied to the HSL components of the composite as a whole rather than per-channel).",
+            semantics: "One of normal | multiply | screen | overlay | darken | lighten | color_dodge | color_burn | hard_light | soft_light | difference | exclusion (the W3C separable blend modes, applied per-channel) or hue | saturation | color | luminosity (the W3C non-separable blend modes, applied to the HSL components of the composite as a whole rather than per-channel). On layers[0] only \"normal\" is accepted (see the backdrop warning below).",
         },
         ParamDoc {
             name: "layers[].opacity",
             type_hint: "f64 0..1",
             requirement: "default: 1.0",
-            semantics: "Overall strength of this layer's contribution after blend_mode, linearly blended with the backdrop. 0 = invisible, 1 = full strength.",
+            semantics: "Overall strength of this layer's contribution after blend_mode, linearly blended with the backdrop. 0 = invisible, 1 = full strength. On layers[0] only 1.0 is accepted (see the backdrop warning below).",
         },
     ],
     examples: &[
@@ -1132,7 +1137,9 @@ pub const LAYERS_DOC: OpDoc = OpDoc {
     ],
     warnings: &[
         "layers is a top-level recipe field, not something you put inside \"operations\" - a recipe has EITHER a flat operations pipeline OR a layers stack (with operations as its finishing pass), never a \"layers\" op tag.",
-        "The bottom layer is the backdrop: its blend_mode/opacity are still honored against whatever is beneath the stack (nothing, i.e. treated as normal/opaque, for the first layer).",
+        "layers[0] IS THE BACKDROP and there is nothing underneath it to blend with, so it is REJECTED unless blend_mode is \"normal\", opacity is exactly 1.0, and it carries no mask. Put the look you wanted on layers[0] into a layer above it instead.",
+        "DIMENSIONS ARE CHECKED AFTER EACH LAYER'S OWN ops, against the backdrop (layers[0] after its ops) - not against the base image, and not against the raw source revision. So a layer may start from a source of any size: the fix for a mismatch is to add a resize/crop to THAT layer's ops until it matches the backdrop, and the error message tells you the exact target size.",
+        "layers[].ops is optional (an omitted ops is the same as []), but encode and strip_metadata are rejected inside a layer - they belong to the top-level finishing pass.",
         "When layers is present, the top-level \"operations\" list runs ONCE on the composited result as the finishing pass - this is where resize and the final encode belong. encode must still be the last operation and appear at most once.",
         "16 blend modes total: the 12 W3C separable modes (normal, multiply, screen, overlay, darken, lighten, color_dodge, color_burn, hard_light, soft_light, difference, exclusion) plus the 4 non-separable modes (hue, saturation, color, luminosity) added in v0.7.",
         "recipe_hash covers the whole recipe including every layer's ops and any referenced revision ids (same rule as lut/mask references), so a layered recipe reproduces only inside a workspace holding every referenced revision.",

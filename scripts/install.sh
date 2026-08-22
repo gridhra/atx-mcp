@@ -8,7 +8,6 @@
 #   ATX_INSTALL_DIR  install directory (default: $HOME/.local/bin)
 set -eu
 
-# NOTE: owner is a placeholder until the repo exists (see RELEASING.md step 0).
 REPO="gridhra/atx-mcp"
 
 INSTALL_DIR="${ATX_INSTALL_DIR:-$HOME/.local/bin}"

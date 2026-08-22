@@ -200,12 +200,28 @@ jobs:
       # that registration fails here; first-time packages are published
       # manually via scripts/publish-npm-local.sh.
       - name: Publish
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
         run: |
           set -euo pipefail
+          # Idempotency guard: a re-run after a partial failure (e.g. the win32
+          # spam-block below) must not re-attempt packages that already made it
+          # to the registry. `npm publish` on an existing version 403s and would
+          # otherwise fail the whole re-run.
+          already_published() {
+            local pkg_dir="$1"
+            local name
+            name="$(node -p "require('./$pkg_dir/package.json').name")"
+            npm view "$name@$VERSION" version >/dev/null 2>&1
+          }
           # Platform packages first: the main package's optionalDependencies
           # pin these exact versions.
           for pkg in npm/dist/atx-mcp-*; do
             echo "==> publishing $pkg"
+            if already_published "$pkg"; then
+              echo "$(node -p "require('./$pkg/package.json').name")@$VERSION already published, skipping"
+              continue
+            fi
             # win32 パッケージは npm のスパム誤検知の解除待ち(サポート対応中)のため、
             # 失敗してもリリース全体は止めない。ランチャーの optionalDependencies は
             # 存在しないバージョンを参照しても npm が optional として警告スキップする。
@@ -217,4 +233,8 @@ jobs:
             fi
           done
           echo "==> publishing npm/dist/atx-mcp"
-          npm publish --provenance --access public npm/dist/atx-mcp
+          if already_published npm/dist/atx-mcp; then
+            echo "$(node -p "require('./npm/dist/atx-mcp/package.json').name")@$VERSION already published, skipping"
+          else
+            npm publish --provenance --access public npm/dist/atx-mcp
+          fi

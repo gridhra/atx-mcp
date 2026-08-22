@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 
 use atx_mcp::tools::{
-    AtxTools, ExplainOperationParams, ImportAssetParams, ListOperationsParams, RevisionParams,
-    TransformParams, SVG_MIME,
+    AtxTools, CompareLayout, CompareRevisionsParams, ExplainOperationParams, ImportAssetParams,
+    ListOperationsParams, RevisionParams, TransformParams, SVG_MIME,
 };
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::Value;
@@ -245,12 +245,45 @@ fn stamping_an_imported_svg_end_to_end_changes_only_the_stamped_region() {
     );
 }
 
+/// compare_revisions は SVG(ベクタ)側を `not_an_image` で弾き、
+/// **どちら側 (a/b) が悪いのか**をエラーに含めること。
+#[test]
+fn compare_revisions_rejects_an_svg_side_naming_it() {
+    let (_ws, tools) = tools();
+    let raster = revision_id(&import(&tools, image_fixture()));
+    let svg = revision_id(&import(&tools, badge_fixture()));
+
+    for (a, b, bad_side) in [
+        (svg.clone(), raster.clone(), "a"),
+        (raster.clone(), svg.clone(), "b"),
+    ] {
+        let result = tools.compare_revisions(&CompareRevisionsParams {
+            revision_id_a: a,
+            revision_id_b: b,
+            layout: CompareLayout::SideBySide,
+        });
+        let payload = error_payload(&result);
+        assert_eq!(payload["error"]["code"], "not_an_image");
+        assert_eq!(payload["error"]["details"]["mime_type"], SVG_MIME);
+        assert_eq!(payload["error"]["details"]["side"], bad_side);
+        assert_eq!(payload["error"]["details"]["revision_id"], svg.as_str());
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("revision_id_{bad_side}")),
+            "the message must name the offending side: {:?}",
+            payload["error"]["message"]
+        );
+    }
+}
+
 /// 語彙カタログに `svg_overlay` が 1 件だけ載り、総数が 27 になっていること。
 #[test]
 fn the_catalog_lists_twenty_seven_operations_including_svg_overlay() {
     let (_ws, tools) = tools();
     let out = structured(&tools.list_operations(&ListOperationsParams::default()));
-    let ops = out["operations"].as_array().expect("operations array");
+    let ops = out["ops"].as_array().expect("ops array");
     assert_eq!(ops.len(), 27, "v0.3.0 has 27 operations");
     let overlay: Vec<_> = ops
         .iter()

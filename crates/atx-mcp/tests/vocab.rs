@@ -127,9 +127,9 @@ fn list_operations_returns_every_op_and_the_presets() {
     let body = text(&result);
 
     assert_eq!(out["count"], 27);
-    let names: Vec<&str> = out["operations"]
+    let names: Vec<&str> = out["ops"]
         .as_array()
-        .expect("operations must be an array")
+        .expect("ops must be an array")
         .iter()
         .map(|op| op["name"].as_str().unwrap())
         .collect();
@@ -143,12 +143,19 @@ fn list_operations_returns_every_op_and_the_presets() {
             "missing op {expected} in the text catalog"
         );
     }
+    // structuredContent は機械可読の最小形(name + category のみ)。
+    // 散文(summary / params)はテキストサマリ側にだけ載る。
+    for op in out["ops"].as_array().unwrap() {
+        let mut keys: Vec<&str> = op.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["category", "name"], "op entry must stay compact");
+    }
 
     let presets: Vec<&str> = out["presets"]
         .as_array()
         .expect("presets must be an array")
         .iter()
-        .map(|p| p["name"].as_str().unwrap())
+        .map(|p| p.as_str().expect("presets must be plain names"))
         .collect();
     assert_eq!(presets, BUILTIN_PRESETS);
     for preset in BUILTIN_PRESETS {
@@ -170,7 +177,17 @@ fn list_operations_returns_every_op_and_the_presets() {
         "the catalog must stay compact, got {} chars",
         body.len()
     );
-    assert!(out["next"].as_str().unwrap().contains("explain_operation"));
+    assert!(body.contains("explain_operation"));
+
+    // 二重払いの禁止: structuredContent はテキストの散文を繰り返さないこと。
+    // (以前は text と structured の両方に summary + params を積んでいて、
+    //  1 呼び出しで ~4.7k tokens を焼いていた。)
+    let structured_len = serde_json::to_string(&out).unwrap().len();
+    assert!(
+        structured_len < body.len() / 3,
+        "structuredContent must stay a compact machine form, got {structured_len} chars vs {} of text",
+        body.len()
+    );
 }
 
 #[test]
@@ -179,7 +196,7 @@ fn list_operations_filters_by_category_and_rejects_unknown_ones() {
     let filtered = structured(&tools.list_operations(&ListOperationsParams {
         category: Some("filter".to_string()),
     }));
-    let names: Vec<&str> = filtered["operations"]
+    let names: Vec<&str> = filtered["ops"]
         .as_array()
         .unwrap()
         .iter()
@@ -375,28 +392,59 @@ fn embedded_presets_are_well_formed() {
         assert!(!preset.description.is_empty());
         assert!(!preset.recipe.operations.is_empty());
     }
-    for name in ["eyecatch_16_9", "thumbnail_square", "web_optimize"] {
+    // 全 30 プリセットが atx-core の validate を通ること(名前を手で並べない)。
+    for name in BUILTIN_PRESETS {
         let preset = atx_mcp::presets::resolve(name).expect("preset must resolve");
         atx_core::recipe::validate(&preset.recipe)
             .unwrap_or_else(|e| panic!("preset {name} must pass atx-core validate: {e}"));
     }
 }
 
-/// v0.3 op(white_balance)を使うプリセットの validate。
+/// 「正確な寸法」を約束するプリセットは without_enlargement=false であること
+/// (true だと小さい入力で黙って約束を破る)。
 #[test]
-fn v03_presets_pass_core_validate() {
-    let preset = atx_mcp::presets::resolve("product_clean").expect("preset must resolve");
-    atx_core::recipe::validate(&preset.recipe)
-        .unwrap_or_else(|e| panic!("preset product_clean must pass atx-core validate: {e}"));
+fn exact_size_presets_do_not_refuse_to_enlarge() {
+    for name in [
+        "eyecatch_16_9",
+        "thumbnail_square",
+        "og_1200x630",
+        "instagram_square_1080",
+        "instagram_portrait_4_5",
+        "x_wide_16_9",
+        "youtube_thumb_1280x720",
+    ] {
+        let preset = atx_mcp::presets::resolve(name).expect("preset must resolve");
+        let json = serde_json::to_value(&preset.recipe).unwrap();
+        let resize = json["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|op| op["op"] == "resize")
+            .unwrap_or_else(|| panic!("preset {name} must contain a resize op"));
+        assert_eq!(
+            resize["without_enlargement"],
+            Value::Bool(false),
+            "preset {name} promises an exact size, so it must be allowed to upscale"
+        );
+    }
 }
 
-/// color_matrix / curves を使うプリセットの validate(v0.2 の color op で実装済み)。
+/// 単体 op のビルディングブロックは「プリセットの連鎖」を約束しないこと
+/// (ツール面は preset XOR recipe で、2 回適用すれば二重にロスあり再エンコードされる)。
 #[test]
-fn color_presets_pass_core_validate() {
-    for name in ["film_soft", "grayscale", "sepia"] {
+fn building_block_presets_do_not_promise_chaining() {
+    for name in ["grain_fine", "soft_vignette"] {
         let preset = atx_mcp::presets::resolve(name).expect("preset must resolve");
-        atx_core::recipe::validate(&preset.recipe)
-            .unwrap_or_else(|e| panic!("preset {name} must pass atx-core validate: {e}"));
+        assert!(
+            !preset.description.contains("for stacking"),
+            "preset {name} must not promise preset stacking: {}",
+            preset.description
+        );
+        assert!(
+            preset.description.contains("recipe"),
+            "preset {name} must point at copying the op into a recipe: {}",
+            preset.description
+        );
     }
 }
 
@@ -514,4 +562,121 @@ fn recipe_and_preset_are_mutually_exclusive_and_one_is_required() {
         error_payload(&preview_neither)["error"]["code"],
         "recipe_or_preset_required"
     );
+}
+
+/// vocab.rs が書いている値域が、atx-core の validate と実際に一致していること
+/// (境界のすぐ外がエラーになる = ドキュメントが嘘をついていない)。
+#[test]
+fn documented_ranges_match_core_validate() {
+    let reject = |json: serde_json::Value, what: &str| {
+        let recipe: atx_core::TransformRecipe =
+            serde_json::from_value(json).expect("must deserialize");
+        assert!(
+            atx_core::recipe::validate(&recipe).is_err(),
+            "{what} must be rejected by atx-core validate"
+        );
+    };
+    let accept = |json: serde_json::Value, what: &str| {
+        let recipe: atx_core::TransformRecipe =
+            serde_json::from_value(json).expect("must deserialize");
+        atx_core::recipe::validate(&recipe)
+            .unwrap_or_else(|e| panic!("{what} must be accepted by atx-core validate: {e}"));
+    };
+
+    // perspective: |degrees| <= 45
+    accept(
+        serde_json::json!({"operations": [{"op": "perspective", "vertical_degrees": 45.0}]}),
+        "vertical_degrees = 45",
+    );
+    reject(
+        serde_json::json!({"operations": [{"op": "perspective", "vertical_degrees": 45.1}]}),
+        "vertical_degrees = 45.1",
+    );
+    reject(
+        serde_json::json!({"operations": [{"op": "perspective", "horizontal_degrees": -46.0}]}),
+        "horizontal_degrees = -46",
+    );
+    // perspective: quad は tl,tr,br,bl の順で厳密に凸(逆順は順序エラー)
+    reject(
+        serde_json::json!({"operations": [{"op": "perspective",
+            "quad": [[0.0,0.0],[0.0,10.0],[10.0,10.0],[10.0,0.0]]}]}),
+        "a reversed-order quad",
+    );
+
+    // color_matrix: |v| <= 8
+    let mut matrix = vec![0.0f64; 20];
+    matrix[0] = 8.0;
+    accept(
+        serde_json::json!({"operations": [{"op": "color_matrix", "matrix": matrix.clone()}]}),
+        "matrix element 8.0",
+    );
+    matrix[0] = 8.1;
+    reject(
+        serde_json::json!({"operations": [{"op": "color_matrix", "matrix": matrix}]}),
+        "matrix element 8.1",
+    );
+
+    // curves: 1..=32 points per channel
+    let points: Vec<[u16; 2]> = (0..=32u16).map(|i| [i * 7, i * 7]).collect();
+    reject(
+        serde_json::json!({"operations": [{"op": "curves", "master": points}]}),
+        "33 control points",
+    );
+    reject(
+        serde_json::json!({"operations": [{"op": "curves", "master": []}]}),
+        "an empty control point list",
+    );
+
+    // levels: out_black <= out_white(反転は不可、潰しは可)
+    accept(
+        serde_json::json!({"operations": [{"op": "levels", "out_black": 100, "out_white": 100}]}),
+        "out_black == out_white",
+    );
+    reject(
+        serde_json::json!({"operations": [{"op": "levels", "out_black": 200, "out_white": 100}]}),
+        "out_black > out_white",
+    );
+
+    // clone / heal: radius 1..=2048, feather_px 0..=200
+    for op in ["clone", "heal"] {
+        accept(
+            serde_json::json!({"operations": [{"op": op, "src_x": 0, "src_y": 0, "dest_x": 1,
+                "dest_y": 1, "radius": 2048, "feather_px": 200.0}]}),
+            "radius 2048 / feather 200",
+        );
+        reject(
+            serde_json::json!({"operations": [{"op": op, "src_x": 0, "src_y": 0, "dest_x": 1,
+                "dest_y": 1, "radius": 2049}]}),
+            "radius 2049",
+        );
+        reject(
+            serde_json::json!({"operations": [{"op": op, "src_x": 0, "src_y": 0, "dest_x": 1,
+                "dest_y": 1, "radius": 8, "feather_px": 200.1}]}),
+            "feather_px 200.1",
+        );
+        // feather_px は省略可能(既定 0)
+        accept(
+            serde_json::json!({"operations": [{"op": op, "src_x": 0, "src_y": 0, "dest_x": 1,
+                "dest_y": 1, "radius": 8}]}),
+            "an omitted feather_px",
+        );
+    }
+}
+
+/// list_operations の総ペイロード(テキスト + structuredContent)のサイズを記録する。
+/// `cargo test -p atx-mcp --test vocab -- --nocapture list_operations_payload_size`
+#[test]
+fn list_operations_payload_size() {
+    let (_ws, tools) = tools();
+    let result = tools.list_operations(&ListOperationsParams::default());
+    let body = text(&result);
+    let structured_json = serde_json::to_string(&structured(&result)).unwrap();
+    println!(
+        "list_operations: text {} chars + structuredContent {} chars = {} chars total (~{} tokens)",
+        body.len(),
+        structured_json.len(),
+        body.len() + structured_json.len(),
+        (body.len() + structured_json.len()) / 4
+    );
+    assert!(body.len() + structured_json.len() < 11_000);
 }
