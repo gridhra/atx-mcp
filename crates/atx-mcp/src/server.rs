@@ -15,11 +15,11 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 
 use crate::mask::GenerateMaskParams;
 use crate::tools::{
-    ApplyTransformOutput, AtxTools, CompareRevisionsOutput, CompareRevisionsParams,
-    DetectTiltOutput, DetectTiltParams, ExplainOperationOutput, ExplainOperationParams,
-    ExportAssetOutput, ExportAssetParams, GenerateMaskOutput, ImportAssetParams, ImportOutput,
-    InspectOutput, ListAssetsOutput, ListAssetsParams, ListOperationsOutput, ListOperationsParams,
-    RenderPreviewOutput, RenderPreviewParams, RevisionParams, TransformParams,
+    ApplyResult, AtxTools, CompareRevisionsOutput, CompareRevisionsParams, DetectTiltOutput,
+    DetectTiltParams, ExplainOperationParams, ExplainResult, ExportAssetOutput, ExportAssetParams,
+    GenerateMaskOutput, ImportAssetParams, ImportResult, InspectOutput, ListAssetsOutput,
+    ListAssetsParams, ListOperationsOutput, ListOperationsParams, RenderPreviewOutput,
+    RenderPreviewParams, RevisionParams, TransformParams,
 };
 
 /// ホスト AI 向けの使い方。initialize の `instructions` として返す。
@@ -48,18 +48,18 @@ Layered recipes: a recipe may carry {"layers": [...]} - a bottom-to-top stack co
 
 Discovering the vocabulary (the ops are deliberately NOT enumerated in the tool schemas)
 - list_operations  - compact catalog of every operation (name, category) plus the built-in preset names. Start here.
-- explain_operation - full parameter table, examples and gotchas for one operation.
+- explain_operation - full parameter table, examples and gotchas for one operation, or the full op list behind a preset name.
 Errors are teachers: an invalid recipe or an unknown name comes back with the valid values and a recovery step, so one round trip is enough to fix it.
 
 Presets: apply_transform and render_preview take either `recipe` (the raw DSL) or `preset` (a built-in named recipe such as web_optimize) - mutually exclusive, exactly one required. A preset is pure sugar: the recipe_hash is computed on the RESOLVED recipe, so a preset call and the equivalent raw recipe land on the same revision.
 
 Recommended flow
 0. list_operations / explain_operation - look up the recipe vocabulary on demand (or pick a preset).
-1. import_asset  - bring a local file into the workspace, get a revision_id.
+1. import_asset  - bring a local file into the workspace, get a revision_id (or `paths` for up to 64 files in one call).
 2. inspect_image - dimensions, format, EXIF summary, GPS/PII flag, byte size.
 3. detect_tilt   - read-only tilt candidates with a confidence; a null angle means "do not correct".
 4. render_preview- run a candidate recipe, get a <=768px inline JPEG plus a file path, to check composition cheaply.
-5. apply_transform - run the same recipe at full resolution, producing a new revision.
+5. apply_transform - run the same recipe at full resolution, producing a new revision (`revision_ids` applies it to up to 64 revisions in one call).
 6. export_asset  - copy a revision out of the workspace (refuses to overwrite unless overwrite=true; ask the user first, and it never writes inside the workspace store).
 
 Use list_assets to review the ledger (lineage, recipes, sizes). Every result carries a human-readable text summary with absolute paths plus machine-readable structuredContent; prefer the structured fields for chaining.
@@ -90,10 +90,15 @@ impl AtxServer {
     }
 
     /// Import a local image file into the workspace and issue an immutable revision.
+    /// Pass either `path` (one file) or `paths` (a batch of up to 64; one bad file does not
+    /// abort the batch, it lands in `failed`) - exactly one of the two.
     /// Idempotent: importing the same bytes again returns the existing revision.
+    /// If the imported bytes are already the output of a recipe held in this workspace,
+    /// the result carries a warning plus `already_derived_from` so the same recipe is not
+    /// applied twice.
     #[tool(
         name = "import_asset",
-        output_schema = schema_for_output::<ImportOutput>(),
+        output_schema = schema_for_output::<ImportResult>(),
         annotations(
             title = "Import asset",
             read_only_hint = false,
@@ -133,7 +138,8 @@ impl AtxServer {
     /// candidates, refined below 0.1 degree with an edge projection-profile search.
     /// Horizontal-only and vertical-only estimates are reported separately so a
     /// disagreement can be read as perspective/camera position rather than roll,
-    /// and `score_curve` exposes the whole search range so peak sharpness is visible.
+    /// Set include_score_curve=true to also get the whole search range as a score curve
+    /// (omitted by default to keep the answer small).
     /// Read-only: it never modifies the image. A null recommended angle means "do not correct".
     #[tool(
         name = "detect_tilt",
@@ -178,11 +184,13 @@ impl AtxServer {
 
     /// Full reference for one recipe operation: every parameter with its type, range,
     /// required/default status and semantics, one or two ready-to-paste JSON examples,
-    /// and the gotchas worth knowing before using it. An unknown name returns a
-    /// structured error listing every valid operation. Read-only.
+    /// and the gotchas worth knowing before using it. A built-in preset name works too and
+    /// returns its full operation list, so a preset can be read and copied as a raw recipe.
+    /// An unknown name returns a structured error listing every valid operation and preset.
+    /// Read-only.
     #[tool(
         name = "explain_operation",
-        output_schema = schema_for_output::<ExplainOperationOutput>(),
+        output_schema = schema_for_output::<ExplainResult>(),
         annotations(
             title = "Explain operation",
             read_only_hint = true,
@@ -229,7 +237,8 @@ impl AtxServer {
     /// Apply a transform recipe at full resolution and issue a new revision.
     /// Pass either `recipe` ({"operations": [...]}, applied in order, at most one
     /// "encode" and it must be last) or `preset` (a built-in named recipe) - exactly
-    /// one of the two. Call list_operations for the operation catalog and the preset
+    /// one of the two - and either `revision_id` (one image) or `revision_ids` (the same
+    /// recipe over a batch of up to 64; one failure does not abort the rest). Call list_operations for the operation catalog and the preset
     /// names, explain_operation for one operation's full schema.
     /// Idempotent: the same (revision_id, resolved recipe) returns the existing derived
     /// revision; a preset hashes identically to the equivalent raw recipe.
@@ -238,7 +247,7 @@ impl AtxServer {
     /// reported as a warning, not an error.
     #[tool(
         name = "apply_transform",
-        output_schema = schema_for_output::<ApplyTransformOutput>(),
+        output_schema = schema_for_output::<ApplyResult>(),
         annotations(
             title = "Apply transform",
             read_only_hint = false,

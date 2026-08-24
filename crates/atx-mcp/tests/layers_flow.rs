@@ -52,9 +52,9 @@ fn tools() -> (tempfile::TempDir, AtxTools) {
 }
 
 fn import_fixture(tools: &AtxTools) -> String {
-    let imported = structured(&tools.import_asset(&ImportAssetParams {
-        path: fixture().to_string_lossy().into_owned(),
-    }));
+    let imported = structured(&tools.import_asset(&ImportAssetParams::single(
+        fixture().to_string_lossy().into_owned(),
+    )));
     imported["revision"]["revision_id"]
         .as_str()
         .expect("revision_id")
@@ -118,7 +118,8 @@ fn layered_apply_transform_composites_and_short_circuits_on_reapply() {
     let source_rev = import_fixture(&tools);
 
     let applied = structured(&tools.apply_transform(&TransformParams {
-        revision_id: source_rev.clone(),
+        revision_id: Some(source_rev.clone()),
+        revision_ids: None,
         recipe: Some(serde_json::from_value(layered_recipe(&source_rev)).unwrap()),
         preset: None,
     }));
@@ -138,7 +139,8 @@ fn layered_apply_transform_composites_and_short_circuits_on_reapply() {
 
     // 冪等性: 同じレシピを再適用すると再変換されず、同じ revision が返る。
     let again = structured(&tools.apply_transform(&TransformParams {
-        revision_id: source_rev.clone(),
+        revision_id: Some(source_rev.clone()),
+        revision_ids: None,
         recipe: Some(serde_json::from_value(layered_recipe(&source_rev)).unwrap()),
         preset: None,
     }));
@@ -220,7 +222,8 @@ fn dims_mismatched_layer_is_a_structured_error_with_the_core_message() {
     let source_rev = import_fixture(&tools);
 
     let result = tools.apply_transform(&TransformParams {
-        revision_id: source_rev.clone(),
+        revision_id: Some(source_rev.clone()),
+        revision_ids: None,
         recipe: Some(serde_json::from_value(dims_mismatched_layered_recipe(&source_rev)).unwrap()),
         preset: None,
     });

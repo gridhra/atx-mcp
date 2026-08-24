@@ -171,9 +171,11 @@ fn list_operations_returns_every_op_and_the_presets() {
     assert!(body.contains("0.1..100"));
 
     // 段階的開示: カタログはトークン的に軽いこと
-    // (v0.3.0 で 27 op + 14 op に付く mask の1行 + 30 プリセット名、目安 ~2100 tokens ≒ 8700 chars)。
+    // (27 op + 14 op に付く mask の1行 + 30 プリセット行。プリセット行には
+    //  中身が見えるように op の骨組み("wb→curves→grain")も入るので、
+    //  目安 ~2400 tokens ≒ 9500 chars を上限とする)。
     assert!(
-        body.len() < 8700,
+        body.len() < 9_500,
         "the catalog must stay compact, got {} chars",
         body.len()
     );
@@ -453,16 +455,17 @@ fn building_block_presets_do_not_promise_chaining() {
 #[test]
 fn preset_apply_is_pure_sugar_over_the_resolved_recipe() {
     let (_ws, tools) = tools();
-    let imported = structured(&tools.import_asset(&ImportAssetParams {
-        path: fixture().to_string_lossy().into_owned(),
-    }));
+    let imported = structured(&tools.import_asset(&ImportAssetParams::single(
+        fixture().to_string_lossy().into_owned(),
+    )));
     let rev = imported["revision"]["revision_id"]
         .as_str()
         .unwrap()
         .to_string();
 
     let applied = structured(&tools.apply_transform(&TransformParams {
-        revision_id: rev.clone(),
+        revision_id: Some(rev.clone()),
+        revision_ids: None,
         recipe: None,
         preset: Some("web_optimize".to_string()),
     }));
@@ -477,8 +480,9 @@ fn preset_apply_is_pure_sugar_over_the_resolved_recipe() {
     // 同じ内容を生レシピで渡すと、冪等ショートサーキットで同じ revision が返る。
     let resolved = atx_mcp::presets::resolve("web_optimize").unwrap().recipe;
     let raw = structured(&tools.apply_transform(&TransformParams {
-        revision_id: rev.clone(),
-        recipe: Some(resolved),
+        revision_id: Some(rev.clone()),
+        revision_ids: None,
+        recipe: Some(resolved.into()),
         preset: None,
     }));
     assert_eq!(raw["recipe_hash"].as_str().unwrap(), preset_hash);
@@ -500,9 +504,9 @@ fn preset_apply_is_pure_sugar_over_the_resolved_recipe() {
 #[test]
 fn recipe_and_preset_are_mutually_exclusive_and_one_is_required() {
     let (_ws, tools) = tools();
-    let imported = structured(&tools.import_asset(&ImportAssetParams {
-        path: fixture().to_string_lossy().into_owned(),
-    }));
+    let imported = structured(&tools.import_asset(&ImportAssetParams::single(
+        fixture().to_string_lossy().into_owned(),
+    )));
     let rev = imported["revision"]["revision_id"]
         .as_str()
         .unwrap()
@@ -513,8 +517,9 @@ fn recipe_and_preset_are_mutually_exclusive_and_one_is_required() {
     .unwrap();
 
     let both = tools.apply_transform(&TransformParams {
-        revision_id: rev.clone(),
-        recipe: Some(recipe.clone()),
+        revision_id: Some(rev.clone()),
+        revision_ids: None,
+        recipe: Some(recipe.clone().into()),
         preset: Some("web_optimize".to_string()),
     });
     assert_eq!(
@@ -523,7 +528,8 @@ fn recipe_and_preset_are_mutually_exclusive_and_one_is_required() {
     );
 
     let neither = tools.apply_transform(&TransformParams {
-        revision_id: rev.clone(),
+        revision_id: Some(rev.clone()),
+        revision_ids: None,
         recipe: None,
         preset: None,
     });
@@ -536,7 +542,8 @@ fn recipe_and_preset_are_mutually_exclusive_and_one_is_required() {
         .any(|v| v == "web_optimize"));
 
     let unknown = tools.apply_transform(&TransformParams {
-        revision_id: rev.clone(),
+        revision_id: Some(rev.clone()),
+        revision_ids: None,
         recipe: None,
         preset: Some("filmic_dream".to_string()),
     });
@@ -678,5 +685,7 @@ fn list_operations_payload_size() {
         body.len() + structured_json.len(),
         (body.len() + structured_json.len()) / 4
     );
-    assert!(body.len() + structured_json.len() < 11_000);
+    // プリセット行に op の骨組み("wb→curves→grain")を足した分だけ上限を広げている
+    // (実運用 FB: 中身が見えないプリセットは使われない)。
+    assert!(body.len() + structured_json.len() < 11_500);
 }

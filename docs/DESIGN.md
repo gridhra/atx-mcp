@@ -1089,3 +1089,27 @@ green(新 op 6 本ぶんのゴールデンを追加)。
 (SNS 比率書き出し、フィルム調グレーディング、白黒バリエーション、
 プロダクト撮影の仕上げ等)。個々のプリセットは通常のレシピ JSON であり、
 語彙・決定論規約に新しい例外は導入していない。
+
+### 9.11 実運用 FB 第2弾への対応(2026-08-24)
+
+神社サイト制作(28枚バッチ)での実運用から。
+
+**価値が実証された設計**(答え合わせ): detect_tilt の H/V 分離と警告文(ヒーロー画像の
+誤回転を実際に防いだ)、compare_revisions の並置、render_preview のインライン+パス
+両返し、apply_transform の実パス返却。いずれも過去の FB 起点の機能で、
+「実運用 FB → 実装 → 次の実運用で実証」のループが2周目で閉じた。
+
+**対応した詰まり**:
+1. inspect_image に stats(BT.709 輝度の p0.2/p1/p50/p99/p99.8 + RGB 平均)。
+   決定論的グリッド間引き(≤262144 サンプル)で大画像でもスキャン費一定
+2. バッチ: import_asset が paths[](≤64)、apply_transform が revision_ids[](≤64)。
+   部分失敗は per-item 収集で続行。単数入力の出力形は完全互換
+3. **inputSchema の opaque 化**: recipe を実行時検証の object にし、27 op 分の
+   スキーマ埋め込みを排除。tools/list 総量 69,489 → 8,002 字(−88%)。
+   実行時エラーは位置特定(operations[i].field)+ did_you_mean(Levenshtein ≤2)で
+   スキーマ検証と同等以上の自己修復性を確保
+4. detect_tilt の score_curve は include_score_curve(既定 off)のオプトインに
+5. explain_operation がプリセット名も解決(kind:"preset" + レシピ全文)。
+   list_operations のプリセット行に op 要約(wb→curves→grain 形式)
+6. import_asset が「既に派生 revision として台帳にある sha256」を検知し
+   二重適用警告(already_derived_from)を返す

@@ -72,9 +72,9 @@ fn preview_jpeg_bytes(result: &CallToolResult) -> Vec<u8> {
 fn workspace_with_fixture() -> (tempfile::TempDir, AtxTools, String) {
     let workspace = tempfile::tempdir().expect("tempdir");
     let tools = AtxTools::open(workspace.path()).expect("open workspace");
-    let imported = structured(&tools.import_asset(&ImportAssetParams {
-        path: fixture().to_string_lossy().into_owned(),
-    }));
+    let imported = structured(&tools.import_asset(&ImportAssetParams::single(
+        fixture().to_string_lossy().into_owned(),
+    )));
     let rev = imported["revision"]["revision_id"]
         .as_str()
         .expect("revision_id")
@@ -244,7 +244,8 @@ fn a_masked_curves_only_changes_the_white_zone() {
     let curve = serde_json::json!({"master": [[0, 0], [128, 220], [255, 255]]});
     let identity = structured(
         &tools.apply_transform(&TransformParams {
-            revision_id: source.clone(),
+            revision_id: Some(source.clone()),
+            revision_ids: None,
             recipe: Some(
                 serde_json::from_value(serde_json::json!({
                     "operations": [{"op": "encode", "format": "png"}]
@@ -256,7 +257,8 @@ fn a_masked_curves_only_changes_the_white_zone() {
     );
     let unmasked = structured(
         &tools.apply_transform(&TransformParams {
-            revision_id: source.clone(),
+            revision_id: Some(source.clone()),
+            revision_ids: None,
             recipe: Some(
                 serde_json::from_value(serde_json::json!({
                     "operations": [
@@ -270,7 +272,8 @@ fn a_masked_curves_only_changes_the_white_zone() {
         }),
     );
     let masked = structured(&tools.apply_transform(&TransformParams {
-        revision_id: source.clone(),
+        revision_id: Some(source.clone()),
+        revision_ids: None,
         recipe: Some(
             serde_json::from_value(serde_json::json!({
                 "operations": [
@@ -342,7 +345,7 @@ fn preview_mask_overlay_differs_from_the_plain_preview_and_coexists() {
 
     let plain = tools.render_preview(&RenderPreviewParams {
         revision_id: source.clone(),
-        recipe: Some(recipe.clone()),
+        recipe: Some(recipe.clone().into()),
         preset: None,
         overlay: None,
         mask_revision_id: None,
@@ -352,7 +355,7 @@ fn preview_mask_overlay_differs_from_the_plain_preview_and_coexists() {
 
     let overlaid = tools.render_preview(&RenderPreviewParams {
         revision_id: source.clone(),
-        recipe: Some(recipe.clone()),
+        recipe: Some(recipe.clone().into()),
         preset: None,
         overlay: Some("mask".to_string()),
         mask_revision_id: Some(mask_a_id.clone()),
@@ -374,7 +377,7 @@ fn preview_mask_overlay_differs_from_the_plain_preview_and_coexists() {
     // キャッシュ共存: overlay あり / なし / 別マスク が互いを上書きしないこと。
     let other = tools.render_preview(&RenderPreviewParams {
         revision_id: source.clone(),
-        recipe: Some(recipe.clone()),
+        recipe: Some(recipe.clone().into()),
         preset: None,
         overlay: Some("mask".to_string()),
         mask_revision_id: Some(mask_b_id.clone()),
@@ -398,7 +401,7 @@ fn preview_mask_overlay_differs_from_the_plain_preview_and_coexists() {
     // 同じ呼び出しの繰り返しはキャッシュヒットでバイト同一。
     let again = tools.render_preview(&RenderPreviewParams {
         revision_id: source,
-        recipe: Some(recipe),
+        recipe: Some(recipe.into()),
         preset: None,
         overlay: Some("mask".to_string()),
         mask_revision_id: Some(mask_a_id),
@@ -419,7 +422,7 @@ fn mask_overlay_argument_errors_are_structured() {
     // 1. overlay="mask" なのに mask_revision_id がない。
     let missing = tools.render_preview(&RenderPreviewParams {
         revision_id: source.clone(),
-        recipe: Some(recipe.clone()),
+        recipe: Some(recipe.clone().into()),
         preset: None,
         overlay: Some("mask".to_string()),
         mask_revision_id: None,
@@ -434,7 +437,7 @@ fn mask_overlay_argument_errors_are_structured() {
     // 2. mask_revision_id だけ渡して overlay を指定していない。
     let stray = tools.render_preview(&RenderPreviewParams {
         revision_id: source.clone(),
-        recipe: Some(recipe.clone()),
+        recipe: Some(recipe.clone().into()),
         preset: None,
         overlay: None,
         mask_revision_id: Some("rev_whatever".to_string()),
@@ -447,7 +450,7 @@ fn mask_overlay_argument_errors_are_structured() {
     // 3. 存在しないマスクは revision_not_found として返る。
     let unknown = tools.render_preview(&RenderPreviewParams {
         revision_id: source,
-        recipe: Some(recipe),
+        recipe: Some(recipe.into()),
         preset: None,
         overlay: Some("mask".to_string()),
         mask_revision_id: Some("rev_does_not_exist".to_string()),
@@ -503,9 +506,9 @@ fn generate_mask_argument_errors_are_teachers() {
 
     // 画像でない revision は参照できない。
     let cube = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/identity_2.cube");
-    let imported = structured(&tools.import_asset(&ImportAssetParams {
-        path: cube.to_string_lossy().into_owned(),
-    }));
+    let imported = structured(&tools.import_asset(&ImportAssetParams::single(
+        cube.to_string_lossy().into_owned(),
+    )));
     let cube_rev = imported["revision"]["revision_id"].as_str().unwrap();
     assert_eq!(
         error_payload(&tools.generate_mask(&params(cube_rev, "linear_gradient")))["error"]["code"],

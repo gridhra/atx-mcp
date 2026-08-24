@@ -68,11 +68,42 @@ const SVG_SNIFF_BYTES: usize = 4 * 1024;
 // 入力パラメータ(tool inputSchema はこれらから生成される)
 // ---------------------------------------------------------------------------
 
-/// `import_asset` の引数。
+/// バッチ(`paths` / `revision_ids`)の1回あたりの上限。
+///
+/// 実運用 FB(28 枚を 1 枚ずつ import → apply で 56 往復)を 2 往復に畳むための
+/// 上限であり、1回の呼び出しが返すテキスト・structuredContent が
+/// ホスト側のコンテキストを食い潰さない実務的な境界でもある。
+pub const MAX_BATCH: usize = 64;
+
+/// `import_asset` の引数。`path`(単一)と `paths`(バッチ)のどちらか一方。
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct ImportAssetParams {
     /// 取り込むローカルファイルの絶対パス(または cwd からの相対パス)。
-    pub path: String,
+    /// `paths` とは排他で、どちらか一方が必須。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// 複数ファイルを1回で取り込む(1..=64 件)。`path` とは排他。
+    /// 1件が失敗してもバッチは中断せず、`failed` に理由が入る。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+}
+
+impl ImportAssetParams {
+    /// 単一パスの引数を作る(テスト・呼び出し側の糖衣)。
+    pub fn single(path: impl Into<String>) -> Self {
+        Self {
+            path: Some(path.into()),
+            paths: None,
+        }
+    }
+
+    /// バッチ引数を作る。
+    pub fn batch<S: Into<String>>(paths: impl IntoIterator<Item = S>) -> Self {
+        Self {
+            path: None,
+            paths: Some(paths.into_iter().map(Into::into).collect()),
+        }
+    }
 }
 
 /// revision を1つ指定するだけのツールの引数。
@@ -90,16 +121,61 @@ pub struct DetectTiltParams {
     /// 探索する最大傾き角(度、0.5..=45)。省略時は 15。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_abs_angle: Option<f64>,
+    /// 探索範囲全体のスコア曲線(最大 300 点)を結果に含めるか。既定 false。
+    /// ピークの鋭さ・多峰性を自分で読みたいときだけ true にする(既定では省かれる)。
+    #[serde(default)]
+    pub include_score_curve: bool,
 }
 
-/// `apply_transform` / `render_preview` の引数。
+/// レシピ引数の**不透明な JSON オブジェクト**。
+///
+/// ROADMAP §Agent UX の規律 #2「語彙の段階的開示」の徹底:
+/// `TransformRecipe` の JsonSchema をそのまま inputSchema に埋めると
+/// 27 op の Operation enum + Layer + `$defs` が **apply_transform と
+/// render_preview の両方に**展開され、tools/list が接続ごとに重くなる。
+/// スキーマ上は `type: "object"` の1行だけを晒し、実際の検証は
+/// [`deserialize_recipe`] が実行時に行って(op index 付きの)構造化エラーで返す。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct RecipeJson(pub serde_json::Value);
+
+impl From<TransformRecipe> for RecipeJson {
+    fn from(recipe: TransformRecipe) -> Self {
+        RecipeJson(serde_json::to_value(recipe).expect("a recipe always serializes"))
+    }
+}
+
+impl JsonSchema for RecipeJson {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "RecipeJson".into()
+    }
+
+    // $defs へ切り出さずその場に展開する(1行のスキーマなので参照する意味がない)。
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "object",
+            "description": "Transform recipe: {\"operations\": [{\"op\": \"...\", ...}, ...]} applied in order, with at most one \"encode\" which must be last (an optional \"layers\" array may precede it). The operation vocabulary is deliberately not inlined here: call list_operations for the catalog and explain_operation for one operation's full schema. An invalid recipe comes back as a structured error naming the offending operation index and field.",
+        })
+    }
+}
+
+/// `apply_transform` の引数。
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct TransformParams {
-    /// 入力 revision ID("rev_...")。
-    pub revision_id: String,
+    /// 入力 revision ID("rev_...")。`revision_ids` とは排他で、どちらか一方が必須。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_id: Option<String>,
+    /// 同じレシピを複数 revision に適用する(1..=64 件)。`revision_id` とは排他。
+    /// 1件が失敗してもバッチは中断せず、その要素に error が入る。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_ids: Option<Vec<String>>,
     /// 変換レシピ。`{"operations": [...]}`。`preset` とはどちらか一方のみ指定する。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recipe: Option<TransformRecipe>,
+    pub recipe: Option<RecipeJson>,
     /// ビルトインプリセット名(`list_operations` の presets セクション参照)。
     /// 指定するとそのプリセットのレシピが使われる。`recipe` とは排他。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,7 +189,7 @@ pub struct RenderPreviewParams {
     pub revision_id: String,
     /// 変換レシピ。`{"operations": [...]}`。`preset` とはどちらか一方のみ指定する。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recipe: Option<TransformRecipe>,
+    pub recipe: Option<RecipeJson>,
     /// ビルトインプリセット名。`recipe` とは排他。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
@@ -239,7 +315,18 @@ impl RevisionSummary {
     }
 }
 
-/// `import_asset` の structuredContent。
+/// 取り込んだバイト列が「既に別レシピの出力として台帳に居る」ことの記録(二重適用検出)。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AlreadyDerivedFrom {
+    /// 同じ sha256 を持つ**派生** revision の ID。
+    pub revision_id: String,
+    /// その派生を生んだレシピのハッシュ。
+    pub recipe_hash: Option<String>,
+    /// その派生の入力 revision(= 元画像)。
+    pub source_revision_id: String,
+}
+
+/// `import_asset`(単一パス)の structuredContent。
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ImportOutput {
     pub revision: RevisionSummary,
@@ -247,6 +334,56 @@ pub struct ImportOutput {
     pub reused: bool,
     /// 取り込み元の正規化済みパス。
     pub source_path: String,
+    /// 注意喚起(現状は二重適用検出のみ)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    /// 取り込んだバイト列が既にこのワークスペースの**派生** revision と同一だった場合の
+    /// その派生の素性(= 同じレシピをもう一度当てると二重処理になる、というサイン)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub already_derived_from: Option<AlreadyDerivedFrom>,
+}
+
+/// バッチの1件分の失敗(パスと構造化エラーの要点)。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BatchFailure {
+    /// 入力で与えられたパス(または revision ID)。
+    pub path: String,
+    pub error: BatchError,
+}
+
+/// バッチ要素の失敗理由。単一呼び出しが返す構造化エラーと同じ code / message。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct BatchError {
+    pub code: String,
+    pub message: String,
+}
+
+/// `import_asset`(バッチ)の1件分。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ImportEntry {
+    /// 入力で与えられたパス(正規化前。入力順を保つ)。
+    pub path: String,
+    #[serde(flatten)]
+    pub result: ImportOutput,
+}
+
+/// `import_asset`(バッチ)の structuredContent。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ImportBatchOutput {
+    /// 取り込みに成功した件数(= `imported` の長さ)。
+    pub count: usize,
+    /// 入力順の成功結果。
+    pub imported: Vec<ImportEntry>,
+    /// 失敗したファイル(1件の失敗でバッチは中断しない)。
+    pub failed: Vec<BatchFailure>,
+}
+
+/// `import_asset` の structuredContent(単一 = 従来どおり / バッチ)。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ImportResult {
+    Single(Box<ImportOutput>),
+    Batch(Box<ImportBatchOutput>),
 }
 
 /// `inspect_image` の structuredContent。
@@ -257,11 +394,37 @@ pub struct InspectOutput {
     pub info: ImageInfo,
 }
 
+/// `detect_tilt` の検出結果のビュー。
+///
+/// `include_score_curve: false`(既定)のときは `score_curve`(最大 300 点 ≒ 数 KB)を
+/// **丸ごと落として**返す。実運用 FB: 曲線は要らないのに毎回返ってきてコンテキストを
+/// 食っていた。必要なときだけフラグで取り寄せる(段階的開示)。
+#[derive(Debug, Clone)]
+pub struct DetectionView {
+    pub detection: TiltDetection,
+    pub include_score_curve: bool,
+}
+
+impl Serialize for DetectionView {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.include_score_curve {
+            return self.detection.serialize(serializer);
+        }
+        let mut value = serde_json::to_value(&self.detection).map_err(serde::ser::Error::custom)?;
+        if let Some(object) = value.as_object_mut() {
+            object.remove("score_curve");
+        }
+        value.serialize(serializer)
+    }
+}
+
 /// `detect_tilt` の structuredContent。
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DetectTiltOutput {
     pub revision_id: String,
-    pub detection: TiltDetection,
+    /// 検出結果。`score_curve` は `include_score_curve: true` のときだけ載る。
+    #[schemars(with = "TiltDetection")]
+    pub detection: DetectionView,
 }
 
 /// `apply_transform` の structuredContent。
@@ -274,6 +437,45 @@ pub struct ApplyTransformOutput {
     /// 既存 revision を返した(再変換をスキップした)場合 true。
     pub reused: bool,
     pub warnings: Vec<String>,
+}
+
+/// `apply_transform`(バッチ)の1件分。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ApplyEntry {
+    /// 入力 revision ID(入力順を保つ)。
+    pub revision_id: String,
+    /// 成功時の出力 revision。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<RevisionSummary>,
+    /// 成功時のみ。既存派生を再利用した(再変換しなかった)場合 true。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reused: Option<bool>,
+    /// 失敗時のみ。単一呼び出しと同じ構造化エラーの要点。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<BatchError>,
+}
+
+/// `apply_transform`(バッチ)の structuredContent。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ApplyBatchOutput {
+    /// 入力件数(= `results` の長さ。成功・失敗の両方を含む)。
+    pub count: usize,
+    /// 成功した件数。
+    pub succeeded: usize,
+    /// 入力順の結果。
+    pub results: Vec<ApplyEntry>,
+    pub recipe_hash: String,
+    pub engine_version: String,
+    /// 全 revision 分の警告を `"<revision_id>: <warning>"` の形で集約したもの。
+    pub warnings: Vec<String>,
+}
+
+/// `apply_transform` の structuredContent(単一 = 従来どおり / バッチ)。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ApplyResult {
+    Single(Box<ApplyTransformOutput>),
+    Batch(Box<ApplyBatchOutput>),
 }
 
 /// `render_preview` の structuredContent。
@@ -397,9 +599,12 @@ pub struct ExplainParamEntry {
     pub semantics: String,
 }
 
-/// `explain_operation` の structuredContent。
+/// `explain_operation` の structuredContent(op を説明した場合)。
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ExplainOperationOutput {
+    /// 常に `"operation"`。プリセットを説明した場合は `"preset"` になる
+    /// ([`ExplainPresetOutput`])。
+    pub kind: String,
     pub name: String,
     pub category: String,
     pub summary: String,
@@ -407,6 +612,33 @@ pub struct ExplainOperationOutput {
     /// そのまま `operations` に入れられる JSON 断片(文字列)。
     pub examples: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+/// `explain_operation` の structuredContent(プリセットを説明した場合)。
+///
+/// 実運用 FB: プリセットは名前と1行説明しか見えないので「中身が分からないから使わない」
+/// と敬遠された。中身(op 配列)をそのまま見せて、生 DSL との往復を可能にする
+/// (ROADMAP §Agent UX の規律 #3「プリセット = 語彙の圧縮」= 2層言語の下層が見えること)。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ExplainPresetOutput {
+    /// 常に `"preset"`。
+    pub kind: String,
+    pub name: String,
+    pub description: String,
+    /// プリセットのレシピの `operations` をそのまま JSON で。
+    /// コピーして編集すれば生レシピとして使える。
+    pub ops: Vec<serde_json::Value>,
+    /// プリセットが `layers` を持つ場合のみ。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layers: Option<serde_json::Value>,
+}
+
+/// `explain_operation` の structuredContent(op / プリセット)。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ExplainResult {
+    Operation(Box<ExplainOperationOutput>),
+    Preset(Box<ExplainPresetOutput>),
 }
 
 /// `export_asset` の structuredContent。
@@ -469,6 +701,181 @@ fn tool_error(
         ContentBlock::text(message),
         ContentBlock::text(payload.to_string()),
     ])
+}
+
+/// 構造化エラー結果([`tool_error`] が作ったもの)から code / message を取り出す。
+///
+/// バッチ処理では1件の失敗でバッチを止めず、**単一呼び出しとまったく同じ**
+/// 構造化エラーの要点をその要素に記録する。エラーの作り方を二重化しないために、
+/// 生成済みの `CallToolResult` から読み戻す。
+fn error_info(result: &CallToolResult) -> BatchError {
+    let parsed = result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text())
+        .find_map(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok());
+    match parsed {
+        Some(value) => BatchError {
+            code: value["error"]["code"]
+                .as_str()
+                .unwrap_or("unknown_error")
+                .to_string(),
+            message: value["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        },
+        None => BatchError {
+            code: "unknown_error".to_string(),
+            message: result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.clone())
+                .unwrap_or_default(),
+        },
+    }
+}
+
+/// 不透明な JSON([`RecipeJson`])を [`TransformRecipe`] に落とす。
+///
+/// inputSchema から Operation enum を外した代償として、**コンパイル時スキーマ検証と
+/// 同じだけ具体的なエラー**を実行時に作るのがこの関数の仕事:
+/// まず素直に deserialize し、失敗したら `operations[i]` / `layers[j].operations[k]` を
+/// 1件ずつ試して**壊れている位置**を特定し、op 名の打ち間違いには
+/// `did_you_mean` を添える。
+fn deserialize_recipe(recipe: &RecipeJson) -> Result<TransformRecipe, CallToolResult> {
+    let value = &recipe.0;
+    match serde_json::from_value::<TransformRecipe>(value.clone()) {
+        Ok(recipe) => Ok(recipe),
+        Err(err) => {
+            let (location, message, did_you_mean) = locate_recipe_error(value, &err);
+            Err(tool_error(
+                "invalid_recipe",
+                format!("invalid recipe at {location}: {message}"),
+                serde_json::json!({
+                    "location": location,
+                    "reason": message,
+                    "did_you_mean": did_you_mean,
+                    "recovery": "fix that field and call the tool again; call list_operations for the catalog of operation names, or explain_operation {\"operation\":\"<name>\"} for one operation's full parameter table",
+                }),
+            ))
+        }
+    }
+}
+
+/// serde のエラーを、レシピ内の位置(`operations[2]` 等)まで絞り込む。
+///
+/// 返すのは `(location, message, did_you_mean)`。位置が特定できないときは
+/// `"recipe"` に serde の原文をそのまま添える(情報を失わないため)。
+fn locate_recipe_error(
+    value: &serde_json::Value,
+    err: &serde_json::Error,
+) -> (String, String, Vec<&'static str>) {
+    let Some(object) = value.as_object() else {
+        return (
+            "recipe".to_string(),
+            format!(
+                "a recipe must be a JSON object like {{\"operations\": [...]}} , got {}",
+                json_type_name(value)
+            ),
+            Vec::new(),
+        );
+    };
+
+    // layers[j].operations[k] → operations[i] の順に、壊れている1件を名指しする。
+    if let Some(layers) = object.get("layers").and_then(|l| l.as_array()) {
+        for (j, layer) in layers.iter().enumerate() {
+            if let Some(ops) = layer.get("operations").and_then(|o| o.as_array()) {
+                if let Some((k, e)) = first_bad_operation(ops) {
+                    let name = op_name_of(&ops[k]);
+                    return (
+                        format!("layers[{j}].operations[{k}]{}", field_suffix(&ops[k])),
+                        e,
+                        suggestions_for(name),
+                    );
+                }
+            }
+        }
+    }
+    match object.get("operations") {
+        None => (
+            "recipe".to_string(),
+            "a recipe needs an \"operations\" array (it may be empty only together with \"layers\")"
+                .to_string(),
+            Vec::new(),
+        ),
+        Some(serde_json::Value::Array(ops)) => match first_bad_operation(ops) {
+            Some((i, e)) => (
+                format!("operations[{i}]{}", field_suffix(&ops[i])),
+                e,
+                suggestions_for(op_name_of(&ops[i])),
+            ),
+            None => ("recipe".to_string(), err.to_string(), Vec::new()),
+        },
+        Some(other) => (
+            "recipe.operations".to_string(),
+            format!("\"operations\" must be an array, got {}", json_type_name(other)),
+            Vec::new(),
+        ),
+    }
+}
+
+/// 配列の中で最初に `Operation` として読めない要素の (index, serde メッセージ)。
+fn first_bad_operation(ops: &[serde_json::Value]) -> Option<(usize, String)> {
+    ops.iter().enumerate().find_map(|(i, op)| {
+        serde_json::from_value::<Operation>(op.clone())
+            .err()
+            .map(|e| (i, e.to_string()))
+    })
+}
+
+/// 壊れている op の中で、どのフィールドが原因かを `".field"` の形で返す(特定できなければ空)。
+///
+/// serde の internally-tagged enum のエラーは `invalid type: string ..., expected f64` のように
+/// **フィールド名を落とす**。1つずつフィールドを抜いて deserialize し直すと、
+/// 「抜いたら通った」= そのフィールドが原因、「抜いたら missing field になった」=
+/// 必須フィールドの型違い、と切り分けられる(op は高々数フィールドなので安い)。
+fn field_suffix(op: &serde_json::Value) -> String {
+    let Some(object) = op.as_object() else {
+        return String::new();
+    };
+    for key in object.keys().filter(|k| k.as_str() != "op") {
+        let mut probe = object.clone();
+        probe.remove(key);
+        match serde_json::from_value::<Operation>(serde_json::Value::Object(probe)) {
+            Ok(_) => return format!(".{key}"),
+            Err(e) if e.to_string().contains(&format!("missing field `{key}`")) => {
+                return format!(".{key}")
+            }
+            Err(_) => {}
+        }
+    }
+    String::new()
+}
+
+/// `{"op": "..."}` の名前(無ければ None)。
+fn op_name_of(op: &serde_json::Value) -> Option<&str> {
+    op.get("op").and_then(|v| v.as_str())
+}
+
+/// 打ち間違えた op 名への「もしかして」。
+fn suggestions_for(name: Option<&str>) -> Vec<&'static str> {
+    match name {
+        Some(name) if crate::vocab::find(name).is_none() => crate::vocab::did_you_mean(name),
+        _ => Vec::new(),
+    }
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 /// [`StoreError`] を構造化エラーに変換する。
@@ -686,28 +1093,173 @@ impl AtxTools {
 
     // -- 1. import_asset ----------------------------------------------------
 
-    /// ローカルパスからワークスペースへ取り込む。同一内容なら既存 revision を返す(冪等)。
+    /// ローカルパス(1件 or バッチ)からワークスペースへ取り込む。
+    ///
+    /// `path` と `paths` は排他でどちらか一方が必須。`paths` のときは
+    /// **1件の失敗でバッチを止めない**(失敗は `failed` に積み、1件でも成功すれば
+    /// ツールとしては成功)。実運用 FB: 28 枚を 1 枚ずつ import すると
+    /// それだけで 28 往復かかっていた。
     pub fn import_asset(&self, params: &ImportAssetParams) -> CallToolResult {
-        let raw = PathBuf::from(&params.path);
+        match (params.path.as_deref(), params.paths.as_deref()) {
+            (Some(path), None) => match self.import_one(path) {
+                Ok((output, text)) => ok_result(text, &ImportResult::Single(Box::new(output))),
+                Err(result) => result,
+            },
+            (None, Some(paths)) => self.import_batch(paths),
+            (Some(_), Some(_)) => tool_error(
+                "path_and_paths_conflict",
+                "path and paths are mutually exclusive, but both were given",
+                serde_json::json!({
+                    "recovery": "pass path for a single file, or paths for a batch of up to 64 files, not both",
+                }),
+            ),
+            (None, None) => tool_error(
+                "path_or_paths_required",
+                "one of path (single file) or paths (batch of up to 64 files) is required",
+                serde_json::json!({
+                    "recovery": "pass path = \"/abs/file.jpg\", or paths = [\"/abs/a.jpg\", \"/abs/b.jpg\"]",
+                }),
+            ),
+        }
+    }
+
+    /// バッチ取り込み。入力順を保ち、失敗しても続行する。
+    fn import_batch(&self, paths: &[String]) -> CallToolResult {
+        if let Err(result) = check_batch_size(paths.len(), "paths") {
+            return result;
+        }
+
+        let mut imported: Vec<ImportEntry> = Vec::new();
+        let mut failed: Vec<BatchFailure> = Vec::new();
+        for path in paths {
+            match self.import_one(path) {
+                Ok((output, _)) => imported.push(ImportEntry {
+                    path: path.clone(),
+                    result: output,
+                }),
+                Err(result) => failed.push(BatchFailure {
+                    path: path.clone(),
+                    error: error_info(&result),
+                }),
+            }
+        }
+
+        if imported.is_empty() {
+            let listed: Vec<String> = failed
+                .iter()
+                .map(|f| format!("- {}: [{}] {}", f.path, f.error.code, f.error.message))
+                .collect();
+            return tool_error(
+                "import_failed",
+                format!(
+                    "all {} imports failed:\n{}",
+                    failed.len(),
+                    listed.join("\n")
+                ),
+                serde_json::json!({
+                    "failed": failed,
+                    "recovery": "fix the paths above (they must be existing local files) and call import_asset again",
+                }),
+            );
+        }
+
+        let reused = imported.iter().filter(|e| e.result.reused).count();
+        let double_applied = imported
+            .iter()
+            .filter(|e| e.result.already_derived_from.is_some())
+            .count();
+        let mut text = format!(
+            "Imported {} of {} file(s){}{}{}",
+            imported.len(),
+            imported.len() + failed.len(),
+            if reused > 0 {
+                format!(" ({reused} already in the workspace, reused)")
+            } else {
+                String::new()
+            },
+            if failed.is_empty() {
+                String::new()
+            } else {
+                format!(", {} failed", failed.len())
+            },
+            if double_applied > 0 {
+                format!(
+                    "; {double_applied} of them are already the output of a recipe (see already_derived_from)"
+                )
+            } else {
+                String::new()
+            },
+        );
+        for entry in &imported {
+            text.push_str(&format!(
+                "\n- {} -> {} ({}x{} {}, {} bytes){}",
+                entry.path,
+                entry.result.revision.revision_id,
+                entry.result.revision.width,
+                entry.result.revision.height,
+                entry.result.revision.mime_type,
+                entry.result.revision.byte_size,
+                if entry.result.reused { " [reused]" } else { "" },
+            ));
+            for warning in &entry.result.warnings {
+                text.push_str(&format!("\n  warning: {warning}"));
+            }
+        }
+        if !failed.is_empty() {
+            text.push_str("\nfailed:");
+            for failure in &failed {
+                text.push_str(&format!(
+                    "\n- {}: [{}] {}",
+                    failure.path, failure.error.code, failure.error.message
+                ));
+            }
+        }
+
+        ok_result(
+            text,
+            &ImportResult::Batch(Box::new(ImportBatchOutput {
+                count: imported.len(),
+                imported,
+                failed,
+            })),
+        )
+    }
+
+    /// 1ファイルを取り込む。成功なら `(structuredContent, テキストサマリ)`、
+    /// 失敗なら単一呼び出しがそのまま返せる構造化エラー。
+    fn import_one(&self, raw_path: &str) -> Result<(ImportOutput, String), CallToolResult> {
+        macro_rules! bail {
+            ($result:expr) => {
+                return Err($result)
+            };
+        }
+        macro_rules! tri {
+            ($expr:expr, $map:expr) => {
+                match $expr {
+                    Ok(v) => v,
+                    Err(e) => return Err($map(e)),
+                }
+            };
+        }
+
+        let raw = PathBuf::from(raw_path);
         let path = match raw.canonicalize() {
             Ok(p) => p,
-            Err(e) => {
-                return tool_error(
-                    "path_not_found",
-                    format!("cannot access {:?}: {e}", params.path),
-                    serde_json::json!({
-                        "path": params.path,
-                        "recovery": "pass an absolute path to an existing local image file",
-                    }),
-                )
-            }
+            Err(e) => bail!(tool_error(
+                "path_not_found",
+                format!("cannot access {raw_path:?}: {e}"),
+                serde_json::json!({
+                    "path": raw_path,
+                    "recovery": "pass an absolute path to an existing local image file",
+                }),
+            )),
         };
         if !path.is_file() {
-            return tool_error(
+            bail!(tool_error(
                 "not_a_file",
                 format!("{} is not a regular file", path.display()),
                 serde_json::json!({ "path": path.to_string_lossy(), "recovery": "pass a path to a file, not a directory" }),
-            );
+            ));
         }
 
         let bytes = tri!(std::fs::read(&path), |e: std::io::Error| tool_error(
@@ -720,7 +1272,7 @@ impl AtxTools {
         // 画像としての検査を行わず、寸法 0x0 の擬似 MIME で台帳に載せる。
         let is_cube = looks_like_cube(&path, &bytes);
         if is_cube && bytes.len() as u64 > MAX_CUBE_BYTES {
-            return tool_error(
+            bail!(tool_error(
                 "limit_exceeded",
                 format!(
                     "{} looks like a .cube LUT but is {} bytes, over the {MAX_CUBE_BYTES} byte limit for LUT assets",
@@ -733,7 +1285,7 @@ impl AtxTools {
                     "max_bytes": MAX_CUBE_BYTES,
                     "recovery": "a .cube file this large is almost certainly not a LUT; check the file, or use a smaller LUT size",
                 }),
-            );
+            ));
         }
         // ベクタアセット(v0.8: レシピから参照される SVG)も画像としては検査しない。
         // 寸法は SVG の**固有サイズ**を記録し、持たない SVG は 0x0 のままにする
@@ -741,7 +1293,7 @@ impl AtxTools {
         //  svg_overlay で width/height を書けというサインになる)。
         let is_svg = !is_cube && looks_like_svg(&path, &bytes);
         if is_svg && bytes.len() as u64 > MAX_SVG_BYTES {
-            return tool_error(
+            bail!(tool_error(
                 "limit_exceeded",
                 format!(
                     "{} looks like an SVG but is {} bytes, over the {MAX_SVG_BYTES} byte limit for SVG assets",
@@ -754,7 +1306,7 @@ impl AtxTools {
                     "max_bytes": MAX_SVG_BYTES,
                     "recovery": "an SVG this large is almost certainly not a logo/watermark; check the file, or simplify the artwork",
                 }),
-            );
+            ));
         }
         let (mime_type, width, height) = if is_cube {
             (CUBE_MIME.to_string(), 0, 0)
@@ -794,6 +1346,21 @@ impl AtxTools {
         );
         let reused = known_before.contains(&revision.revision_id);
         let summary = RevisionSummary::new(&self.store, &revision);
+
+        // --- 二重適用検出(実運用 FB) ---
+        // 取り込んだバイト列と同じ sha256 の**派生** revision が台帳に居るなら、
+        // このファイルは既にどこかで export されたレシピの出力である。
+        // 同じレシピをもう一度当てると二重処理になるので、警告として名指しする。
+        let already_derived_from = tri!(self.find_derived_with_sha256(&revision), store_error);
+        let mut warnings = Vec::new();
+        if let Some(origin) = &already_derived_from {
+            warnings.push(format!(
+                "these bytes are already the output of recipe {} applied to {} (revision {}) - applying the same recipe again would double-process them",
+                short_hash(origin.recipe_hash.as_deref()),
+                origin.source_revision_id,
+                origin.revision_id,
+            ));
+        }
 
         let verb = if reused {
             "Reused existing import of"
@@ -839,14 +1406,42 @@ impl AtxTools {
                 summary.path,
             )
         };
-        ok_result(
-            text,
-            &ImportOutput {
+        let text = if warnings.is_empty() {
+            text
+        } else {
+            format!("{text}\nwarnings: {}", warnings.join("; "))
+        };
+        Ok((
+            ImportOutput {
                 revision: summary,
                 reused,
                 source_path: path.to_string_lossy().into_owned(),
+                warnings,
+                already_derived_from,
             },
-        )
+            text,
+        ))
+    }
+
+    /// 取り込んだ revision と同じ sha256 を持つ**派生** revision を台帳から探す(読み取り専用)。
+    fn find_derived_with_sha256(
+        &self,
+        imported: &AssetRevision,
+    ) -> Result<Option<AlreadyDerivedFrom>, StoreError> {
+        Ok(self
+            .store
+            .list_revisions(None)?
+            .into_iter()
+            .find(|r| {
+                r.sha256 == imported.sha256
+                    && r.revision_id != imported.revision_id
+                    && r.source_revision_id.is_some()
+            })
+            .map(|r| AlreadyDerivedFrom {
+                revision_id: r.revision_id,
+                recipe_hash: r.recipe_hash,
+                source_revision_id: r.source_revision_id.unwrap_or_default(),
+            }))
     }
 
     // -- 2. inspect_image ---------------------------------------------------
@@ -956,11 +1551,25 @@ impl AtxTools {
         } else {
             format!("{text}\nwarnings: {}", detection.warnings.join("; "))
         };
+        // 既定では score_curve を返さない。要る人だけがフラグで取り寄せる。
+        let text = if params.include_score_curve {
+            format!(
+                "{text}\nscore_curve: {} points over the search range (normalized to 1.0 at the peak).",
+                detection.score_curve.len()
+            )
+        } else {
+            format!(
+                "{text}\n(score_curve omitted; pass include_score_curve=true to see the whole search range and judge the peak sharpness yourself)"
+            )
+        };
         ok_result(
             text,
             &DetectTiltOutput {
                 revision_id: params.revision_id.clone(),
-                detection,
+                detection: DetectionView {
+                    detection,
+                    include_score_curve: params.include_score_curve,
+                },
             },
         )
     }
@@ -1042,13 +1651,20 @@ impl AtxTools {
             ));
         }
         if !presets.is_empty() {
+            // 実運用 FB: 名前と1行説明だけでは「中身が見えない」ので敬遠された。
+            // op タグを → でつないだ骨組みだけ添える(パラメータは explain_operation 側)。
             text.push_str("\nPresets (pass preset=<name> instead of recipe):");
             for preset in &presets {
-                text.push_str(&format!("\n- {}: {}", preset.name, preset.description));
+                text.push_str(&format!(
+                    "\n- {} — {}: {}",
+                    preset.name,
+                    preset_op_summary(&preset.recipe),
+                    preset.description
+                ));
             }
         }
         text.push_str(
-            "\ncall explain_operation {\"operation\":\"<name>\"} for full params, examples and gotchas.",
+            "\ncall explain_operation {\"operation\":\"<name>\"} for full params, examples and gotchas (it takes preset names too, and prints the preset's whole op list).",
         );
 
         ok_result(
@@ -1073,24 +1689,34 @@ impl AtxTools {
         } else {
             match crate::vocab::find(trimmed) {
                 Some(doc) => doc,
-                None => {
-                    let valid = crate::vocab::operation_names();
-                    let suggestions = crate::vocab::did_you_mean(&params.operation);
-                    return tool_error(
-                        "unknown_operation",
-                        format!(
-                            "unknown operation {:?}; valid operations are {}",
-                            params.operation,
-                            valid.join(", ")
-                        ),
-                        serde_json::json!({
-                            "given": params.operation,
-                            "valid_values": valid,
-                            "did_you_mean": suggestions,
-                            "recovery": "call explain_operation again with one of valid_values, or list_operations for the catalog",
-                        }),
-                    );
-                }
+                // op でなければプリセット名として解決を試みる(実運用 FB:
+                // プリセットの中身が見えないので使われなかった)。
+                None => match crate::presets::resolve(trimmed) {
+                    Ok(preset) => return explain_preset(&preset),
+                    Err(_) => {
+                        let valid = crate::vocab::operation_names();
+                        let presets = crate::presets::preset_names();
+                        let suggestions = did_you_mean_any(trimmed);
+                        return tool_error(
+                            "unknown_operation",
+                            format!(
+                                "unknown name {:?}. Valid operations: {}. Valid presets: {}.",
+                                params.operation,
+                                valid.join(", "),
+                                presets.join(", ")
+                            ),
+                            serde_json::json!({
+                                "given": params.operation,
+                                "valid_operations": valid,
+                                "valid_presets": presets,
+                                // 旧クライアント互換: op 名の一覧はここにも残す。
+                                "valid_values": valid,
+                                "did_you_mean": suggestions,
+                                "recovery": "call explain_operation again with one of valid_operations (a recipe op) or valid_presets (a built-in named recipe), or list_operations for the whole catalog",
+                            }),
+                        );
+                    }
+                },
             }
         };
 
@@ -1130,14 +1756,15 @@ impl AtxTools {
 
         ok_result(
             text.trim_end(),
-            &ExplainOperationOutput {
+            &ExplainResult::Operation(Box::new(ExplainOperationOutput {
+                kind: "operation".to_string(),
                 name: doc.name.to_string(),
                 category: doc.category.to_string(),
                 summary: doc.summary.to_string(),
                 params: param_entries,
                 examples: doc.examples.iter().map(|e| e.to_string()).collect(),
                 warnings: doc.warnings.iter().map(|w| w.to_string()).collect(),
-            },
+            })),
         )
     }
 
@@ -1245,6 +1872,10 @@ impl AtxTools {
     ///
     /// `preset` を渡した場合は解決後のレシピがそのまま以降の処理に流れる
     /// (= `recipe_hash` は解決後のレシピに対して計算される。プリセットは純粋な糖衣)。
+    /// `revision_ids` を渡すと**同じレシピ**を各 revision に適用する
+    /// (実運用 FB: 28 枚に同じ調整を当てるのに 28 往復かかっていた)。
+    /// 冪等ショートサーキットは revision ごとに個別に効き、1件の失敗では
+    /// バッチを止めずにその要素へ error を入れる。
     pub fn apply_transform(&self, params: &TransformParams) -> CallToolResult {
         let recipe = match resolve_recipe(params.recipe.as_ref(), params.preset.as_deref()) {
             Ok(recipe) => recipe,
@@ -1252,19 +1883,191 @@ impl AtxTools {
         };
         tri!(atx_core::recipe::validate(&recipe), atx_error);
         let recipe_hash = tri!(atx_core::recipe_hash(&recipe), atx_error);
-        let source = tri!(self.store.get_revision(&params.revision_id), store_error);
+
+        match (params.revision_id.as_deref(), params.revision_ids.as_deref()) {
+            (Some(revision_id), None) => {
+                match self.apply_one(revision_id, &recipe, &recipe_hash, params.preset.as_deref()) {
+                    Ok((output, text)) => ok_result(text, &ApplyResult::Single(Box::new(output))),
+                    Err(result) => result,
+                }
+            }
+            (None, Some(revision_ids)) => {
+                self.apply_batch(revision_ids, &recipe, &recipe_hash, params.preset.as_deref())
+            }
+            (Some(_), Some(_)) => tool_error(
+                "revision_id_and_revision_ids_conflict",
+                "revision_id and revision_ids are mutually exclusive, but both were given",
+                serde_json::json!({
+                    "recovery": "pass revision_id for one image, or revision_ids for a batch of up to 64, not both",
+                }),
+            ),
+            (None, None) => tool_error(
+                "revision_id_or_revision_ids_required",
+                "one of revision_id (a single image) or revision_ids (a batch of up to 64) is required",
+                serde_json::json!({
+                    "recovery": "pass revision_id = \"rev_...\", or revision_ids = [\"rev_...\", \"rev_...\"]; call list_assets to see the available revision_ids",
+                }),
+            ),
+        }
+    }
+
+    /// 同じレシピを複数 revision に適用する。入力順を保ち、失敗しても続行する。
+    fn apply_batch(
+        &self,
+        revision_ids: &[String],
+        recipe: &TransformRecipe,
+        recipe_hash: &str,
+        preset: Option<&str>,
+    ) -> CallToolResult {
+        if let Err(result) = check_batch_size(revision_ids.len(), "revision_ids") {
+            return result;
+        }
+
+        let mut results: Vec<ApplyEntry> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        let mut failed: Vec<BatchFailure> = Vec::new();
+        for revision_id in revision_ids {
+            match self.apply_one(revision_id, recipe, recipe_hash, preset) {
+                Ok((output, _)) => {
+                    warnings.extend(
+                        output
+                            .warnings
+                            .iter()
+                            .map(|w| format!("{revision_id}: {w}")),
+                    );
+                    results.push(ApplyEntry {
+                        revision_id: revision_id.clone(),
+                        revision: Some(output.revision),
+                        reused: Some(output.reused),
+                        error: None,
+                    });
+                }
+                Err(result) => {
+                    let error = error_info(&result);
+                    failed.push(BatchFailure {
+                        path: revision_id.clone(),
+                        error: error.clone(),
+                    });
+                    results.push(ApplyEntry {
+                        revision_id: revision_id.clone(),
+                        revision: None,
+                        reused: None,
+                        error: Some(error),
+                    });
+                }
+            }
+        }
+
+        let succeeded = results.len() - failed.len();
+        if succeeded == 0 {
+            let listed: Vec<String> = failed
+                .iter()
+                .map(|f| format!("- {}: [{}] {}", f.path, f.error.code, f.error.message))
+                .collect();
+            return tool_error(
+                "apply_failed",
+                format!(
+                    "all {} transforms failed:\n{}",
+                    failed.len(),
+                    listed.join("\n")
+                ),
+                serde_json::json!({
+                    "failed": failed,
+                    "recipe_hash": recipe_hash,
+                    "recovery": "fix the revision_ids or the recipe above and call apply_transform again; call list_assets to see the available revision_ids",
+                }),
+            );
+        }
+
+        let reused = results.iter().filter(|r| r.reused == Some(true)).count();
+        let mut text = format!(
+            "Applied the same {}recipe (hash {}) to {succeeded} of {} revision(s){}{}",
+            preset_note(preset),
+            short_hash(Some(recipe_hash)),
+            results.len(),
+            if reused > 0 {
+                format!(" ({reused} reused an existing derivation)")
+            } else {
+                String::new()
+            },
+            if failed.is_empty() {
+                String::new()
+            } else {
+                format!(", {} failed", failed.len())
+            },
+        );
+        for entry in &results {
+            match (&entry.revision, &entry.error) {
+                (Some(revision), _) => text.push_str(&format!(
+                    "\n- {} -> {} ({}x{} {}, {} bytes){}\n  path: {}",
+                    entry.revision_id,
+                    revision.revision_id,
+                    revision.width,
+                    revision.height,
+                    revision.mime_type,
+                    revision.byte_size,
+                    if entry.reused == Some(true) {
+                        " [reused]"
+                    } else {
+                        ""
+                    },
+                    revision.path,
+                )),
+                (None, Some(error)) => text.push_str(&format!(
+                    "\n- {}: FAILED [{}] {}",
+                    entry.revision_id, error.code, error.message
+                )),
+                (None, None) => {}
+            }
+        }
+        if !warnings.is_empty() {
+            text.push_str(&format!("\nwarnings: {}", warnings.join("; ")));
+        }
+
+        ok_result(
+            text,
+            &ApplyResult::Batch(Box::new(ApplyBatchOutput {
+                count: results.len(),
+                succeeded,
+                results,
+                recipe_hash: recipe_hash.to_string(),
+                engine_version: ENGINE_VERSION.to_string(),
+                warnings,
+            })),
+        )
+    }
+
+    /// 1 revision にレシピを適用する。成功なら `(structuredContent, テキストサマリ)`、
+    /// 失敗なら単一呼び出しがそのまま返せる構造化エラー。
+    fn apply_one(
+        &self,
+        revision_id: &str,
+        recipe: &TransformRecipe,
+        recipe_hash: &str,
+        preset: Option<&str>,
+    ) -> Result<(ApplyTransformOutput, String), CallToolResult> {
+        macro_rules! tri {
+            ($expr:expr, $map:expr) => {
+                match $expr {
+                    Ok(v) => v,
+                    Err(e) => return Err($map(e)),
+                }
+            };
+        }
+
+        let source = tri!(self.store.get_revision(revision_id), store_error);
         // 変換の入力はラスタ画像でなければならない(SVG / .cube は
         // **レシピから参照される**アセットであって、パイプラインの入力ではない)。
         if !is_raster_image(&source.mime_type) {
-            return not_an_image(&params.revision_id, &source.mime_type);
+            return Err(not_an_image(revision_id, &source.mime_type));
         }
 
         // --- 冪等ショートサーキット: 既存派生があれば再変換しない ---
         let existing = tri!(self.store.list_revisions(None), store_error)
             .into_iter()
             .find(|r| {
-                r.source_revision_id.as_deref() == Some(params.revision_id.as_str())
-                    && r.recipe_hash.as_deref() == Some(recipe_hash.as_str())
+                r.source_revision_id.as_deref() == Some(revision_id)
+                    && r.recipe_hash.as_deref() == Some(recipe_hash)
             });
         if let Some(revision) = existing {
             let summary = RevisionSummary::new(&self.store, &revision);
@@ -1272,24 +2075,24 @@ impl AtxTools {
                 "Reused existing revision {} for this recipe (no re-transform): {}x{} {} ({} bytes)\npath: {}",
                 summary.revision_id, summary.width, summary.height, summary.mime_type, summary.byte_size, summary.path
             );
-            return ok_result(
-                text,
-                &ApplyTransformOutput {
+            return Ok((
+                ApplyTransformOutput {
                     revision: summary,
-                    source_revision_id: params.revision_id.clone(),
-                    recipe_hash,
+                    source_revision_id: revision_id.to_string(),
+                    recipe_hash: recipe_hash.to_string(),
                     engine_version: ENGINE_VERSION.to_string(),
                     reused: true,
                     warnings: Vec::new(),
                 },
-            );
+                text,
+            ));
         }
 
-        let bytes = tri!(self.store.read_bytes(&params.revision_id), store_error);
+        let bytes = tri!(self.store.read_bytes(revision_id), store_error);
         let output = tri!(
             atx_core::apply_recipe_with_assets(
                 &bytes,
-                &recipe,
+                recipe,
                 &self.limits,
                 &StoreAssets(&self.store)
             ),
@@ -1298,8 +2101,8 @@ impl AtxTools {
         let revision = tri!(
             self.store.record_derivation(
                 &source.revision_id,
-                &recipe,
-                &recipe_hash,
+                recipe,
+                recipe_hash,
                 &output.bytes,
                 &output.mime_type,
                 output.width,
@@ -1310,8 +2113,8 @@ impl AtxTools {
         let summary = RevisionSummary::new(&self.store, &revision);
         let text = format!(
             "Applied {}recipe to {} -> {} ({}x{} {}, {} bytes){}\npath: {}",
-            preset_note(params.preset.as_deref()),
-            params.revision_id,
+            preset_note(preset),
+            revision_id,
             summary.revision_id,
             summary.width,
             summary.height,
@@ -1324,17 +2127,17 @@ impl AtxTools {
             },
             summary.path,
         );
-        ok_result(
-            text,
-            &ApplyTransformOutput {
+        Ok((
+            ApplyTransformOutput {
                 revision: summary,
-                source_revision_id: params.revision_id.clone(),
-                recipe_hash,
+                source_revision_id: revision_id.to_string(),
+                recipe_hash: recipe_hash.to_string(),
                 engine_version: ENGINE_VERSION.to_string(),
                 reused: false,
                 warnings: output.warnings,
             },
-        )
+            text,
+        ))
     }
 
     // -- 5. render_preview --------------------------------------------------
@@ -1948,7 +2751,7 @@ fn fmt_angle(a: Option<f64>) -> String {
 /// したがって `preset: "web_optimize"` と、その中身をそのまま書いた生レシピは
 /// 同じ revision に落ちる。
 fn resolve_recipe(
-    recipe: Option<&TransformRecipe>,
+    recipe: Option<&RecipeJson>,
     preset: Option<&str>,
 ) -> Result<TransformRecipe, CallToolResult> {
     match (recipe, preset) {
@@ -1971,7 +2774,7 @@ fn resolve_recipe(
                 "recovery": "pass recipe = {\"operations\": [...]} (call list_operations / explain_operation for the vocabulary), or preset = one of valid_presets",
             }),
         )),
-        (Some(recipe), None) => Ok(recipe.clone()),
+        (Some(recipe), None) => deserialize_recipe(recipe),
         (None, Some(name)) => match crate::presets::resolve(name) {
             Ok(preset) => Ok(preset.recipe),
             Err(crate::presets::PresetError::Unknown) => Err(tool_error(
@@ -1997,6 +2800,129 @@ fn resolve_recipe(
             )),
         },
     }
+}
+
+/// プリセットの中身(op 配列)をそのまま見せる `explain_operation` の分岐。
+fn explain_preset(preset: &crate::presets::Preset) -> CallToolResult {
+    let ops: Vec<serde_json::Value> = preset
+        .recipe
+        .operations
+        .iter()
+        .map(|op| serde_json::to_value(op).unwrap_or(serde_json::Value::Null))
+        .collect();
+    let layers = preset
+        .recipe
+        .layers
+        .as_ref()
+        .and_then(|l| serde_json::to_value(l).ok());
+
+    let mut text = format!(
+        "{} [preset] — {}\nShape: {}\nRecipe ({} operation(s), apply with preset=\"{}\" or paste it as a raw recipe):\n",
+        preset.name,
+        preset.description,
+        preset_op_summary(&preset.recipe),
+        ops.len(),
+        preset.name,
+    );
+    for op in &ops {
+        text.push_str(&format!("- {op}\n"));
+    }
+    if let Some(layers) = &layers {
+        text.push_str(&format!("layers: {layers}\n"));
+    }
+    text.push_str(
+        "A preset is pure sugar: the recipe_hash is computed on the resolved recipe above, so editing a copy of it lands on a different revision than the preset only where you actually changed something.",
+    );
+
+    ok_result(
+        text.trim_end(),
+        &ExplainResult::Preset(Box::new(ExplainPresetOutput {
+            kind: "preset".to_string(),
+            name: preset.name.clone(),
+            description: preset.description.clone(),
+            ops,
+            layers,
+        })),
+    )
+}
+
+/// op 名とプリセット名の**両方**からの「もしかして」。
+fn did_you_mean_any(given: &str) -> Vec<String> {
+    let mut out: Vec<String> = crate::vocab::did_you_mean(given)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let lower = given.to_ascii_lowercase();
+    out.extend(
+        crate::presets::preset_names()
+            .into_iter()
+            .filter(|name| name.contains(&lower) || lower.contains(name))
+            .map(str::to_string),
+    );
+    out
+}
+
+/// カタログ1行に収めるための op 名の短縮形(長い名前だけ縮める)。
+const OP_ABBREVIATIONS: [(&str, &str); 6] = [
+    ("white_balance", "wb"),
+    ("unsharp_mask", "unsharp"),
+    ("gradient_map", "gradmap"),
+    ("strip_metadata", "strip"),
+    ("color_matrix", "cmatrix"),
+    ("svg_overlay", "svg"),
+];
+
+/// プリセットの中身を1行に圧縮する(`"wb→curves→grain"`)。パラメータは載せない。
+///
+/// `layers` を持つプリセットは、レイヤー段があることだけ `layers→` で示す。
+fn preset_op_summary(recipe: &TransformRecipe) -> String {
+    let mut tags: Vec<String> = Vec::new();
+    if recipe.layers.is_some() {
+        tags.push("layers".to_string());
+    }
+    tags.extend(recipe.operations.iter().map(|op| {
+        let name = operation_tag(op);
+        OP_ABBREVIATIONS
+            .iter()
+            .find(|(full, _)| *full == name)
+            .map(|(_, short)| (*short).to_string())
+            .unwrap_or(name)
+    }));
+    tags.join("→")
+}
+
+/// `Operation` の serde タグ(= `{"op": "..."}` に書く名前)を取り出す。
+fn operation_tag(op: &Operation) -> String {
+    serde_json::to_value(op)
+        .ok()
+        .and_then(|v| v.get("op").and_then(|o| o.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// レシピハッシュの先頭 8 文字(人間が見比べるための短縮形)。
+fn short_hash(hash: Option<&str>) -> String {
+    match hash {
+        Some(h) if h.len() >= 8 => h[..8].to_string(),
+        Some(h) => h.to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
+/// バッチ引数の件数(1..=[`MAX_BATCH`])を検査する。
+fn check_batch_size(len: usize, field: &str) -> Result<(), CallToolResult> {
+    if (1..=MAX_BATCH).contains(&len) {
+        return Ok(());
+    }
+    Err(tool_error(
+        "invalid_batch_size",
+        format!("{field} must hold between 1 and {MAX_BATCH} entries, got {len}"),
+        serde_json::json!({
+            "given": len,
+            "min": 1,
+            "max": MAX_BATCH,
+            "recovery": format!("split the work into chunks of at most {MAX_BATCH} and call the tool once per chunk"),
+        }),
+    ))
 }
 
 /// テキストサマリ用: プリセット由来なら `"preset \"x\" "` を、生レシピなら空文字を返す。
