@@ -79,9 +79,9 @@ fn full_flow_import_inspect_detect_preview_apply_export() {
     let tools = AtxTools::open(workspace.path()).expect("open workspace");
 
     // --- 1. import ---------------------------------------------------------
-    let imported = structured(&tools.import_asset(&ImportAssetParams {
-        path: fixture().to_string_lossy().into_owned(),
-    }));
+    let imported = structured(&tools.import_asset(&ImportAssetParams::single(
+        fixture().to_string_lossy().into_owned(),
+    )));
     assert_eq!(imported["reused"], Value::Bool(false));
     let source_rev = imported["revision"]["revision_id"]
         .as_str()
@@ -94,9 +94,9 @@ fn full_flow_import_inspect_detect_preview_apply_export() {
     assert!(PathBuf::from(imported["revision"]["path"].as_str().unwrap()).is_file());
 
     // import は冪等: 同じファイルをもう一度読んでも revision は増えない。
-    let reimported = structured(&tools.import_asset(&ImportAssetParams {
-        path: fixture().to_string_lossy().into_owned(),
-    }));
+    let reimported = structured(&tools.import_asset(&ImportAssetParams::single(
+        fixture().to_string_lossy().into_owned(),
+    )));
     assert_eq!(reimported["reused"], Value::Bool(true));
     assert_eq!(reimported["revision"]["revision_id"], source_rev.as_str());
 
@@ -118,6 +118,7 @@ fn full_flow_import_inspect_detect_preview_apply_export() {
     let detect_result = tools.detect_tilt(&DetectTiltParams {
         revision_id: source_rev.clone(),
         max_abs_angle: None,
+        include_score_curve: false,
     });
     let detected = structured(&detect_result);
     let angle = &detected["detection"]["recommended_angle_degrees"];
@@ -155,7 +156,24 @@ fn full_flow_import_inspect_detect_preview_apply_export() {
         }
     }
 
-    // スコア曲線: 300 点以内・0..1 正規化・補正角の昇順で、ピークは推奨角。
+    // スコア曲線は既定では返らない(オプトイン。ここでは既定 = 省略を確認する)。
+    assert!(
+        det.get("score_curve").is_none(),
+        "score_curve must be omitted unless include_score_curve=true: {det:?}"
+    );
+    assert!(
+        text(&detect_result).contains("include_score_curve=true"),
+        "the summary must point at the flag that brings the curve back"
+    );
+
+    // include_score_curve=true のときだけ:
+    // 300 点以内・0..1 正規化・補正角の昇順で、ピークは推奨角。
+    let with_curve = structured(&tools.detect_tilt(&DetectTiltParams {
+        revision_id: source_rev.clone(),
+        max_abs_angle: None,
+        include_score_curve: true,
+    }));
+    let det = &with_curve["detection"];
     let curve = det["score_curve"].as_array().expect("score_curve");
     assert!(!curve.is_empty() && curve.len() <= 300, "{}", curve.len());
     let mut prev = f64::NEG_INFINITY;
@@ -187,6 +205,7 @@ fn full_flow_import_inspect_detect_preview_apply_export() {
     let narrow = structured(&tools.detect_tilt(&DetectTiltParams {
         revision_id: source_rev.clone(),
         max_abs_angle: Some(3.0),
+        include_score_curve: false,
     }));
     if let Some(a) = narrow["detection"]["recommended_angle_degrees"].as_f64() {
         assert!(a.abs() <= 3.0);
@@ -231,7 +250,8 @@ fn full_flow_import_inspect_detect_preview_apply_export() {
 
     // --- 5. apply_transform ------------------------------------------------
     let applied = structured(&tools.apply_transform(&TransformParams {
-        revision_id: source_rev.clone(),
+        revision_id: Some(source_rev.clone()),
+        revision_ids: None,
         recipe: Some(serde_json::from_value(recipe()).unwrap()),
         preset: None,
     }));
@@ -275,7 +295,8 @@ fn full_flow_import_inspect_detect_preview_apply_export() {
 
     // --- 6. 冪等性: 同じレシピをもう一度 → 同一 revision、再変換なし ---------
     let again = structured(&tools.apply_transform(&TransformParams {
-        revision_id: source_rev.clone(),
+        revision_id: Some(source_rev.clone()),
+        revision_ids: None,
         recipe: Some(serde_json::from_value(recipe()).unwrap()),
         preset: None,
     }));
@@ -330,9 +351,9 @@ fn full_flow_import_inspect_detect_preview_apply_export() {
 fn export_into_the_workspace_store_is_refused() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let tools = AtxTools::open(workspace.path()).expect("open workspace");
-    let imported = structured(&tools.import_asset(&ImportAssetParams {
-        path: fixture().to_string_lossy().into_owned(),
-    }));
+    let imported = structured(&tools.import_asset(&ImportAssetParams::single(
+        fixture().to_string_lossy().into_owned(),
+    )));
     let rev = imported["revision"]["revision_id"]
         .as_str()
         .unwrap()
@@ -376,9 +397,9 @@ fn export_into_the_workspace_store_is_refused() {
 fn export_through_a_symlink_into_the_workspace_is_refused() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let tools = AtxTools::open(workspace.path()).expect("open workspace");
-    let imported = structured(&tools.import_asset(&ImportAssetParams {
-        path: fixture().to_string_lossy().into_owned(),
-    }));
+    let imported = structured(&tools.import_asset(&ImportAssetParams::single(
+        fixture().to_string_lossy().into_owned(),
+    )));
     let rev = imported["revision"]["revision_id"]
         .as_str()
         .unwrap()
@@ -418,21 +439,22 @@ fn errors_are_structured_and_actionable() {
     );
 
     // 存在しないパス
-    let bad_path = tools.import_asset(&ImportAssetParams {
-        path: "/definitely/not/here.jpg".to_string(),
-    });
+    let bad_path = tools.import_asset(&ImportAssetParams::single(
+        "/definitely/not/here.jpg".to_string(),
+    ));
     assert_eq!(error_payload(&bad_path)["error"]["code"], "path_not_found");
 
     // 不正なレシピ(encode が最後でない)は op 位置つきで返る。
-    let imported = structured(&tools.import_asset(&ImportAssetParams {
-        path: fixture().to_string_lossy().into_owned(),
-    }));
+    let imported = structured(&tools.import_asset(&ImportAssetParams::single(
+        fixture().to_string_lossy().into_owned(),
+    )));
     let rev = imported["revision"]["revision_id"]
         .as_str()
         .unwrap()
         .to_string();
     let invalid = tools.apply_transform(&TransformParams {
-        revision_id: rev,
+        revision_id: Some(rev),
+        revision_ids: None,
         recipe: Some(
             serde_json::from_value(serde_json::json!({
                 "operations": [
@@ -582,9 +604,9 @@ fn tool_registration_matches_the_design_contract() {
 fn render_preview_overlay_variants() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let tools = AtxTools::open(workspace.path()).expect("open workspace");
-    let imported = structured(&tools.import_asset(&ImportAssetParams {
-        path: fixture().to_string_lossy().into_owned(),
-    }));
+    let imported = structured(&tools.import_asset(&ImportAssetParams::single(
+        fixture().to_string_lossy().into_owned(),
+    )));
     let rev = imported["revision"]["revision_id"]
         .as_str()
         .unwrap()
@@ -700,16 +722,17 @@ fn compare_revisions_flow() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let tools = AtxTools::open(workspace.path()).expect("open workspace");
 
-    let imported = structured(&tools.import_asset(&ImportAssetParams {
-        path: fixture().to_string_lossy().into_owned(),
-    }));
+    let imported = structured(&tools.import_asset(&ImportAssetParams::single(
+        fixture().to_string_lossy().into_owned(),
+    )));
     let rev_a = imported["revision"]["revision_id"]
         .as_str()
         .unwrap()
         .to_string();
 
     let applied = structured(&tools.apply_transform(&TransformParams {
-        revision_id: rev_a.clone(),
+        revision_id: Some(rev_a.clone()),
+        revision_ids: None,
         recipe: Some(serde_json::from_value(recipe()).unwrap()),
         preset: None,
     }));
@@ -824,9 +847,9 @@ fn compare_revisions_diff_flow() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let tools = AtxTools::open(workspace.path()).expect("open workspace");
 
-    let imported = structured(&tools.import_asset(&ImportAssetParams {
-        path: fixture().to_string_lossy().into_owned(),
-    }));
+    let imported = structured(&tools.import_asset(&ImportAssetParams::single(
+        fixture().to_string_lossy().into_owned(),
+    )));
     let rev_a = imported["revision"]["revision_id"]
         .as_str()
         .unwrap()
@@ -841,8 +864,9 @@ fn compare_revisions_diff_flow() {
     }))
     .unwrap();
     let brightened = structured(&tools.apply_transform(&TransformParams {
-        revision_id: rev_a.clone(),
-        recipe: Some(brighten_recipe),
+        revision_id: Some(rev_a.clone()),
+        revision_ids: None,
+        recipe: Some(brighten_recipe.into()),
         preset: None,
     }));
     let rev_bright = brightened["revision"]["revision_id"]
@@ -934,8 +958,9 @@ fn compare_revisions_diff_flow() {
     // --- 寸法不一致は構造化エラー(resize/crop で寸法が変わった派生と比較) ---
     let resized_recipe: atx_core::TransformRecipe = serde_json::from_value(recipe()).unwrap();
     let resized = structured(&tools.apply_transform(&TransformParams {
-        revision_id: rev_a.clone(),
-        recipe: Some(resized_recipe),
+        revision_id: Some(rev_a.clone()),
+        revision_ids: None,
+        recipe: Some(resized_recipe.into()),
         preset: None,
     }));
     let rev_resized = resized["revision"]["revision_id"]
@@ -951,4 +976,91 @@ fn compare_revisions_diff_flow() {
     assert_eq!(payload["error"]["code"], "dimension_mismatch");
     assert!(payload["error"]["details"]["a_width"].is_u64());
     assert!(payload["error"]["details"]["b_width"].is_u64());
+}
+
+/// tools/list の inputSchema 総量を記録し、レシピを不透明オブジェクトに保つ回帰を張る。
+///
+/// 実運用 FB: `apply_transform` と `render_preview` の inputSchema に
+/// TransformRecipe の JsonSchema(27 op の Operation enum + Layer + $defs)が
+/// **2つとも**展開されていて、スキーマを読み込むクライアントには重すぎた。
+/// レシピは `type: "object"` の1行だけを晒し、検証は実行時に行う
+/// (ROADMAP §Agent UX の規律 #2「語彙の段階的開示」)。
+/// `cargo test -p atx-mcp --test flow -- --nocapture tools_list_schema_size`
+#[test]
+fn tools_list_schema_size_keeps_the_recipe_opaque() {
+    use schemars::JsonSchema;
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let tools = AtxTools::open(workspace.path()).expect("open workspace");
+    let server = atx_mcp::AtxServer::new(std::sync::Arc::new(tools));
+    let listed = server.router().list_all();
+    assert_eq!(listed.len(), 11);
+
+    let mut total = 0usize;
+    for tool in &listed {
+        let json = serde_json::to_string(&tool.input_schema).expect("schema serializes");
+        println!("{:<18} inputSchema {:>6} chars", tool.name, json.len());
+        total += json.len();
+        // op 語彙(と、その値域)がスキーマに紛れ込んでいないこと。
+        assert!(
+            !json.contains("largest_inscribed_rect"),
+            "{}: the operation vocabulary must not be inlined in the inputSchema",
+            tool.name
+        );
+    }
+    println!(
+        "tools/list inputSchema total: {total} chars (~{} tokens)",
+        total / 4
+    );
+
+    // 参考値: レシピを型付きで埋めていた頃の総量(同じ2ツールに $defs ごと展開される)。
+    #[derive(JsonSchema)]
+    #[allow(dead_code)]
+    struct LegacyTransformParams {
+        revision_id: String,
+        recipe: Option<atx_core::TransformRecipe>,
+        preset: Option<String>,
+    }
+    #[derive(JsonSchema)]
+    #[allow(dead_code)]
+    struct LegacyRenderPreviewParams {
+        revision_id: String,
+        recipe: Option<atx_core::TransformRecipe>,
+        preset: Option<String>,
+        overlay: Option<String>,
+        mask_revision_id: Option<String>,
+    }
+    let legacy_apply = serde_json::to_string(&schemars::schema_for!(LegacyTransformParams))
+        .expect("schema serializes")
+        .len();
+    let legacy_preview = serde_json::to_string(&schemars::schema_for!(LegacyRenderPreviewParams))
+        .expect("schema serializes")
+        .len();
+    let slim_apply = schema_len(&listed, "apply_transform");
+    let slim_preview = schema_len(&listed, "render_preview");
+    let before = total - slim_apply - slim_preview + legacy_apply + legacy_preview;
+    println!(
+        "recipe-typed schemas would be: apply_transform {legacy_apply} + render_preview {legacy_preview} chars -> tools/list total {before} chars (~{} tokens)",
+        before / 4
+    );
+
+    assert!(
+        total < legacy_apply,
+        "all 11 tool schemas together must now be smaller than a single recipe-typed one"
+    );
+    assert!(
+        total < 12_000,
+        "tools/list input schemas must stay small, got {total} chars"
+    );
+}
+
+/// tools/list の1ツール分の inputSchema の文字数。
+fn schema_len(listed: &[rmcp::model::Tool], name: &str) -> usize {
+    let tool = listed
+        .iter()
+        .find(|t| t.name == name)
+        .unwrap_or_else(|| panic!("{name} must be registered"));
+    serde_json::to_string(&tool.input_schema)
+        .expect("schema serializes")
+        .len()
 }

@@ -47,6 +47,13 @@ pub struct ImageInfo {
     pub has_gps: bool,
     /// 主要 EXIF の要約(撮影日時、カメラ等)。キーは小文字 snake_case。
     pub exif_summary: std::collections::BTreeMap<String, String>,
+    /// 輝度ヒストグラム統計(黒点 / 白点 / 中央値 / チャンネル平均)。
+    ///
+    /// **決定論的なサブサンプル**上で計算する(`crate::stats` 参照)。
+    /// 262144 画素(512x512 相当)以下の画像は全画素を使うため厳密値、
+    /// それより大きい画像はグリッド間引き(x, y とも k 刻み)による近似値。
+    /// メタデータは読めたが画素デコードに失敗した場合は `None`(inspect 自体は成功させる)。
+    pub stats: Option<crate::stats::ImageStats>,
 }
 
 /// 変換結果。
@@ -68,10 +75,17 @@ struct ExifInfo {
     summary: BTreeMap<String, String>,
 }
 
-/// 入力バイト列を検査する(デコードは寸法確認まで、limits 適用)。
+/// 入力バイト列を検査する(limits 適用)。
 ///
 /// 検査順序は「バイトサイズ → フォーマット判定(マジックバイト)→ 寸法」。
-/// 画素データのフルデコードは行わないため、デコード爆弾に対しても安全。
+/// メタデータ(寸法 / EXIF / ICC)はこの段階だけで確定するため、
+/// 上限を超える入力はフルデコード前に弾かれる = デコード爆弾に対して安全。
+///
+/// 寸法と limits の検査を通った後、`stats`(輝度ヒストグラム統計)のためだけに
+/// **limits 検査済み経路**でもう一度だけ画素をデコードする。統計は決定論的な
+/// グリッド間引き(`crate::stats`)の上で計算するので、画素数が増えてもサンプル数は
+/// 262144 で頭打ちになる。デコードに失敗した場合は `stats = None` とし、
+/// inspect 自体は成功させる(メタデータだけでも返せる方が呼び出し側に有用なため)。
 pub fn inspect_bytes(bytes: &[u8], limits: &Limits) -> Result<ImageInfo> {
     check_byte_limit(bytes, limits)?;
 
@@ -90,6 +104,18 @@ pub fn inspect_bytes(bytes: &[u8], limits: &Limits) -> Result<ImageInfo> {
     let (oriented_width, oriented_height) =
         pixel_ops::oriented_dimensions(width, height, orientation);
 
+    // 統計は EXIF orientation 正規化**前**の画素で計算する。分位点も平均も画素の並べ替えに
+    // 不変なので、間引きグリッドの当たり位置以外に違いは出ない(回転を焼く分の時間を払わない)。
+    let stats = decode_checked(bytes, limits).ok().and_then(|decoded| {
+        // RGB8 / RGBA8 はデコード結果をそのまま走査する(JPEG/PNG の大半がここ)。
+        // それ以外(16bit, グレースケール, パレット等)だけ RGBA8 へ 1 回変換する。
+        match &decoded {
+            DynamicImage::ImageRgb8(img) => crate::stats::from_rgb8(img.as_raw(), width, height),
+            DynamicImage::ImageRgba8(img) => crate::stats::from_rgba8(img.as_raw(), width, height),
+            other => crate::stats::from_rgba8(other.to_rgba8().as_raw(), width, height),
+        }
+    });
+
     Ok(ImageInfo {
         width,
         height,
@@ -104,6 +130,7 @@ pub fn inspect_bytes(bytes: &[u8], limits: &Limits) -> Result<ImageInfo> {
         has_icc_profile: icc.is_some_and(|p| !p.is_empty()),
         has_gps: exif.has_gps,
         exif_summary: exif.summary,
+        stats,
     })
 }
 

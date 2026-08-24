@@ -127,13 +127,13 @@ It is created automatically if it doesn't exist.
 | Tool | Role |
 |---|---|
 | `list_operations` | Compact catalog of the recipe vocabulary: every operation with a one-line description and terse parameter hints, plus the built-in preset names. Optional `category:"geometry"\|"color"\|"filter"\|"output"` narrows it (read-only) |
-| `explain_operation` | Full reference for one operation: parameter table (type, range, required/default, semantics), ready-to-paste JSON examples and gotchas. An unknown name returns the list of valid ones (read-only) |
-| `import_asset` | Import a local image into the workspace (sha256-idempotent) |
+| `explain_operation` | Full reference for one operation: parameter table (type, range, required/default, semantics), ready-to-paste JSON examples and gotchas. A built-in preset name works too and returns its full operation list. An unknown name returns the valid operations and presets, grouped (read-only) |
+| `import_asset` | Import a local image into the workspace (sha256-idempotent). Takes `path` for one file or `paths` for a batch of up to 64 (a failing file does not abort the batch). Warns via `already_derived_from` when the bytes are already the output of a recipe in this workspace |
 | `inspect_image` | Inspect dimensions, EXIF, ICC profile, presence of GPS data, etc. (read-only) |
-| `detect_tilt` | Estimate tilt angle via Canny+Hough (coarse) plus a projection profile (sub-0.1° refinement). Also returns horizontal/vertical family estimates and their score curves. Returns "do not correct" when confidence is low (read-only) |
+| `detect_tilt` | Estimate tilt angle via Canny+Hough (coarse) plus a projection profile (sub-0.1° refinement). Also returns horizontal/vertical family estimates; the full score curve is opt-in via `include_score_curve:true`. Returns "do not correct" when confidence is low (read-only) |
 | `generate_mask` | Generate a deterministic grayscale mask (`linear_gradient` / `radial_gradient` / `luminosity_range` / `color_range`) as a PNG revision with the same dimensions as the reference image, to be referenced from an operation's `mask` field (idempotent) |
 | `render_preview` | Apply a recipe (or a `preset`) at low resolution (long edge ≤768) and return it as an inline image. `overlay:"grid"\|"thirds"\|"horizon"` overlays composition guide lines, and `overlay:"mask"` (with `mask_revision_id`) tints the coverage of a mask (drawn on the preview only; it has no effect on the actual transform) |
-| `apply_transform` | Apply a recipe (or a `preset`) at full resolution and produce a new revision (the same recipe always yields the same revision) |
+| `apply_transform` | Apply a recipe (or a `preset`) at full resolution and produce a new revision (the same recipe always yields the same revision). Takes `revision_id` for one image or `revision_ids` to run the same recipe over a batch of up to 64 |
 | `compare_revisions` | Downscale two revisions to long edge ≤640 and return them composited into a single inline image, arranged via `layout:"side_by_side"\|"stacked"` (for A/B and before/after visual comparison), or `layout:"diff"` for a single pixel-difference heatmap plus `mean_abs_diff`/`max_abs_diff`/`changed_pixel_ratio` stats (requires equal dimensions) |
 | `list_assets` | Read the revision ledger (read-only) |
 | `export_asset` | Write a revision out to a given path (an existing file is only overwritten when `overwrite:true` is explicitly set) |

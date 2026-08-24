@@ -8,6 +8,7 @@ pub(crate) mod ops;
 pub(crate) mod parallel;
 mod pixel_ops;
 pub mod recipe;
+pub mod stats;
 pub(crate) mod transform;
 
 pub use engine::{
@@ -24,6 +25,7 @@ pub use recipe::{
     canonical_json, recipe_hash, Anchor, BaseKeyword, BlendMode, CoordinateSpace, CropMode, Fit,
     Layer, LayerSource, MaskRef, Operation, OutputFormat, RotateCrop, StripScope, TransformRecipe,
 };
+pub use stats::ImageStats;
 
 /// atx-core 全体のエラー型。op 単位の失敗位置を保持し、LLM が自己修復できる粒度で返す。
 #[derive(Debug, thiserror::Error)]

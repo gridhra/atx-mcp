@@ -122,13 +122,13 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 | 工具 | 作用 |
 |---|---|
 | `list_operations` | 配方词汇的精简目录:列出全部操作(op)及其一行说明和参数的类型/取值范围提示,并在末尾附上内置预设名称。可用 `category:"geometry"\|"color"\|"filter"\|"output"` 筛选(只读) |
-| `explain_operation` | 单个操作的完整参考:参数表(类型、取值范围、必填/默认值、语义)、可直接粘贴的 JSON 示例以及注意事项。名称无效时会返回全部有效操作名(只读) |
-| `import_asset` | 将本地图片导入工作区(基于 sha256,幂等) |
+| `explain_operation` | 单个操作的完整参考:参数表(类型、取值范围、必填/默认值、语义)、可直接粘贴的 JSON 示例以及注意事项。也接受内置预设名称,并返回该预设的完整操作列表。名称无效时会分组返回全部有效操作名与预设名(只读) |
+| `import_asset` | 将本地图片导入工作区(基于 sha256,幂等)。单个文件用 `path`,批量(最多 64 个)用 `paths`(单个文件失败不会中断整批)。若导入的字节已是本工作区某个配方的输出,会通过 `already_derived_from` 发出提醒 |
 | `inspect_image` | 检查尺寸、EXIF、ICC 配置文件、是否含 GPS 信息等(只读) |
-| `detect_tilt` | 通过 Canny+Hough(粗定位)加投影轮廓法(精细化到 0.1° 以内)估算倾斜角度,同时返回水平/垂直族的估计值及其评分曲线。置信度低时返回"不进行校正"(只读) |
+| `detect_tilt` | 通过 Canny+Hough(粗定位)加投影轮廓法(精细化到 0.1° 以内)估算倾斜角度,同时返回水平/垂直族的估计值;完整评分曲线需通过 `include_score_curve:true` 显式开启。置信度低时返回"不进行校正"(只读) |
 | `generate_mask` | 确定性地生成灰度蒙版(`linear_gradient` / `radial_gradient` / `luminosity_range` / `color_range`),存为与参考图像同尺寸的 PNG 修订版本,供操作的 `mask` 字段引用(幂等) |
 | `render_preview` | 以低分辨率(长边 ≤768)应用配方(或 `preset` 预设)并以内联图像返回。可通过 `overlay:"grid"\|"thirds"\|"horizon"` 叠加构图参考线,或通过 `overlay:"mask"`(配合 `mask_revision_id`)叠加蒙版覆盖范围(仅绘制在预览图上,不影响实际变换) |
-| `apply_transform` | 以完整分辨率应用配方(或 `preset` 预设)并生成新的修订版本(同一配方 → 同一修订版本) |
+| `apply_transform` | 以完整分辨率应用配方(或 `preset` 预设)并生成新的修订版本(同一配方 → 同一修订版本)。单张用 `revision_id`,把同一配方批量应用到最多 64 个修订版本用 `revision_ids` |
 | `compare_revisions` | 将两个修订版本缩放到长边 ≤640,通过 `layout:"side_by_side"\|"stacked"` 拼接为一张内联图像返回(用于 A/B 或前后对比的可视化);`layout:"diff"` 则返回单张像素差异热力图,并附带 `mean_abs_diff`/`max_abs_diff`/`changed_pixel_ratio` 统计值(要求两者尺寸完全一致) |
 | `list_assets` | 查阅修订版本台账(只读) |
 | `export_asset` | 将修订版本导出到指定路径(仅在显式设置 `overwrite:true` 时才会覆盖已存在的文件) |

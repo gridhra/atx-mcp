@@ -1157,10 +1157,14 @@ pub fn operation_names() -> Vec<&'static str> {
     OPERATIONS.iter().map(|op| op.name).collect()
 }
 
-/// 「もしかして」候補: 前方一致 / 部分一致 / 1文字違い程度の素朴な近傍探索。
+/// 「もしかして」候補: 前方一致 / 部分一致、それで何も出なければ編集距離 ≤2 の近傍。
+///
+/// 打ち間違い(`"resiez"` → `"resize"`)は文字の入れ替えなので部分一致では拾えない。
+/// エラーが教師である以上、1往復で直せるだけの候補を必ず出す
+/// (ROADMAP §Agent UX の規律 #2「エラーが教師」)。
 pub fn did_you_mean(given: &str) -> Vec<&'static str> {
     let given_lower = given.to_ascii_lowercase();
-    OPERATIONS
+    let substring: Vec<&'static str> = OPERATIONS
         .iter()
         .filter(|op| {
             op.name.starts_with(&given_lower)
@@ -1169,7 +1173,36 @@ pub fn did_you_mean(given: &str) -> Vec<&'static str> {
                 || given_lower.contains(op.name)
         })
         .map(|op| op.name)
-        .collect()
+        .collect();
+    if !substring.is_empty() {
+        return substring;
+    }
+    let mut near: Vec<(usize, &'static str)> = OPERATIONS
+        .iter()
+        .filter_map(|op| {
+            let d = edit_distance(&given_lower, op.name);
+            (d <= 2).then_some((d, op.name))
+        })
+        .collect();
+    near.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)));
+    near.into_iter().map(|(_, name)| name).collect()
+}
+
+/// Levenshtein 距離(候補が高々 27 語の短い名前なので素朴な DP で十分)。
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 #[cfg(test)]
