@@ -66,9 +66,9 @@ fn tools() -> (tempfile::TempDir, AtxTools) {
 #[test]
 fn importing_a_cube_produces_a_lut_asset_revision() {
     let (_ws, tools) = tools();
-    let result = tools.import_asset(&ImportAssetParams {
-        path: cube_fixture().to_string_lossy().into_owned(),
-    });
+    let result = tools.import_asset(&ImportAssetParams::single(
+        cube_fixture().to_string_lossy().into_owned(),
+    ));
     let out = structured(&result);
     let body = text(&result);
 
@@ -89,9 +89,9 @@ fn importing_a_cube_produces_a_lut_asset_revision() {
     assert!(body.contains("lut_revision_id"), "summary was: {body}");
 
     // 再取り込みは冪等。
-    let again = structured(&tools.import_asset(&ImportAssetParams {
-        path: cube_fixture().to_string_lossy().into_owned(),
-    }));
+    let again = structured(&tools.import_asset(&ImportAssetParams::single(
+        cube_fixture().to_string_lossy().into_owned(),
+    )));
     assert_eq!(again["reused"], Value::Bool(true));
     assert_eq!(again["revision"]["revision_id"], revision["revision_id"]);
 }
@@ -100,9 +100,9 @@ fn importing_a_cube_produces_a_lut_asset_revision() {
 #[test]
 fn inspect_image_rejects_a_cube_revision_with_a_structured_error() {
     let (_ws, tools) = tools();
-    let imported = structured(&tools.import_asset(&ImportAssetParams {
-        path: cube_fixture().to_string_lossy().into_owned(),
-    }));
+    let imported = structured(&tools.import_asset(&ImportAssetParams::single(
+        cube_fixture().to_string_lossy().into_owned(),
+    )));
     let rev = imported["revision"]["revision_id"]
         .as_str()
         .unwrap()
@@ -126,9 +126,9 @@ fn inspect_image_rejects_a_cube_revision_with_a_structured_error() {
 #[test]
 fn detect_tilt_rejects_a_cube_revision_with_a_structured_error() {
     let (_ws, tools) = tools();
-    let imported = structured(&tools.import_asset(&ImportAssetParams {
-        path: cube_fixture().to_string_lossy().into_owned(),
-    }));
+    let imported = structured(&tools.import_asset(&ImportAssetParams::single(
+        cube_fixture().to_string_lossy().into_owned(),
+    )));
     let rev = imported["revision"]["revision_id"]
         .as_str()
         .unwrap()
@@ -137,6 +137,7 @@ fn detect_tilt_rejects_a_cube_revision_with_a_structured_error() {
     let result = tools.detect_tilt(&atx_mcp::tools::DetectTiltParams {
         revision_id: rev.clone(),
         max_abs_angle: None,
+        include_score_curve: false,
     });
     let payload = error_payload(&result);
     assert_eq!(payload["error"]["code"], "not_an_image");
@@ -150,9 +151,9 @@ fn detect_tilt_rejects_a_cube_revision_with_a_structured_error() {
 #[test]
 fn a_lut_referencing_an_unknown_revision_fails_with_an_actionable_error() {
     let (_ws, tools) = tools();
-    let imported = structured(&tools.import_asset(&ImportAssetParams {
-        path: image_fixture().to_string_lossy().into_owned(),
-    }));
+    let imported = structured(&tools.import_asset(&ImportAssetParams::single(
+        image_fixture().to_string_lossy().into_owned(),
+    )));
     let rev = imported["revision"]["revision_id"]
         .as_str()
         .unwrap()
@@ -167,8 +168,9 @@ fn a_lut_referencing_an_unknown_revision_fails_with_an_actionable_error() {
     .expect("the lut op must deserialize");
 
     let result = tools.apply_transform(&TransformParams {
-        revision_id: rev,
-        recipe: Some(recipe),
+        revision_id: Some(rev),
+        revision_ids: None,
+        recipe: Some(recipe.into()),
         preset: None,
     });
     let payload = error_payload(&result);
@@ -198,16 +200,16 @@ fn a_lut_referencing_an_unknown_revision_fails_with_an_actionable_error() {
 #[test]
 fn applying_an_imported_lut_end_to_end() {
     let (_ws, tools) = tools();
-    let image = structured(&tools.import_asset(&ImportAssetParams {
-        path: image_fixture().to_string_lossy().into_owned(),
-    }));
+    let image = structured(&tools.import_asset(&ImportAssetParams::single(
+        image_fixture().to_string_lossy().into_owned(),
+    )));
     let image_rev = image["revision"]["revision_id"]
         .as_str()
         .unwrap()
         .to_string();
-    let lut = structured(&tools.import_asset(&ImportAssetParams {
-        path: cube_fixture().to_string_lossy().into_owned(),
-    }));
+    let lut = structured(&tools.import_asset(&ImportAssetParams::single(
+        cube_fixture().to_string_lossy().into_owned(),
+    )));
     let lut_rev = lut["revision"]["revision_id"].as_str().unwrap().to_string();
 
     let recipe: atx_core::TransformRecipe = serde_json::from_value(serde_json::json!({
@@ -220,8 +222,9 @@ fn applying_an_imported_lut_end_to_end() {
     .expect("the lut recipe must deserialize");
 
     let applied = structured(&tools.apply_transform(&TransformParams {
-        revision_id: image_rev.clone(),
-        recipe: Some(recipe.clone()),
+        revision_id: Some(image_rev.clone()),
+        revision_ids: None,
+        recipe: Some(recipe.clone().into()),
         preset: None,
     }));
     assert_eq!(applied["reused"], Value::Bool(false));
@@ -233,8 +236,9 @@ fn applying_an_imported_lut_end_to_end() {
 
     // 冪等ショートサーキット: 同じ (revision, recipe) は再変換せず同じ revision を返す。
     let again = structured(&tools.apply_transform(&TransformParams {
-        revision_id: image_rev,
-        recipe: Some(recipe),
+        revision_id: Some(image_rev),
+        revision_ids: None,
+        recipe: Some(recipe.into()),
         preset: None,
     }));
     assert_eq!(again["reused"], Value::Bool(true));

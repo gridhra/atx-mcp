@@ -121,13 +121,13 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 | ツール | 役割 |
 |---|---|
 | `list_operations` | レシピ語彙の軽量カタログ。全 op を1行説明 + パラメータの型/値域ヒント付きで返し、末尾にビルトインプリセット名も載せる。`category:"geometry"\|"color"\|"filter"\|"output"` で絞り込み可(read-only) |
-| `explain_operation` | 1つの op の完全なリファレンス。パラメータ表(型・値域・必須/既定値・意味)、そのまま貼れる JSON 例、落とし穴を返す。未知の名前には有効な op 名一覧を返す(read-only) |
-| `import_asset` | ローカル画像をワークスペースへ取り込み(sha256 冪等) |
+| `explain_operation` | 1つの op の完全なリファレンス。パラメータ表(型・値域・必須/既定値・意味)、そのまま貼れる JSON 例、落とし穴を返す。ビルトインプリセット名も受け取れ、その全 op 列を返す。未知の名前には有効な op 名とプリセット名を分けて返す(read-only) |
+| `import_asset` | ローカル画像をワークスペースへ取り込み(sha256 冪等)。1件なら `path`、最大 64 件の一括なら `paths`(1件の失敗でバッチは止まらない)。取り込んだバイト列が既にこのワークスペースのレシピ出力だった場合は `already_derived_from` で警告 |
 | `inspect_image` | 寸法・EXIF・ICC・GPS 有無などの検査(read-only) |
-| `detect_tilt` | Canny+Hough(粗)+ 投影プロファイル(0.1° 未満の細分)による傾き角推定。水平族/垂直族の推定とスコア曲線も返す。confidence 低なら「補正しない」を返す(read-only) |
+| `detect_tilt` | Canny+Hough(粗)+ 投影プロファイル(0.1° 未満の細分)による傾き角推定。水平族/垂直族の推定も返す。スコア曲線は `include_score_curve:true` のときだけ返る。confidence 低なら「補正しない」を返す(read-only) |
 | `generate_mask` | 決定論的なグレースケールマスク(`linear_gradient` / `radial_gradient` / `luminosity_range` / `color_range`)を、参照画像と同寸法の PNG revision として生成する。op の `mask` フィールドから参照して使う(冪等) |
 | `render_preview` | レシピ(または `preset`)を低解像度(長辺 ≤768)で適用、インライン画像付きで返却。`overlay:"grid"\|"thirds"\|"horizon"` で構図確認用のガイド線を、`overlay:"mask"`(+ `mask_revision_id`)でマスクの被覆を重ねられる(プレビューのみに描画、本適用には影響しない) |
-| `apply_transform` | レシピ(または `preset`)を高解像度適用し新 revision を発行(同一レシピ→同一 revision) |
+| `apply_transform` | レシピ(または `preset`)を高解像度適用し新 revision を発行(同一レシピ→同一 revision)。1件なら `revision_id`、同じレシピを最大 64 件へまとめて当てるなら `revision_ids` |
 | `compare_revisions` | 2つの revision を長辺 ≤640 に縮小し、`layout:"side_by_side"\|"stacked"` で1枚に並べてインライン画像で返却(A/B・before/after の視覚比較用)。`layout:"diff"` なら1枚の画素差分ヒートマップ + `mean_abs_diff`/`max_abs_diff`/`changed_pixel_ratio` の統計を返す(寸法が完全一致している必要あり) |
 | `list_assets` | revision 台帳の参照(read-only) |
 | `export_asset` | revision を指定パスへ書き出し(既存ファイルは `overwrite:true` 明示時のみ上書き) |
