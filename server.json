@@ -1,0 +1,36 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.gridhra/atx-mcp",
+  "title": "atx-mcp",
+  "description": "Deterministic, non-generative image transform MCP server: reproducible recipes, immutable originals.",
+  "version": "0.4.1",
+  "websiteUrl": "https://github.com/gridhra/atx-mcp",
+  "repository": {
+    "url": "https://github.com/gridhra/atx-mcp",
+    "source": "github",
+    "id": "1340924762"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "atx-mcp",
+      "version": "0.4.1",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "named",
+          "name": "--workspace",
+          "description": "Path to the asset workspace directory where originals, revisions, and exports are stored. Created if it does not exist.",
+          "format": "filepath",
+          "isRequired": true,
+          "isRepeated": false,
+          "placeholder": "/path/to/asset-workspace"
+        }
+      ]
+    }
+  ]
+}
