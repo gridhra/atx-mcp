@@ -9,6 +9,9 @@ It executes editing intent — "level the horizon, crop to 16:9, brighten it up 
 touch" — as a declarative transform recipe, and tracks every result as an
 immutable revision. The original asset is never modified.
 
+![Before/after: a tilted synthetic cityscape straightened, levels auto-corrected, and a subtle look applied](docs/assets/before-after.jpg)
+Tilt correction + auto levels + a look applied (a fully deterministic recipe) — left: input / right: output.
+
 See [docs/DESIGN.md](docs/DESIGN.md) for the full design.
 
 ## Use cases

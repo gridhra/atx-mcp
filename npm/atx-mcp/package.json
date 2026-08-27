@@ -1,6 +1,7 @@
 {
   "name": "atx-mcp",
   "version": "0.0.0-dev",
+  "mcpName": "io.github.gridhra/atx-mcp",
   "description": "Deterministic (non-generative) asset transformation MCP server. Ships prebuilt native binaries.",
   "keywords": [
     "mcp",
