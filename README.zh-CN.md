@@ -8,6 +8,9 @@
 (recipe)来执行,并将每一次结果都作为不可变(immutable)的修订版本(revision)
 进行追踪。原始资产永远不会被修改。
 
+![前后对比:一张倾斜的合成城市风景被校正水平、自动调整色阶并应用了一个观感](docs/assets/before-after.jpg)
+倾斜校正 + 自动色阶 + 观感调整(全部为确定性配方)— 左:输入 / 右:输出
+
 完整设计请参见 [docs/DESIGN.md](docs/DESIGN.md)。
 
 ## 使用场景
