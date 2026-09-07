@@ -44,11 +44,15 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the full design.
    > "Stamp my logo in the corner, remove the power lines, and fix the converging verticals."
    `svg_overlay` burns in a logo, `clone`/`heal` remove blemishes or wires by compositing both texture and tone, and `perspective` corrects converging verticals.
 
-8. **Verification and accountability**
+8. **Reading documents (OCR pre-processing)**
+   > "Read this receipt photo for me." / "What does this slide say?"
+   `detect_document` finds the page or screen and returns a `perspective` quad ready to paste, the `ocr_document` preset (grayscale, auto levels, light sharpen) and `trim` concentrate the pixel budget on the text, and `render_preview` with `long_edge:1568` hands the model an image it can actually read. No OCR engine is bundled: the model does the reading, atx only makes the pixels legible and reproducible. `threshold` (Otsu / Sauvola) and `ocr_binarize` exist for external OCR engines.
+
+9. **Verification and accountability**
    > "Show me this image before and after the edits, side by side."
    `compare_revisions` places before/after side by side, or returns a difference heatmap with stats like `mean_abs_diff`. Every revision keeps its lineage, so the full edit history behind any image used in an article can be traced and reproduced — byte-identical on any machine.
 
-What atx doesn't do — generative editing, RAW development, ML-based auto-cropping — is out of scope; see [docs/DESIGN.md](docs/DESIGN.md) for the roadmap.
+What atx doesn't do — generative editing, RAW development, ML-based auto-cropping, OCR itself — is out of scope; see [docs/DESIGN.md](docs/DESIGN.md) for the roadmap.
 
 ## Install
 
@@ -125,7 +129,7 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 `--workspace` (env: `ATX_WORKSPACE`) is the directory used as the asset store.
 It is created automatically if it doesn't exist.
 
-## Tools (11)
+## Tools (12)
 
 | Tool | Role |
 |---|---|
@@ -134,8 +138,9 @@ It is created automatically if it doesn't exist.
 | `import_asset` | Import a local image into the workspace (sha256-idempotent). Takes `path` for one file or `paths` for a batch of up to 64 (a failing file does not abort the batch). Warns via `already_derived_from` when the bytes are already the output of a recipe in this workspace |
 | `inspect_image` | Inspect dimensions, EXIF, ICC profile, presence of GPS data, etc. (read-only) |
 | `detect_tilt` | Estimate tilt angle via Canny+Hough (coarse) plus a projection profile (sub-0.1° refinement). Also returns horizontal/vertical family estimates; the full score curve is opt-in via `include_score_curve:true`. Returns "do not correct" when confidence is low (read-only) |
+| `detect_document` | Find the dominant quadrilateral (page, screen, whiteboard, sign) via Canny + contours and return it as a `perspective`-ready `quad` (tl, tr, br, bl) with `confidence`, `area_ratio`, an `output_size_hint` and a paste-ready `suggested_operation`. Returns `quad:null` with a reason (`no_quad_found` / `already_rectified` / `low_confidence`) rather than guessing (read-only) |
 | `generate_mask` | Generate a deterministic grayscale mask (`linear_gradient` / `radial_gradient` / `luminosity_range` / `color_range`) as a PNG revision with the same dimensions as the reference image, to be referenced from an operation's `mask` field (idempotent) |
-| `render_preview` | Apply a recipe (or a `preset`) at low resolution (long edge ≤768) and return it as an inline image. `overlay:"grid"\|"thirds"\|"horizon"` overlays composition guide lines, and `overlay:"mask"` (with `mask_revision_id`) tints the coverage of a mask (drawn on the preview only; it has no effect on the actual transform) |
+| `render_preview` | Apply a recipe (or a `preset`) at low resolution (long edge ≤768 by default, `long_edge` 256..1568 to hand a vision model a legible page) and return it as an inline image. `overlay:"grid"\|"thirds"\|"horizon"` overlays composition guide lines, and `overlay:"mask"` (with `mask_revision_id`) tints the coverage of a mask (drawn on the preview only; it has no effect on the actual transform) |
 | `apply_transform` | Apply a recipe (or a `preset`) at full resolution and produce a new revision (the same recipe always yields the same revision). Takes `revision_id` for one image or `revision_ids` to run the same recipe over a batch of up to 64 |
 | `compare_revisions` | Downscale two revisions to long edge ≤640 and return them composited into a single inline image, arranged via `layout:"side_by_side"\|"stacked"` (for A/B and before/after visual comparison), or `layout:"diff"` for a single pixel-difference heatmap plus `mean_abs_diff`/`max_abs_diff`/`changed_pixel_ratio` stats (requires equal dimensions) |
 | `list_assets` | Read the revision ledger (read-only) |
@@ -154,12 +159,12 @@ It is created automatically if it doesn't exist.
 }
 ```
 
-Supported ops (27): `auto_orient` / `rotate` / `perspective` / `crop` (crop,
-pad) / `resize` (cover, contain, fill) / `adjust` / `color_matrix` / `curves` /
-`levels` / `lut` / `white_balance` / `hsl` / `blur` / `median` /
-`unsharp_mask` / `convolve` / `clone` / `heal` / `svg_overlay` / `flip` /
-`vignette` / `grain` / `gradient_map` / `pixelate` / `auto_levels` / `encode`
-(jpeg, png, webp, avif) / `strip_metadata`.
+Supported ops (29): `auto_orient` / `rotate` / `perspective` / `crop` (crop,
+pad) / `trim` / `resize` (cover, contain, fill) / `adjust` / `color_matrix` /
+`curves` / `levels` / `lut` / `white_balance` / `hsl` / `blur` / `median` /
+`unsharp_mask` / `convolve` / `threshold` / `clone` / `heal` / `svg_overlay` /
+`flip` / `vignette` / `grain` / `gradient_map` / `pixelate` / `auto_levels` /
+`encode` (jpeg, png, webp, avif) / `strip_metadata`.
 The operation vocabulary is deliberately kept out of the tool schemas: call
 `list_operations` for the up-to-date catalog and `explain_operation` for one
 operation's full schema, examples and gotchas.
@@ -337,6 +342,10 @@ the two:
 | social | `hero_2400` | Large hero/banner image: fit inside 2400px, WebP q85 |
 | building block | `soft_vignette` | Subtle vignette on its own, for stacking after other looks |
 | building block | `grain_fine` | Light, fine, deterministic grain on its own, for stacking |
+| ocr | `ocr_document` | Make a page/slide/whiteboard photo legible for a vision model: grayscale, auto levels, light sharpen (no binarization) |
+| ocr | `ocr_receipt` | Noisy or faded receipts: grayscale, median denoise, stronger auto levels, sharpen |
+| ocr | `ocr_binarize` | Sauvola adaptive binarization for external OCR engines (prefer `ocr_document` when a vision model reads the result) |
+| ocr | `ocr_dark_ui` | Dark-mode screenshots: `trim` the margins, then invert to dark-on-light grayscale |
 
 A preset is pure sugar: it resolves to its recipe and flows through the normal
 pipeline, and the `recipe_hash` (the idempotency key) is computed on the

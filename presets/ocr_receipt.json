@@ -1,0 +1,20 @@
+{
+  "name": "ocr_receipt",
+  "description": "Faded thermal receipts: grayscale, median despeckle, stronger stretch, firmer sharpen (no resize/encode).",
+  "recipe": {
+    "operations": [
+      {
+        "op": "color_matrix",
+        "matrix": [
+          0.2126, 0.7152, 0.0722, 0.0, 0.0,
+          0.2126, 0.7152, 0.0722, 0.0, 0.0,
+          0.2126, 0.7152, 0.0722, 0.0, 0.0,
+          0.0, 0.0, 0.0, 1.0, 0.0
+        ]
+      },
+      { "op": "median", "radius": 1 },
+      { "op": "auto_levels", "clip_percent": 1.0 },
+      { "op": "unsharp_mask", "amount": 0.8, "radius": 1.0, "threshold": 3 }
+    ]
+  }
+}

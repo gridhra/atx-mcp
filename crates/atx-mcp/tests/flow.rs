@@ -218,6 +218,7 @@ fn full_flow_import_inspect_detect_preview_apply_export() {
         preset: None,
         overlay: None,
         mask_revision_id: None,
+        long_edge: None,
     });
     let preview = structured(&preview_result);
     assert_eq!(preview["mime_type"], "image/jpeg");
@@ -491,6 +492,7 @@ fn tool_registration_matches_the_design_contract() {
         [
             "apply_transform",
             "compare_revisions",
+            "detect_document",
             "detect_tilt",
             "explain_operation",
             "export_asset",
@@ -529,6 +531,7 @@ fn tool_registration_matches_the_design_contract() {
             tool.name.as_ref(),
             "inspect_image"
                 | "detect_tilt"
+                | "detect_document"
                 | "list_assets"
                 | "list_operations"
                 | "explain_operation"
@@ -569,14 +572,23 @@ fn tool_registration_matches_the_design_contract() {
     assert!(instructions.contains("\"mask\": {\"revision_id\""));
     assert!(instructions.contains("explain_operation"));
     assert!(instructions.contains("preset"));
+    // v0.5: 文字を読むワークフロー(detect_document → perspective、長辺 1568、二値化しない)。
+    assert!(
+        instructions.contains("detect_document"),
+        "instructions must point at the document workflow"
+    );
+    assert!(instructions.contains("long_edge"));
+    assert!(instructions.contains("Do NOT binarize"));
     // op を instructions 側で列挙しないこと(列挙は list_operations の役目)。
     assert!(
         !instructions.contains("auto_orient | rotate"),
         "instructions must not enumerate the operation vocabulary inline"
     );
     // instructions は毎セッションの固定費なので予算を持つ。JSON 例は1つ(flat recipe)だけ。
+    // v0.5(DESIGN §9.12)で「画像内の文字を読む」ワークフロー 3 行分だけ枠を広げた
+    // (4700 → 5600)。これ以上の追加は list_operations / explain_operation 側へ。
     assert!(
-        instructions.len() < 4700,
+        instructions.len() < 5600,
         "instructions must stay within budget, got {} chars",
         instructions.len()
     );
@@ -633,6 +645,7 @@ fn render_preview_overlay_variants() {
         preset: None,
         overlay: None,
         mask_revision_id: None,
+        long_edge: None,
     });
     let base_structured = structured(&base_result);
     let base_bytes = preview_jpeg_bytes(&base_result);
@@ -653,6 +666,7 @@ fn render_preview_overlay_variants() {
             preset: None,
             overlay: Some(overlay.to_string()),
             mask_revision_id: None,
+            long_edge: None,
         });
         let structured_out = structured(&result);
         assert_eq!(structured_out["overlay"], overlay);
@@ -687,6 +701,7 @@ fn render_preview_overlay_variants() {
             preset: None,
             overlay: Some(overlay.to_string()),
             mask_revision_id: None,
+            long_edge: None,
         });
         let again_bytes = preview_jpeg_bytes(&again);
         assert_eq!(
@@ -704,6 +719,7 @@ fn render_preview_overlay_variants() {
         preset: None,
         overlay: Some("scanlines".to_string()),
         mask_revision_id: None,
+        long_edge: None,
     });
     let payload = error_payload(&invalid);
     assert_eq!(payload["error"]["code"], "invalid_overlay");
@@ -994,7 +1010,7 @@ fn tools_list_schema_size_keeps_the_recipe_opaque() {
     let tools = AtxTools::open(workspace.path()).expect("open workspace");
     let server = atx_mcp::AtxServer::new(std::sync::Arc::new(tools));
     let listed = server.router().list_all();
-    assert_eq!(listed.len(), 11);
+    assert_eq!(listed.len(), 12);
 
     let mut total = 0usize;
     for tool in &listed {
@@ -1046,7 +1062,7 @@ fn tools_list_schema_size_keeps_the_recipe_opaque() {
 
     assert!(
         total < legacy_apply,
-        "all 11 tool schemas together must now be smaller than a single recipe-typed one"
+        "all 12 tool schemas together must now be smaller than a single recipe-typed one"
     );
     assert!(
         total < 12_000,

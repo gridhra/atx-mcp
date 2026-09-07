@@ -425,7 +425,7 @@ fn an_unknown_name_lists_operations_and_presets_separately() {
     assert_eq!(payload["error"]["code"], "unknown_operation");
 
     let details = &payload["error"]["details"];
-    assert_eq!(details["valid_operations"].as_array().unwrap().len(), 27);
+    assert_eq!(details["valid_operations"].as_array().unwrap().len(), 29);
     assert!(details["valid_presets"]
         .as_array()
         .unwrap()
@@ -453,8 +453,10 @@ fn the_catalog_shows_what_each_preset_actually_does() {
         body.contains("→") || body.lines().any(|l| l.starts_with("- grayscale — ")),
         "multi-op presets must show their chain joined by an arrow"
     );
+    // DESIGN.md §9.12 で op 2 本(trim / threshold)と ocr_* プリセット 4 本が
+    // 増えた分だけ上限を広げている(1 行あたり ~170 chars × 6 行)。
     assert!(
-        body.len() < 9_500,
+        body.len() < 10_500,
         "the catalog must stay compact, got {} chars",
         body.len()
     );

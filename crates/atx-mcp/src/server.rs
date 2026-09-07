@@ -15,11 +15,12 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 
 use crate::mask::GenerateMaskParams;
 use crate::tools::{
-    ApplyResult, AtxTools, CompareRevisionsOutput, CompareRevisionsParams, DetectTiltOutput,
-    DetectTiltParams, ExplainOperationParams, ExplainResult, ExportAssetOutput, ExportAssetParams,
-    GenerateMaskOutput, ImportAssetParams, ImportResult, InspectOutput, ListAssetsOutput,
-    ListAssetsParams, ListOperationsOutput, ListOperationsParams, RenderPreviewOutput,
-    RenderPreviewParams, RevisionParams, TransformParams,
+    ApplyResult, AtxTools, CompareRevisionsOutput, CompareRevisionsParams, DetectDocumentOutput,
+    DetectDocumentParams, DetectTiltOutput, DetectTiltParams, ExplainOperationParams,
+    ExplainResult, ExportAssetOutput, ExportAssetParams, GenerateMaskOutput, ImportAssetParams,
+    ImportResult, InspectOutput, ListAssetsOutput, ListAssetsParams, ListOperationsOutput,
+    ListOperationsParams, RenderPreviewOutput, RenderPreviewParams, RevisionParams,
+    TransformParams,
 };
 
 /// ホスト AI 向けの使い方。initialize の `instructions` として返す。
@@ -58,13 +59,19 @@ Recommended flow
 1. import_asset  - bring a local file into the workspace, get a revision_id (or `paths` for up to 64 files in one call).
 2. inspect_image - dimensions, format, EXIF summary, GPS/PII flag, byte size.
 3. detect_tilt   - read-only tilt candidates with a confidence; a null angle means "do not correct".
-4. render_preview- run a candidate recipe, get a <=768px inline JPEG plus a file path, to check composition cheaply.
+3b. detect_document - read-only: the dominant quadrilateral (paper, screen, whiteboard) as a ready-to-paste perspective op; null means "do not correct".
+4. render_preview- run a candidate recipe, get an inline JPEG (long edge 768, up to 1568 via `long_edge`) plus a file path, to check composition cheaply.
 5. apply_transform - run the same recipe at full resolution, producing a new revision (`revision_ids` applies it to up to 64 revisions in one call).
 6. export_asset  - copy a revision out of the workspace (refuses to overwrite unless overwrite=true; ask the user first, and it never writes inside the workspace store).
 
 Use list_assets to review the ledger (lineage, recipes, sizes). Every result carries a human-readable text summary with absolute paths plus machine-readable structuredContent; prefer the structured fields for chaining.
 
 Note on ICC: for png/webp/avif encode output any ICC color profile on the source is dropped (embedding is jpeg-only) and reported as a warning, not an error.
+
+Reading text in an image (documents, receipts, slides, screenshots)
+1. detect_document - if it returns a quad, paste its `suggested_operation` as the FIRST op of your recipe; a null quad means fall back to detect_tilt + rotate.
+2. apply_transform with a recipe of: the detected perspective op -> trim (drop margins) -> the ocr_document preset's ops (grayscale, auto_levels, unsharp_mask); the preset alone covers only the last part. Do NOT binarize for a vision model - thresholding thins strokes; `threshold` / ocr_binarize are for external OCR engines such as Tesseract.
+3. Read it with render_preview `long_edge: 1568`. A vision model reads a downscaled image, so dropping the margins BEFORE that downscale is what buys pixels per glyph; preview a long document in bands with crop.rect.
 
 Visual verification: render_preview takes an optional `overlay` ("grid" | "thirds" | "horizon", or "mask" with a mask_revision_id); compare_revisions shows two revisions side by side or stacked inline, or layout="diff" (same dimensions) for a difference heatmap plus mean/max/changed-ratio stats."#;
 
@@ -157,6 +164,33 @@ impl AtxServer {
         Parameters(params): Parameters<DetectTiltParams>,
     ) -> CallToolResult {
         self.tools.detect_tilt(&params)
+    }
+
+    /// Detect the dominant quadrilateral (a sheet of paper, a screen, a whiteboard, a sign)
+    /// in a revision with a contour-based search, and return it as a ready-to-paste
+    /// perspective operation. This is to `perspective` what detect_tilt is to `rotate`:
+    /// read-only, it never modifies the image, and a null quad means "do not correct".
+    /// The quad is in post-EXIF-orientation pixel coordinates, ordered tl, tr, br, bl, and
+    /// `output_size_hint` is exactly the size `perspective` will produce from it.
+    /// Optional `min_area_ratio` (0.05..=1.0, default 0.2) is the smallest fraction of the
+    /// frame a candidate may cover. When quad is null the reason is the first warning:
+    /// no_quad_found, already_rectified (the page already fills the frame) or low_confidence.
+    #[tool(
+        name = "detect_document",
+        output_schema = schema_for_output::<DetectDocumentOutput>(),
+        annotations(
+            title = "Detect document",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn detect_document(
+        &self,
+        Parameters(params): Parameters<DetectDocumentParams>,
+    ) -> CallToolResult {
+        self.tools.detect_document(&params)
     }
 
     /// Compact catalog of the recipe vocabulary: every operation with a one-line
@@ -263,9 +297,11 @@ impl AtxServer {
         self.tools.apply_transform(&params)
     }
 
-    /// Render a recipe as a small JPEG preview (long edge <= 768) and return it inline
-    /// plus a file path, so the composition can be checked before committing to apply_transform.
-    /// Takes either `recipe` or `preset`, exactly like apply_transform.
+    /// Render a recipe as a small JPEG preview (long edge <= 768 by default) and return it
+    /// inline plus a file path, so the composition can be checked before committing to
+    /// apply_transform. Takes either `recipe` or `preset`, exactly like apply_transform.
+    /// Optional `long_edge` (256..=1568) sets the preview size: raise it to 1568 when the
+    /// point of the preview is to READ text in the image; 768 is too small for that.
     /// Optional `overlay` ("grid" | "thirds" | "horizon") draws semi-transparent composition
     /// guide lines on the returned preview only (never on the apply_transform output).
     /// overlay="mask" instead visualises a mask: pass `mask_revision_id` (required for this

@@ -11,7 +11,7 @@ CI には組み込まない(§下記コスト注意)。
 ## ⚠️ コスト注意
 
 `evals/run.sh` を(`--dry-run` なしで)実行すると、タスクごとに実際の Claude API トークンを消費する。
-13 タスク × 数ターンの実行になるので、CI やプッシュ毎の自動実行には絶対に使わないこと。
+15 タスク × 数ターンの実行になるので、CI やプッシュ毎の自動実行には絶対に使わないこと。
 リリース候補を切る前に手動で1回まわす、という運用を想定している。
 
 ## 前提
@@ -27,7 +27,7 @@ which claude                        # Claude Code CLI が PATH にあること
 # 1. まずコマンド列挙だけ確認する(トークン消費なし)
 evals/run.sh --dry-run
 
-# 2. 全13タスクを実行する(課金される)
+# 2. 全15タスクを実行する(課金される)
 evals/run.sh
 
 # 3. 1タスクだけ実行する(デバッグ用、courseの絞り込み)
@@ -57,7 +57,10 @@ evals/run.sh t01_straighten_eyecatch
   `{"op": "...", "fields": {...}, "fields_present": [...]}` の形式。`op` は省略可
   (省略時はop名を問わず走査。マスク付きトーン系 op のようにどの op が使われるか
   事前に決め打てないケース用)。`fields` は値まで一致、`fields_present` は
-  値を問わずそのフィールドが存在する(null でない)ことだけを要求する) /
+  値を問わずそのフィールドが存在する(null でない)ことだけを要求する。
+  `{"any_of": [<spec>, ...]}` は選択肢のいずれか1つを満たせば真 —
+  「グレースケール化は color_matrix でも auto_levels でもよい」のように、
+  エージェントがどちらを選ぶか決め打てないケース用) /
   `recipe_contains_text`(recipe を JSON 文字列化したものへの部分文字列一致の配列。
   `layers` キーの存在やブレンドモード名など、op名ベースでは表現しづらい構造の
   ざっくり確認用) /
@@ -92,7 +95,7 @@ python3 evals/score.py --selftest
 
 ## タスク一覧(evals/tasks/*.json)
 
-実運用フィードバック(docs/DESIGN.md §9)と ROADMAP の Agent UX 規律に由来する13本:
+実運用フィードバック(docs/DESIGN.md §9)と ROADMAP の Agent UX 規律に由来する15本:
 
 | id | 検証する挙動 |
 |---|---|
@@ -109,6 +112,8 @@ python3 evals/score.py --selftest
 | `t11_masked_adjustment` | `generate_mask`(linear_gradient)でマスクを作り、トーン系 op の `mask` フィールドから参照して部分適用する(空だけ暗くする、下半分は不変) |
 | `t12_layer_composite` | `layers` スタックで同一画像のぼかし版を `screen` 50% で重ね、仕上げの `operations` で 1200px幅 WebP へ |
 | `t13_svg_watermark` | `.svg` バッジを `import_asset` してから `svg_overlay` で右下に焼き込む(ベクタアセットの取り込み→参照フロー) |
+| `t14_document_rectify_readable` | 斜めから撮った書類の写真を `detect_document` → `perspective` で正対させ、`ocr_document` 相当(`color_matrix` / `auto_levels` のいずれか)で読みやすく整える(DESIGN §9.12) |
+| `t15_dark_screenshot_trim` | ダークモードのスクリーンショットの一様な余白を `trim` で落とす(縮小前に余白を捨てて 1 グリフあたりの画素数を稼ぐ。DESIGN §9.12) |
 
 各タスクの `input_fixture` は基本的に共通で `tests/fixtures/synthetic_scene.jpg`
 (完全合成・決定論的に再生成可能なフィクスチャ。docs/DESIGN.md §9.2 参照)。
@@ -116,6 +121,15 @@ python3 evals/score.py --selftest
 `rotate` を省く正しい振る舞いが誤って失敗扱いになっていた。`evals/fixtures/tilted_scene.jpg`
 (同じ合成シーンを `-2.4°` 回転させた、客観的に傾いたフィクスチャ。`crates/atx-core/examples/gen_fixture.rs`
 が `synthetic_scene.jpg` と同時に生成し、`detect_tilt` の推奨補正角 ~+2.4° を自己検証する)を使う。
+
+ドキュメント前処理の2本も専用フィクスチャを使う(いずれも同じ生成器が作る完全合成画像。文字は描かず
+「文字らしい」矩形バー列で行を表す):
+
+- `t14_document_rectify_readable`: `evals/fixtures/document_photo.jpg`
+  (白い用紙を暗い机に置き、atx-core 自身の `perspective`(キーストーン)で歪ませたもの。
+  生成器が既知 quad と `detect_document` の結果を突き合わせ、頂点誤差 ≤ 長辺 1% を自己検証する)
+- `t15_dark_screenshot_trim`: `evals/fixtures/dark_ui_screenshot.png`
+  (暗い UI + 完全に一様な余白。`trim` の期待値が定義できる)
 
 ## タスクの追加方法
 

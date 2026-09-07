@@ -1,4 +1,11 @@
-//! atx-geometry: 傾き検出(Canny + Hough + 角度選択ヒューリスティック)。
+//! atx-geometry: 幾何の検出系。
+//!
+//! - 傾き検出 [`detect_tilt`](Canny + Hough + 投影プロファイル)
+//! - ドキュメント四角形検出 [`detect_document`](Canny + 輪郭近似。[`quad`] モジュール)
+//!
+//! いずれも read-only で、適用はしない(判断はホスト AI に委ねる)。
+//!
+//! # 傾き検出(Canny + Hough + 角度選択ヒューリスティック)
 //!
 //! 品質要件:
 //! - 建築・風景写真: 人工回転テストで誤差 ±0.3° 以内
@@ -42,6 +49,7 @@
 mod angle;
 mod hough;
 mod projection;
+mod quad;
 
 use image::{imageops::FilterType, DynamicImage, GrayImage};
 use imageproc::gradients::sobel_gradients;
@@ -50,6 +58,10 @@ use serde::Serialize;
 use crate::angle::{confidence, inscribed_crop_loss_percent, support_for, AngleHistogram};
 use crate::hough::{detect_lines_fine, Family};
 use crate::projection::{ProjectionEstimate, ProjectionSearch};
+
+pub use crate::quad::{
+    detect_document, DocumentDetection, DocumentParams, OutputSizeHint, SuggestedOperation,
+};
 
 /// 傾き検出の結果。MCP structuredContent 互換。
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
@@ -405,7 +417,9 @@ fn empty(warning: String, pp: &ProjectionEstimate) -> TiltDetection {
 }
 
 /// 長辺が `long_edge` 以下になるようグレースケール化して縮小する。
-fn downscale_gray(image: &DynamicImage, long_edge: u32) -> GrayImage {
+///
+/// `detect_tilt` と [`crate::quad::detect_document`] で共用する前処理。
+pub(crate) fn downscale_gray(image: &DynamicImage, long_edge: u32) -> GrayImage {
     let gray = image.to_luma8();
     let (w, h) = (gray.width(), gray.height());
     let long = w.max(h);
@@ -421,7 +435,7 @@ fn downscale_gray(image: &DynamicImage, long_edge: u32) -> GrayImage {
 /// Sobel 勾配強度のパーセンタイルから Canny 閾値を適応決定する。
 ///
 /// ヒストグラム(整数ビン)ベースなので浮動小数の順序依存がなく決定論的。
-fn canny_thresholds(blurred: &GrayImage) -> (f32, f32) {
+pub(crate) fn canny_thresholds(blurred: &GrayImage) -> (f32, f32) {
     let g = sobel_gradients(blurred);
     let mut hist = [0u32; 1141];
     let mut n = 0u32;
@@ -448,7 +462,7 @@ fn canny_thresholds(blurred: &GrayImage) -> (f32, f32) {
 }
 
 /// 小数第 3 位に丸める(出力の安定化)。
-fn round3(v: f64) -> f64 {
+pub(crate) fn round3(v: f64) -> f64 {
     let r = (v * 1000.0).round() / 1000.0;
     if r == 0.0 {
         0.0

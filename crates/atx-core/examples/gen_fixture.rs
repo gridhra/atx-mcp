@@ -1,5 +1,10 @@
-//! テストフィクスチャ `tests/fixtures/synthetic_scene.jpg` および
-//! `evals/fixtures/tilted_scene.jpg` の生成器。
+//! テストフィクスチャの生成器。
+//!
+//! - `tests/fixtures/synthetic_scene.jpg` … 合成の「建築写真」
+//! - `evals/fixtures/tilted_scene.jpg` … 上を -2.4° 回した傾きフィクスチャ
+//! - `tests/fixtures/synthetic_document.png` … 白い用紙 + 単語状バー + 一様な灰色余白
+//! - `evals/fixtures/document_photo.jpg` … 上の用紙を暗い机に置き、キーストーンで歪めた「写真」
+//! - `evals/fixtures/dark_ui_screenshot.png` … ダークモード UI のスクリーンショット風合成
 //!
 //! ```sh
 //! cargo run -p atx-core --example gen_fixture
@@ -406,6 +411,12 @@ fn main() {
     );
 
     gen_tilted_fixture(&first);
+
+    // ドキュメント前処理(DESIGN §9.12)のフィクスチャ。
+    // 既存の synthetic_scene.jpg / tilted_scene.jpg のバイト列には一切触れない。
+    gen_synthetic_document();
+    gen_document_photo();
+    gen_dark_ui_screenshot();
 }
 
 /// `evals/fixtures/tilted_scene.jpg` を生成する。
@@ -479,4 +490,421 @@ fn tilt_recipe() -> TransformRecipe {
             },
         ],
     }
+}
+
+// ===========================================================================
+// ドキュメント前処理(DESIGN §9.12)のフィクスチャ
+// ===========================================================================
+//
+// - tests/fixtures/synthetic_document.png … 白い用紙 + 黒い単語状バー列 + 一様な灰色余白
+// - evals/fixtures/document_photo.jpg     … 上の用紙を暗い机面に置き、atx-core の
+//                                            `perspective`(キーストーン)で歪ませた「写真」
+// - evals/fixtures/dark_ui_screenshot.png … 暗い UI のスクリーンショット風合成
+//
+// 第三者素材は使わない。**文字は一切描かず**、「文字らしい」矩形バー列で行を表す。
+// 乱数源は固定シードの LCG のみ。いずれも 2 回生成してバイト同一を assert する。
+
+/// 任意寸法の描画バッファ(既存のシーン描画はモジュール定数 `WIDTH`/`HEIGHT` に
+/// 縛られているため、新しいフィクスチャ用に寸法を持ち回せる最小の器を用意する)。
+struct Canvas {
+    w: u32,
+    h: u32,
+    buf: Vec<[f32; 3]>,
+}
+
+impl Canvas {
+    fn new(w: u32, h: u32, fill: [f32; 3]) -> Self {
+        Self {
+            w,
+            h,
+            buf: vec![fill; (w * h) as usize],
+        }
+    }
+
+    /// 軸平行の塗り矩形(範囲外はクリップ)。
+    fn rect(&mut self, x0: i64, y0: i64, w: i64, h: i64, c: [f32; 3]) {
+        let x1 = (x0 + w).clamp(0, self.w as i64);
+        let y1 = (y0 + h).clamp(0, self.h as i64);
+        let x0 = x0.clamp(0, self.w as i64);
+        let y0 = y0.clamp(0, self.h as i64);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                self.buf[(y as u32 * self.w + x as u32) as usize] = c;
+            }
+        }
+    }
+
+    fn to_rgb(&self) -> RgbImage {
+        let mut img = RgbImage::new(self.w, self.h);
+        for (i, px) in self.buf.iter().enumerate() {
+            img.put_pixel(
+                (i as u32) % self.w,
+                (i as u32) / self.w,
+                Rgb([
+                    px[0].round().clamp(0.0, 255.0) as u8,
+                    px[1].round().clamp(0.0, 255.0) as u8,
+                    px[2].round().clamp(0.0, 255.0) as u8,
+                ]),
+            );
+        }
+        img
+    }
+}
+
+/// 用紙の色。
+const PAPER: [f32; 3] = [246.0, 245.0, 242.0];
+/// インク(単語バー)の色。
+const INK: [f32; 3] = [28.0, 27.0, 30.0];
+/// `synthetic_document.png` の一様な余白色(`trim` の期待値がこれで定義できる)。
+const DOC_MARGIN: [f32; 3] = [154.0, 154.0, 154.0];
+
+/// 用紙の中身(見出し + 単語状バーの行)を矩形だけで描く。
+///
+/// 文字は描かない(フォント = 環境依存 = 非決定論。DESIGN §9.9 と同じ理由)。
+/// 行間・左マージンは一定で、単語の幅だけ LCG で振る。
+fn draw_document_body(canvas: &mut Canvas, x: i64, y: i64, w: i64, h: i64, rng: &mut Lcg) {
+    canvas.rect(x, y, w, h, PAPER);
+
+    let pad = w / 10;
+    let text_w = w - pad * 2;
+    // 行の高さ・行間は用紙高さに対する固定比(寸法を変えても見た目が保たれる)。
+    let bar_h = (h / 62).max(3);
+    let line_step = bar_h * 3;
+    let space = (bar_h * 3 / 4).max(2);
+
+    // 見出し(太いバー)+ その下の罫線。
+    canvas.rect(x + pad, y + line_step, text_w * 3 / 5, bar_h * 2, INK);
+    canvas.rect(x + pad, y + line_step * 2, text_w, (bar_h / 3).max(1), INK);
+
+    // 本文: 段落ごとに行を並べ、各行を「単語」バーで埋める。
+    let mut ly = y + line_step * 4;
+    let mut paragraph_line = 0i64;
+    while ly + bar_h < y + h - pad {
+        // 段落末尾の行は短くする(自然な右端の凹凸を作る)。
+        let line_w = if paragraph_line == 6 {
+            text_w * (2 + (rng.next_u32() % 3) as i64) / 5
+        } else {
+            text_w
+        };
+        let mut lx = x + pad;
+        while lx < x + pad + line_w {
+            let word = bar_h * (4 + (rng.next_u32() % 9) as i64) / 2;
+            let word = word.min(x + pad + line_w - lx);
+            if word <= 0 {
+                break;
+            }
+            canvas.rect(lx, ly, word, bar_h, INK);
+            lx += word + space;
+        }
+        ly += line_step;
+        paragraph_line += 1;
+        if paragraph_line > 6 {
+            paragraph_line = 0;
+            ly += line_step; // 段落間の空き
+        }
+    }
+}
+
+/// PNG へ決定論的にエンコードする(image クレートの既定圧縮設定。
+/// 同一バージョン・同一入力なら常に同じバイト列)。
+fn encode_png(img: &RgbImage) -> Vec<u8> {
+    use image::ImageEncoder;
+    let mut out = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut out)
+        .write_image(
+            img.as_raw(),
+            img.width(),
+            img.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .expect("png encode");
+    out
+}
+
+/// リポジトリルート相対のフィクスチャ出力先(親ディレクトリは作る)。
+fn repo_path(relative: &str) -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).expect("fixture directory");
+    path
+}
+
+/// `tests/fixtures/synthetic_document.png`(900x1200、軸平行)。
+fn draw_synthetic_document() -> Canvas {
+    const W: u32 = 900;
+    const H: u32 = 1200;
+    /// 用紙の周囲に残す一様な余白(px)。`trim` の期待値はこれで決まる。
+    const MARGIN: i64 = 60;
+
+    let mut canvas = Canvas::new(W, H, DOC_MARGIN);
+    let mut rng = Lcg(0xD0C0_1234);
+    draw_document_body(
+        &mut canvas,
+        MARGIN,
+        MARGIN,
+        W as i64 - MARGIN * 2,
+        H as i64 - MARGIN * 2,
+        &mut rng,
+    );
+    canvas
+}
+
+fn gen_synthetic_document() {
+    let first = encode_png(&draw_synthetic_document().to_rgb());
+    let second = encode_png(&draw_synthetic_document().to_rgb());
+    assert_eq!(
+        first, second,
+        "synthetic_document.png generation must be byte-for-byte deterministic"
+    );
+    let path = repo_path("tests/fixtures/synthetic_document.png");
+    std::fs::write(&path, &first).expect("write synthetic_document.png");
+    println!("wrote {} (900x1200, {} bytes)", path.display(), first.len());
+}
+
+/// `document_photo.jpg` のシーン寸法。
+const PHOTO_W: u32 = 1400;
+const PHOTO_H: u32 = 1050;
+/// 机の上に置いた用紙(軸平行、キーストーンを掛ける前)の矩形。
+const PAPER_X: i64 = 300;
+const PAPER_Y: i64 = 90;
+const PAPER_W: i64 = 800;
+const PAPER_H: i64 = 920;
+/// 掛けるキーストーン角(度)。atx-core `perspective` の符号規約。
+const PHOTO_VERTICAL_DEG: f64 = 9.0;
+const PHOTO_HORIZONTAL_DEG: f64 = 5.0;
+/// 机の色(キーストーンで空いた領域の pad_color にも使う)。
+const DESK_HEX: &str = "#1e1c1a";
+
+/// キーストーン前のシーン(暗い机 + 用紙 + 微細ノイズ)。
+fn draw_document_scene() -> Canvas {
+    let mut canvas = Canvas::new(PHOTO_W, PHOTO_H, [30.0, 28.0, 26.0]);
+    let mut rng = Lcg(0x0DE5_C001);
+
+    // 机: ゆるい縦グラデーション + 木目風の低周波の筋(用紙より必ず暗い)。
+    for y in 0..PHOTO_H {
+        let t = y as f32 / PHOTO_H as f32;
+        let base = [
+            lerp(38.0, 22.0, t),
+            lerp(34.0, 20.0, t),
+            lerp(30.0, 18.0, t),
+        ];
+        for x in 0..PHOTO_W {
+            let grain = ((x as f32 * 0.02).sin() * 0.5 + 0.5) * 3.0;
+            canvas.buf[(y * PHOTO_W + x) as usize] =
+                [base[0] + grain, base[1] + grain, base[2] + grain * 0.8];
+        }
+    }
+
+    draw_document_body(&mut canvas, PAPER_X, PAPER_Y, PAPER_W, PAPER_H, &mut rng);
+
+    // 用紙のわずかな影(下辺・右辺)。平坦すぎる合成画像で JPEG が
+    // ブロックノイズだらけにならないようにするための味付け。
+    for i in 0..6i64 {
+        let k = 1.0 - i as f32 / 6.0;
+        let c = [26.0 * k + 20.0, 24.0 * k + 18.0, 22.0 * k + 16.0];
+        canvas.rect(PAPER_X + 6, PAPER_Y + PAPER_H + i, PAPER_W, 1, c);
+        canvas.rect(PAPER_X + PAPER_W + i, PAPER_Y + 6, 1, PAPER_H, c);
+    }
+
+    // 微細ノイズ(全面)。
+    for px in canvas.buf.iter_mut() {
+        let n = rng.noise() * 3.0;
+        for c in px.iter_mut() {
+            *c += n;
+        }
+    }
+    canvas
+}
+
+/// キーストーンの前進写像(atx-core `ops::perspective` の doc コメントのモデル)。
+///
+/// 画像中心を原点とする連続座標で `X' = X / D`, `Y' = Y / D`,
+/// `D = 1 + (t_h X + t_v Y) / f`、`f = max(W, H)`。
+/// 生成器はこの式で「既知 quad」を解析的に求め、`detect_document` の答え合わせに使う。
+/// (エンジン側は正規化座標で 1e-6 量子化して行列を組むので厳密には一致しないが、
+///  差は 0.01 画素未満で、判定に使う長辺 1% の許容とは 3 桁違う)
+fn keystone_forward(p: [f64; 2]) -> [f64; 2] {
+    let f = PHOTO_W.max(PHOTO_H) as f64;
+    let (cx, cy) = (PHOTO_W as f64 / 2.0, PHOTO_H as f64 / 2.0);
+    let t_v = PHOTO_VERTICAL_DEG.to_radians().tan();
+    let t_h = PHOTO_HORIZONTAL_DEG.to_radians().tan();
+    let (x, y) = (p[0] - cx, p[1] - cy);
+    let d = 1.0 + (t_h * x + t_v * y) / f;
+    [x / d + cx, y / d + cy]
+}
+
+/// 任意寸法版の JPEG エンコード(ICC なし)。既存の [`encode_jpeg`] は
+/// `synthetic_scene.jpg` 専用(モジュール定数の寸法 + ダミー ICC)なので分けてある。
+fn encode_jpeg_sized(img: &RgbImage, quality: u8) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut encoder = jpeg_encoder::Encoder::new(&mut out, quality);
+    encoder.set_progressive(false);
+    encoder.set_optimized_huffman_tables(false);
+    encoder
+        .encode(
+            img.as_raw(),
+            img.width() as u16,
+            img.height() as u16,
+            jpeg_encoder::ColorType::Rgb,
+        )
+        .expect("jpeg encode");
+    out
+}
+
+/// `evals/fixtures/document_photo.jpg` を生成する。
+///
+/// `tilted_scene.jpg` と同じ「生成器が自分の検出器で答え合わせする」方針:
+/// 既知の用紙矩形をキーストーンで写した quad を解析的に求め、生成直後に
+/// `atx_geometry::detect_document` を走らせて頂点誤差 ≤ 長辺 1% を assert する。
+fn gen_document_photo() {
+    let scene = draw_document_scene().to_rgb();
+    let scene_jpeg = encode_jpeg_sized(&scene, QUALITY);
+    let recipe = TransformRecipe {
+        layers: None,
+        operations: vec![
+            Operation::Perspective {
+                quad: None,
+                vertical_degrees: Some(PHOTO_VERTICAL_DEG),
+                horizontal_degrees: Some(PHOTO_HORIZONTAL_DEG),
+                pad_color: Some(DESK_HEX.to_string()),
+            },
+            Operation::Encode {
+                format: OutputFormat::Jpeg,
+                quality: Some(QUALITY),
+                bit_depth: None,
+            },
+        ],
+    };
+    let limits = Limits::default();
+    let first = atx_core::apply_recipe(&scene_jpeg, &recipe, &limits)
+        .expect("apply_recipe(perspective) on the document scene");
+    let second = atx_core::apply_recipe(&scene_jpeg, &recipe, &limits)
+        .expect("apply_recipe(perspective) on the document scene (2nd run)");
+    assert_eq!(
+        first.bytes, second.bytes,
+        "document_photo.jpg generation must be byte-for-byte deterministic"
+    );
+
+    // 既知 quad(tl, tr, br, bl)。
+    let expected = [
+        keystone_forward([PAPER_X as f64, PAPER_Y as f64]),
+        keystone_forward([(PAPER_X + PAPER_W) as f64, PAPER_Y as f64]),
+        keystone_forward([(PAPER_X + PAPER_W) as f64, (PAPER_Y + PAPER_H) as f64]),
+        keystone_forward([PAPER_X as f64, (PAPER_Y + PAPER_H) as f64]),
+    ];
+
+    let decoded = image::load_from_memory(&first.bytes).expect("decode generated document photo");
+    let detection =
+        atx_geometry::detect_document(&decoded, &atx_geometry::DocumentParams::default());
+    let quad = detection
+        .quad
+        .unwrap_or_else(|| panic!("detect_document must find the sheet of paper ({detection:?})"));
+    let tolerance = PHOTO_W.max(PHOTO_H) as f64 * 0.01;
+    let mut worst = 0f64;
+    for (i, (got, want)) in quad.iter().zip(expected.iter()).enumerate() {
+        let d = ((got[0] - want[0]).powi(2) + (got[1] - want[1]).powi(2)).sqrt();
+        worst = worst.max(d);
+        assert!(
+            d <= tolerance,
+            "corner {i} is {d:.2}px away from the known quad (tolerance {tolerance:.2}px); \
+             got {got:?}, expected {want:?} ({detection:?})"
+        );
+    }
+    println!(
+        "document_photo.jpg: detect_document confidence={:.3} area_ratio={:.3} worst corner error={worst:.2}px (tolerance {tolerance:.1}px) hint={:?}",
+        detection.confidence, detection.area_ratio, detection.output_size_hint
+    );
+
+    let path = repo_path("evals/fixtures/document_photo.jpg");
+    std::fs::write(&path, &first.bytes).expect("write document_photo.jpg");
+    println!(
+        "wrote {} ({}x{}, {} bytes)",
+        path.display(),
+        first.width,
+        first.height,
+        first.bytes.len()
+    );
+}
+
+/// `evals/fixtures/dark_ui_screenshot.png`(1280x800)。
+///
+/// 暗い背景に**一様な余白**(= `trim` の期待値が定義できる)と、明るい UI 要素風の
+/// 矩形群。文字は描かず、ラベルは短いバーで表す。
+fn draw_dark_ui() -> Canvas {
+    const W: u32 = 1280;
+    const H: u32 = 800;
+    /// 左右の余白(この外側は完全に一様な背景色)。
+    const MX: i64 = 110;
+    /// 上下の余白。
+    const MY: i64 = 80;
+
+    let bg = [16.0, 16.0, 20.0];
+    let mut canvas = Canvas::new(W, H, bg);
+    let mut rng = Lcg(0xDA2C_0FFE);
+
+    let (x0, y0) = (MX, MY);
+    let (cw, ch) = (W as i64 - MX * 2, H as i64 - MY * 2);
+
+    // ウィンドウ本体(背景よりわずかに明るい面)。
+    canvas.rect(x0, y0, cw, ch, [30.0, 31.0, 38.0]);
+    // タイトルバー + 信号機ボタン風の点。
+    canvas.rect(x0, y0, cw, 34, [44.0, 46.0, 56.0]);
+    for i in 0..3i64 {
+        canvas.rect(x0 + 14 + i * 20, y0 + 12, 10, 10, [96.0, 100.0, 120.0]);
+    }
+    // サイドバー + その項目。
+    let side_w = cw / 4;
+    canvas.rect(x0, y0 + 34, side_w, ch - 34, [24.0, 25.0, 31.0]);
+    for i in 0..8i64 {
+        let iy = y0 + 60 + i * 40;
+        canvas.rect(x0 + 18, iy, 14, 14, [120.0, 126.0, 150.0]);
+        let w = side_w / 2 + (rng.next_u32() % 60) as i64;
+        canvas.rect(
+            x0 + 42,
+            iy + 3,
+            w.min(side_w - 60),
+            9,
+            [206.0, 208.0, 220.0],
+        );
+    }
+    // 本文側のカード群(明るい見出しバー + 細い本文バー)。
+    let main_x = x0 + side_w + 24;
+    let main_w = cw - side_w - 48;
+    for card in 0..3i64 {
+        let cy = y0 + 60 + card * 190;
+        canvas.rect(main_x, cy, main_w, 160, [40.0, 42.0, 52.0]);
+        canvas.rect(main_x + 20, cy + 22, main_w / 3, 16, [232.0, 234.0, 244.0]);
+        for line in 0..4i64 {
+            let w = main_w - 40 - (rng.next_u32() % 160) as i64;
+            canvas.rect(
+                main_x + 20,
+                cy + 60 + line * 22,
+                w.max(60),
+                8,
+                [150.0, 154.0, 172.0],
+            );
+        }
+        // 強調ボタン(いちばん明るい要素)。
+        canvas.rect(
+            main_x + main_w - 130,
+            cy + 118,
+            110,
+            26,
+            [96.0, 148.0, 236.0],
+        );
+    }
+    canvas
+}
+
+fn gen_dark_ui_screenshot() {
+    let first = encode_png(&draw_dark_ui().to_rgb());
+    let second = encode_png(&draw_dark_ui().to_rgb());
+    assert_eq!(
+        first, second,
+        "dark_ui_screenshot.png generation must be byte-for-byte deterministic"
+    );
+    let path = repo_path("evals/fixtures/dark_ui_screenshot.png");
+    std::fs::write(&path, &first).expect("write dark_ui_screenshot.png");
+    println!("wrote {} (1280x800, {} bytes)", path.display(), first.len());
 }

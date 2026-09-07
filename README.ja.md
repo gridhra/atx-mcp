@@ -42,11 +42,15 @@
    > 「右下にロゴを焼き込んで、電線を消して、上すぼまりを直して」
    `svg_overlay` でロゴ焼き込み、`clone`/`heal` で質感と色調を合成してシミ・電線を除去、`perspective` で上すぼまりを補正する。
 
-8. **検証と説明責任**
+8. **書類を読む(OCR 前処理)**
+   > 「このレシートの写真、読み取って」「このスライドに何て書いてある?」
+   `detect_document` が用紙・画面の四角形を見つけて `perspective` にそのまま貼れる quad を返し、`ocr_document` プリセット(グレースケール → 自動レベル → 軽いシャープ)と `trim` が画素の予算を文字に集中させ、`render_preview` の `long_edge:1568` がモデルに読める大きさの画像を渡す。OCR エンジンは同梱しない: 読むのはモデル、atx は画素を読みやすく・再現可能にするだけ。外部 OCR エンジン向けには `threshold`(Otsu / Sauvola)と `ocr_binarize` がある。
+
+9. **検証と説明責任**
    > 「この画像、加工前後を並べて見せて」
    `compare_revisions` が before/after を並置表示、または差分ヒートマップと数値(`mean_abs_diff` など)を返す。全 revision に系譜が残るため、記事に使った画像の加工履歴を完全に追跡・再現でき、どのマシンでもバイト同一になる。
 
-atx にできないこと(生成的な画像編集・RAW 現像・機械学習による自動切り抜きなど)は対象外。ロードマップは [docs/DESIGN.md](docs/DESIGN.md) を参照。
+atx にできないこと(生成的な画像編集・RAW 現像・機械学習による自動切り抜き・OCR 本体など)は対象外。ロードマップは [docs/DESIGN.md](docs/DESIGN.md) を参照。
 
 ## インストール
 
@@ -119,7 +123,7 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 
 `--workspace`(env: `ATX_WORKSPACE`)はアセットストアのディレクトリ。存在しなければ作成される。
 
-## ツール(11)
+## ツール(12)
 
 | ツール | 役割 |
 |---|---|
@@ -128,8 +132,9 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 | `import_asset` | ローカル画像をワークスペースへ取り込み(sha256 冪等)。1件なら `path`、最大 64 件の一括なら `paths`(1件の失敗でバッチは止まらない)。取り込んだバイト列が既にこのワークスペースのレシピ出力だった場合は `already_derived_from` で警告 |
 | `inspect_image` | 寸法・EXIF・ICC・GPS 有無などの検査(read-only) |
 | `detect_tilt` | Canny+Hough(粗)+ 投影プロファイル(0.1° 未満の細分)による傾き角推定。水平族/垂直族の推定も返す。スコア曲線は `include_score_curve:true` のときだけ返る。confidence 低なら「補正しない」を返す(read-only) |
+| `detect_document` | Canny + 輪郭抽出で支配的な四角形(用紙・画面・ホワイトボード・看板)を検出し、`perspective` にそのまま貼れる `quad`(tl, tr, br, bl)と `confidence`・`area_ratio`・`output_size_hint`・貼り付け用 `suggested_operation` を返す。見つからないときは推測せず `quad:null` と理由(`no_quad_found` / `already_rectified` / `low_confidence`)を返す(read-only) |
 | `generate_mask` | 決定論的なグレースケールマスク(`linear_gradient` / `radial_gradient` / `luminosity_range` / `color_range`)を、参照画像と同寸法の PNG revision として生成する。op の `mask` フィールドから参照して使う(冪等) |
-| `render_preview` | レシピ(または `preset`)を低解像度(長辺 ≤768)で適用、インライン画像付きで返却。`overlay:"grid"\|"thirds"\|"horizon"` で構図確認用のガイド線を、`overlay:"mask"`(+ `mask_revision_id`)でマスクの被覆を重ねられる(プレビューのみに描画、本適用には影響しない) |
+| `render_preview` | レシピ(または `preset`)を低解像度(既定は長辺 ≤768、`long_edge` 256..1568 で視覚モデルが文字を読める大きさまで拡大可)で適用、インライン画像付きで返却。`overlay:"grid"\|"thirds"\|"horizon"` で構図確認用のガイド線を、`overlay:"mask"`(+ `mask_revision_id`)でマスクの被覆を重ねられる(プレビューのみに描画、本適用には影響しない) |
 | `apply_transform` | レシピ(または `preset`)を高解像度適用し新 revision を発行(同一レシピ→同一 revision)。1件なら `revision_id`、同じレシピを最大 64 件へまとめて当てるなら `revision_ids` |
 | `compare_revisions` | 2つの revision を長辺 ≤640 に縮小し、`layout:"side_by_side"\|"stacked"` で1枚に並べてインライン画像で返却(A/B・before/after の視覚比較用)。`layout:"diff"` なら1枚の画素差分ヒートマップ + `mean_abs_diff`/`max_abs_diff`/`changed_pixel_ratio` の統計を返す(寸法が完全一致している必要あり) |
 | `list_assets` | revision 台帳の参照(read-only) |
@@ -148,11 +153,11 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 }
 ```
 
-対応 op(27種): `auto_orient` / `rotate` / `perspective` / `crop`(crop・pad)/ `resize`(cover・contain・fill)/
-`adjust` / `color_matrix` / `curves` / `levels` / `lut` / `white_balance` / `hsl` /
-`blur` / `median` / `unsharp_mask` / `convolve` / `clone` / `heal` / `svg_overlay` /
-`flip` / `vignette` / `grain` / `gradient_map` / `pixelate` / `auto_levels` /
-`encode`(jpeg・png・webp・avif)/ `strip_metadata`。
+対応 op(29種): `auto_orient` / `rotate` / `perspective` / `crop`(crop・pad)/ `trim` /
+`resize`(cover・contain・fill)/ `adjust` / `color_matrix` / `curves` / `levels` / `lut` /
+`white_balance` / `hsl` / `blur` / `median` / `unsharp_mask` / `convolve` / `threshold` /
+`clone` / `heal` / `svg_overlay` / `flip` / `vignette` / `grain` / `gradient_map` /
+`pixelate` / `auto_levels` / `encode`(jpeg・png・webp・avif)/ `strip_metadata`。
 op 一覧はツールのスキーマにあえて埋め込んでいない。最新のカタログは `list_operations`、
 個々の op の完全なスキーマ・例・注意点は `explain_operation` で取得する。
 
@@ -318,6 +323,10 @@ op 一覧はツールのスキーマにあえて埋め込んでいない。最�
 | social | `hero_2400` | 大判ヒーロー/バナー画像: 2400px に収める → WebP q85 |
 | building block | `soft_vignette` | ビネット単体。他の仕上げの上に重ねる部品として |
 | building block | `grain_fine` | 軽く細かい決定論的グレイン単体。重ねる部品として |
+| ocr | `ocr_document` | 書類・スライド・ホワイトボード写真を視覚モデルが読める状態に: グレースケール → 自動レベル → 軽いシャープ(二値化しない) |
+| ocr | `ocr_receipt` | ノイズ・退色のあるレシート向け: グレースケール → メディアン → 強めの自動レベル → シャープ |
+| ocr | `ocr_binarize` | 外部 OCR エンジン向けの Sauvola 適応二値化(読み手が視覚モデルなら `ocr_document` を使う) |
+| ocr | `ocr_dark_ui` | ダークモードのスクリーンショット向け: `trim` で余白を落とし、反転して黒文字・白地のグレースケールに |
 
 プリセットは純粋な糖衣である: 解決後は通常のレシピとして同じパイプラインを流れ、
 `recipe_hash`(冪等キー)は**解決後のレシピ**に対して計算される。

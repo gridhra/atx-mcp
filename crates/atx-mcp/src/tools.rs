@@ -5,7 +5,8 @@
 //!
 //! 返却規約(DESIGN.md §4.1):
 //! - 常に「人間可読のテキストサマリ(パス込み)」+ `structuredContent`(機械可読 JSON)の両方を返す
-//! - `render_preview` のみ inline ImageContent(base64 jpeg、長辺 ≤ 768)を追加する
+//! - `render_preview` のみ inline ImageContent(base64 jpeg、長辺は既定 768、
+//!   `long_edge` で 256..=1568 まで指定可)を追加する
 //! - エラーは `CallToolResult::error`(is_error=true)で、原因と回復手順を構造化して返す
 
 use std::collections::BTreeMap;
@@ -13,7 +14,7 @@ use std::path::{Component, Path, PathBuf};
 
 use atx_core::recipe::{Fit, Operation, OutputFormat};
 use atx_core::{AtxError, ImageInfo, Limits, TransformRecipe, ENGINE_VERSION};
-use atx_geometry::{DetectParams, TiltDetection};
+use atx_geometry::{DetectParams, DocumentDetection, DocumentParams, TiltDetection};
 use atx_store::{AssetRevision, AssetStore, StoreError};
 use base64::Engine as _;
 use image::{ImageEncoder, RgbImage};
@@ -24,6 +25,18 @@ use sha2::{Digest, Sha256};
 
 /// プレビューの長辺上限(DESIGN.md §4.1)。
 pub const PREVIEW_LONG_EDGE: u32 = 768;
+/// `detect_document` の `min_area_ratio` に指定できる下限(DESIGN.md §9.12)。
+pub const MIN_AREA_RATIO_MIN: f64 = 0.05;
+/// `detect_document` の `min_area_ratio` に指定できる上限。
+pub const MIN_AREA_RATIO_MAX: f64 = 1.0;
+/// `render_preview` の `long_edge` に指定できる下限。
+pub const PREVIEW_LONG_EDGE_MIN: u32 = 256;
+/// `render_preview` の `long_edge` に指定できる上限。
+///
+/// VLM がインライン画像を受け取れる実務上の上限(長辺 ~1568px)に合わせてある。
+/// 文字を読ませる用途では既定の 768 では足りないため、ここまで上げられる
+/// (DESIGN.md §9.12)。
+pub const PREVIEW_LONG_EDGE_MAX: u32 = 1568;
 /// プレビューの JPEG 品質(レシピの encode 指定に関わらず固定)。
 pub const PREVIEW_JPEG_QUALITY: u8 = 80;
 /// `compare_revisions` で各辺を縮小する際の長辺上限。
@@ -127,6 +140,16 @@ pub struct DetectTiltParams {
     pub include_score_curve: bool,
 }
 
+/// `detect_document` の引数。
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct DetectDocumentParams {
+    /// 対象 revision ID("rev_...")。
+    pub revision_id: String,
+    /// 画像面積に対する候補四角形の最小面積比(0.05..=1.0)。省略時は 0.2。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_area_ratio: Option<f64>,
+}
+
 /// レシピ引数の**不透明な JSON オブジェクト**。
 ///
 /// ROADMAP §Agent UX の規律 #2「語彙の段階的開示」の徹底:
@@ -202,6 +225,10 @@ pub struct RenderPreviewParams {
     /// `overlay` が `"mask"` のときのみ指定でき、そのときは必須。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mask_revision_id: Option<String>,
+    /// プレビューの長辺(256..=1568)。省略時は 768。
+    /// 文字を読む用途では 1568 まで上げる(DESIGN.md §9.12)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_edge: Option<u32>,
 }
 
 /// `list_operations` の引数。
@@ -425,6 +452,14 @@ pub struct DetectTiltOutput {
     /// 検出結果。`score_curve` は `include_score_curve: true` のときだけ載る。
     #[schemars(with = "TiltDetection")]
     pub detection: DetectionView,
+}
+
+/// `detect_document` の structuredContent。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DetectDocumentOutput {
+    pub revision_id: String,
+    /// 検出結果。`quad` が null なら「補正しない」で、理由は `warnings` の先頭に入る。
+    pub detection: DocumentDetection,
 }
 
 /// `apply_transform` の structuredContent。
@@ -1574,6 +1609,84 @@ impl AtxTools {
         )
     }
 
+    // -- 3a. detect_document ------------------------------------------------
+
+    /// 画像内の支配的な四角形(用紙・画面・ホワイトボード)を返す(read-only、適用はしない)。
+    ///
+    /// `detect_tilt` → `rotate` と同じ関係を `detect_document` → `perspective` で作る。
+    /// 返す `suggested_operation` はそのままレシピの先頭に貼れる形(DESIGN.md §9.12)。
+    pub fn detect_document(&self, params: &DetectDocumentParams) -> CallToolResult {
+        let defaults = DocumentParams::default();
+        // 範囲外は「有効範囲を含む構造化エラー」で返す(エラーは教師である)。
+        let min_area_ratio = match params.min_area_ratio {
+            None => defaults.min_area_ratio,
+            Some(v) if v.is_finite() && (MIN_AREA_RATIO_MIN..=MIN_AREA_RATIO_MAX).contains(&v) => v,
+            Some(v) => {
+                return tool_error(
+                    "invalid_min_area_ratio",
+                    format!(
+                        "min_area_ratio must be within {MIN_AREA_RATIO_MIN}..={MIN_AREA_RATIO_MAX}, got {v}"
+                    ),
+                    serde_json::json!({
+                        "given": v,
+                        "min": MIN_AREA_RATIO_MIN,
+                        "max": MIN_AREA_RATIO_MAX,
+                        "default": defaults.min_area_ratio,
+                        "recovery": "call detect_document again with min_area_ratio omitted (defaults to 0.2) or a value inside the valid range",
+                    }),
+                )
+            }
+        };
+
+        let revision = tri!(self.store.get_revision(&params.revision_id), store_error);
+        // 画像でない revision(.cube LUT / SVG 等)は detect_tilt と同じ構造化エラー。
+        if !is_raster_image(&revision.mime_type) {
+            return not_an_image(&params.revision_id, &revision.mime_type);
+        }
+        let bytes = tri!(self.store.read_bytes(&params.revision_id), store_error);
+        let info = tri!(atx_core::inspect_bytes(&bytes, &self.limits), atx_error);
+        let image = tri!(
+            image::load_from_memory(&bytes).map_err(|e| AtxError::Decode(e.to_string())),
+            atx_error
+        );
+        // atx-core はデコード時に必ず Orientation を正規化する。検出も同じ向きで行う
+        // (返す quad は apply_transform の最初の op が見る座標系)。
+        let image = apply_orientation(image, info.exif_orientation.unwrap_or(1));
+
+        let detect_params = DocumentParams {
+            min_area_ratio,
+            ..defaults
+        };
+        let detection = atx_geometry::detect_document(&image, &detect_params);
+
+        let text = match (&detection.quad, &detection.output_size_hint) {
+            (Some(_), Some(hint)) => format!(
+                "{}: quad found (confidence {:.2}, covers {:.0}%): paste suggested_operation as the first op of your recipe. Applying it yields a {}x{} image.",
+                params.revision_id,
+                detection.confidence,
+                detection.area_ratio * 100.0,
+                hint.width,
+                hint.height,
+            ),
+            _ => format!(
+                "{}: no quad: {}",
+                params.revision_id,
+                detection
+                    .warnings
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("no dominant quadrilateral was found"),
+            ),
+        };
+        ok_result(
+            text,
+            &DetectDocumentOutput {
+                revision_id: params.revision_id.clone(),
+                detection,
+            },
+        )
+    }
+
     // -- 3b. list_operations ------------------------------------------------
 
     /// レシピ語彙の軽量カタログを返す(read-only)。
@@ -2142,7 +2255,11 @@ impl AtxTools {
 
     // -- 5. render_preview --------------------------------------------------
 
-    /// レシピを適用したうえで長辺 ≤ 768 に縮小し、jpeg で inline 返却する。
+    /// レシピを適用したうえで長辺 ≤ `long_edge`(既定 768)に縮小し、jpeg で inline 返却する。
+    ///
+    /// `long_edge` は 256..=[`PREVIEW_LONG_EDGE_MAX`]。文字を読ませたいときは
+    /// VLM が受け取れる上限まで上げる(DESIGN.md §9.12)。既定値は変えていない
+    /// (既存の挙動と eval の互換のため)。
     ///
     /// # コスト
     ///
@@ -2170,6 +2287,26 @@ impl AtxTools {
                 );
             }
         }
+        // 長辺は 256..=1568。範囲外は有効範囲を添えた構造化エラーで返す。
+        let long_edge = match params.long_edge {
+            None => PREVIEW_LONG_EDGE,
+            Some(v) if (PREVIEW_LONG_EDGE_MIN..=PREVIEW_LONG_EDGE_MAX).contains(&v) => v,
+            Some(v) => {
+                return tool_error(
+                    "invalid_long_edge",
+                    format!(
+                        "long_edge must be within {PREVIEW_LONG_EDGE_MIN}..={PREVIEW_LONG_EDGE_MAX}, got {v}"
+                    ),
+                    serde_json::json!({
+                        "given": v,
+                        "min": PREVIEW_LONG_EDGE_MIN,
+                        "max": PREVIEW_LONG_EDGE_MAX,
+                        "default": PREVIEW_LONG_EDGE,
+                        "recovery": "call render_preview again with long_edge omitted (defaults to 768) or a value inside the valid range; 1568 is the largest inline image a vision model can use",
+                    }),
+                )
+            }
+        };
         // overlay="mask" と mask_revision_id は相互に必須・排他(片方だけでは意味がない)。
         let mask_revision_id = match (params.overlay.as_deref(), params.mask_revision_id.as_deref())
         {
@@ -2208,7 +2345,7 @@ impl AtxTools {
             return not_an_image(&params.revision_id, &source.mime_type);
         }
 
-        let preview_recipe = preview_recipe_of(&recipe);
+        let preview_recipe = preview_recipe_of(&recipe, long_edge);
         let bytes = tri!(self.store.read_bytes(&params.revision_id), store_error);
         let output = tri!(
             atx_core::apply_recipe_with_assets(
@@ -2260,6 +2397,7 @@ impl AtxTools {
             &recipe_hash,
             params.overlay.as_deref(),
             mask_revision_id.as_deref(),
+            long_edge,
         );
         let path = tri!(
             self.store.put_preview(&key, "jpg", &final_bytes),
@@ -2274,7 +2412,7 @@ impl AtxTools {
             output.width,
             output.height,
             final_bytes.len(),
-            PREVIEW_LONG_EDGE,
+            long_edge,
             match (params.overlay.as_deref(), mask_revision_id.as_deref()) {
                 (Some("mask"), Some(id)) => format!(
                     " Mask overlay: {id} is tinted red where its weight exceeds {MASK_OVERLAY_THRESHOLD}, and the rest is dimmed."
@@ -2933,7 +3071,8 @@ fn preset_note(preset: Option<&str>) -> String {
     }
 }
 
-fn preview_recipe_of(recipe: &TransformRecipe) -> TransformRecipe {
+/// プレビュー用レシピ: encode を落とし、末尾に `resize(contain long_edge) + jpeg` を足す。
+fn preview_recipe_of(recipe: &TransformRecipe, long_edge: u32) -> TransformRecipe {
     let mut operations: Vec<Operation> = recipe
         .operations
         .iter()
@@ -2941,8 +3080,8 @@ fn preview_recipe_of(recipe: &TransformRecipe) -> TransformRecipe {
         .cloned()
         .collect();
     operations.push(Operation::Resize {
-        width: Some(PREVIEW_LONG_EDGE),
-        height: Some(PREVIEW_LONG_EDGE),
+        width: Some(long_edge),
+        height: Some(long_edge),
         fit: Fit::Contain,
         without_enlargement: true,
     });
@@ -2953,7 +3092,7 @@ fn preview_recipe_of(recipe: &TransformRecipe) -> TransformRecipe {
     });
     // v0.6: `layers` はそのまま素通しする。トップレベル `operations` は
     // (layers があってもなくても)合成結果に対する仕上げパスなので、
-    // ここで差し替えた「長辺 768 リサイズ + jpeg q80 encode」がそのまま
+    // ここで差し替えた「長辺 long_edge リサイズ + jpeg q80 encode」がそのまま
     // レイヤー合成後の縮小プレビューになる。layers を落とすと、
     // ユーザが layers で意図した合成そのものがプレビューから消えてしまう。
     TransformRecipe {
@@ -2963,18 +3102,21 @@ fn preview_recipe_of(recipe: &TransformRecipe) -> TransformRecipe {
 }
 
 /// プレビューのキャッシュキー:
-/// sha256(source_revision + recipe_hash + overlay + mask_revision_id) の先頭 32 文字。
+/// sha256(source_revision + recipe_hash + overlay + mask_revision_id + long_edge) の先頭 32 文字。
 ///
 /// `overlay` をハッシュ入力に含めることで、同じ (revision, recipe) でも
 /// overlay の有無・種類ごとに別ファイルとしてキャッシュされ、
 /// overlay 付きプレビューが overlay なしプレビューを上書きしない。
 /// `overlay="mask"` は可視化するマスクごとに絵が変わるので、
 /// マスクの revision id もキーに含める(でないと別マスクの結果を掴む)。
+/// `long_edge` も同様: 同じ (revision, recipe) でも寸法ごとに別ファイルにしないと、
+/// 768 のプレビューが 1568 のプレビューを上書きしてしまう。
 fn preview_key(
     source_revision_id: &str,
     recipe_hash: &str,
     overlay: Option<&str>,
     mask_revision_id: Option<&str>,
+    long_edge: u32,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(source_revision_id.as_bytes());
@@ -2984,6 +3126,8 @@ fn preview_key(
     hasher.update(overlay.unwrap_or("").as_bytes());
     hasher.update([0u8]);
     hasher.update(mask_revision_id.unwrap_or("").as_bytes());
+    hasher.update([0u8]);
+    hasher.update(long_edge.to_le_bytes());
     let digest = hex::encode(hasher.finalize());
     digest[..32].to_string()
 }
@@ -3346,7 +3490,7 @@ mod tests {
             ],
             layers: None,
         };
-        let preview = preview_recipe_of(&recipe);
+        let preview = preview_recipe_of(&recipe, PREVIEW_LONG_EDGE);
         assert_eq!(preview.operations.len(), 3);
         assert!(matches!(
             preview.operations[2],
@@ -3384,7 +3528,7 @@ mod tests {
                 },
             ]),
         };
-        let preview = preview_recipe_of(&recipe);
+        let preview = preview_recipe_of(&recipe, PREVIEW_LONG_EDGE);
         assert!(
             preview.layers.is_some(),
             "preview_recipe_of must not drop layers"
@@ -3397,18 +3541,32 @@ mod tests {
 
     #[test]
     fn preview_key_is_deterministic_and_path_safe() {
-        let a = preview_key("rev_1", "abc", None, None);
-        assert_eq!(a, preview_key("rev_1", "abc", None, None));
-        assert_ne!(a, preview_key("rev_1", "abd", None, None));
+        let a = preview_key("rev_1", "abc", None, None, PREVIEW_LONG_EDGE);
+        assert_eq!(
+            a,
+            preview_key("rev_1", "abc", None, None, PREVIEW_LONG_EDGE)
+        );
+        assert_ne!(
+            a,
+            preview_key("rev_1", "abd", None, None, PREVIEW_LONG_EDGE)
+        );
         assert_eq!(a.len(), 32);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
+    /// 長辺が違えば別キーになること(768 のプレビューが 1568 を上書きしない)。
+    #[test]
+    fn preview_key_differs_by_long_edge() {
+        let small = preview_key("rev_1", "abc", None, None, PREVIEW_LONG_EDGE);
+        let large = preview_key("rev_1", "abc", None, None, PREVIEW_LONG_EDGE_MAX);
+        assert_ne!(small, large);
+    }
+
     #[test]
     fn preview_key_differs_by_overlay() {
-        let base = preview_key("rev_1", "abc", None, None);
-        let grid = preview_key("rev_1", "abc", Some("grid"), None);
-        let thirds = preview_key("rev_1", "abc", Some("thirds"), None);
+        let base = preview_key("rev_1", "abc", None, None, PREVIEW_LONG_EDGE);
+        let grid = preview_key("rev_1", "abc", Some("grid"), None, PREVIEW_LONG_EDGE);
+        let thirds = preview_key("rev_1", "abc", Some("thirds"), None, PREVIEW_LONG_EDGE);
         assert_ne!(base, grid);
         assert_ne!(base, thirds);
         assert_ne!(grid, thirds);
@@ -3417,9 +3575,21 @@ mod tests {
     /// 同じ (revision, recipe, overlay="mask") でもマスクが違えば別キーになること。
     #[test]
     fn preview_key_differs_by_mask_revision() {
-        let m1 = preview_key("rev_1", "abc", Some("mask"), Some("rev_m1"));
-        let m2 = preview_key("rev_1", "abc", Some("mask"), Some("rev_m2"));
-        let none = preview_key("rev_1", "abc", Some("mask"), None);
+        let m1 = preview_key(
+            "rev_1",
+            "abc",
+            Some("mask"),
+            Some("rev_m1"),
+            PREVIEW_LONG_EDGE,
+        );
+        let m2 = preview_key(
+            "rev_1",
+            "abc",
+            Some("mask"),
+            Some("rev_m2"),
+            PREVIEW_LONG_EDGE,
+        );
+        let none = preview_key("rev_1", "abc", Some("mask"), None, PREVIEW_LONG_EDGE);
         assert_ne!(m1, m2);
         assert_ne!(m1, none);
     }

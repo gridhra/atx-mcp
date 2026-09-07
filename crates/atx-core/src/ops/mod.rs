@@ -10,6 +10,8 @@
 //!   v0.6 / v0.7、DESIGN.md §9.7 / §9.8)
 //! - `clone_heal`: clone / heal(円領域の複写・修復。v0.7、DESIGN.md §9.8)
 //! - `svg`: svg_overlay(SVG のラスタライズと焼き込み。v0.8、DESIGN.md §9.9)
+//! - `trim` / `threshold`: ドキュメント前処理(余白の自動切り落としと 2 値化。
+//!   v0.9、DESIGN.md §9.12)
 //!
 //! # 画素エンジン v2: op ごとの作業空間(v0.4 の中核設計)
 //!
@@ -21,7 +23,7 @@
 //! | 作業空間 | op | 理由 |
 //! |---|---|---|
 //! | **線形光** | `resize` / `rotate` / `perspective` / `crop` / `pad` / `blur` / `median` / `unsharp_mask` / `convolve` / `white_balance` / `clone` / `heal` | 画素の**混合**(加重平均・畳み込み)と**露出のスケール**は、物理的な光量に対して行ってはじめて正しい。符号値のまま平均すると暗部に寄る(古典的なガンマ・ブラー誤差) |
-//! | **sRGB 符号値** | `adjust` / `color_matrix` / `curves` / `levels` / `hsl` / `lut` / `svg_overlay` | これらは「見た目のトーンカーブ」を操作する語彙で、スライダの効き方・制御点の座標・`.cube` の定義域がいずれも**符号値**上の慣習で決まっている。線形光で適用すると同じ数値が全く違う見た目になる |
+//! | **sRGB 符号値** | `adjust` / `color_matrix` / `curves` / `levels` / `hsl` / `lut` / `svg_overlay` / `trim` / `threshold` | これらは「見た目のトーンカーブ」を操作する語彙で、スライダの効き方・制御点の座標・`.cube` の定義域がいずれも**符号値**上の慣習で決まっている。線形光で適用すると同じ数値が全く違う見た目になる。`trim` / `threshold` は別の理由で同じ空間を要求する: どちらも閾値を **u8 符号値の距離**(色距離 / BT.709 輝度)で定義しているため、比較の直前に符号値の u8 格子へ丸める必要がある |
 //!
 //! 空間変換は `linear::srgb_to_linear` / `linear::linear_to_srgb`(4096 エントリ +
 //! 線形補間の量子化 LUT)を双方向で使う。u8 の格子上では往復がバイト同一になる
@@ -60,4 +62,6 @@ pub mod mask;
 pub mod perspective;
 pub mod pixelate;
 pub mod svg;
+pub mod threshold;
+pub mod trim;
 pub mod wb;

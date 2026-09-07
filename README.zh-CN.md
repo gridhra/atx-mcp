@@ -43,11 +43,15 @@
    > "在右下角烧录 Logo,去掉电线,再修一下透视变形。"
    `svg_overlay` 烧录 Logo,`clone`/`heal` 通过合成质感与色调去除污点或电线,`perspective` 校正会聚的竖线。
 
-8. **核验与可追责**
+8. **读取文档(OCR 预处理)**
+   > "帮我读一下这张收据照片。" / "这张幻灯片上写了什么?"
+   `detect_document` 找到纸张或屏幕的四边形并返回可直接粘贴到 `perspective` 的 quad,`ocr_document` 预设(灰度 → 自动色阶 → 轻微锐化)与 `trim` 把像素预算集中到文字上,`render_preview` 的 `long_edge:1568` 则把模型真正能读清的图像交给它。不内置 OCR 引擎:阅读由模型完成,atx 只负责让像素清晰可读且可复现。面向外部 OCR 引擎另有 `threshold`(Otsu / Sauvola)与 `ocr_binarize`。
+
+9. **核验与可追责**
    > "把这张图修改前后并排给我看看。"
    `compare_revisions` 并排展示前后对比,或返回像素差异热力图及 `mean_abs_diff` 等统计值。每个修订版本都保留完整谱系,文章所用图片的加工历史可被完整追踪与复现——在任何机器上都是字节级一致。
 
-atx 不做的事(生成式编辑、RAW 显影、基于机器学习的自动裁切等)不在范围内,路线图参见 [docs/DESIGN.md](docs/DESIGN.md)。
+atx 不做的事(生成式编辑、RAW 显影、基于机器学习的自动裁切、OCR 本身等)不在范围内,路线图参见 [docs/DESIGN.md](docs/DESIGN.md)。
 
 ## 安装
 
@@ -120,7 +124,7 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 
 `--workspace`(环境变量:`ATX_WORKSPACE`)是资产存储所在的目录,若不存在会自动创建。
 
-## 工具(11 个)
+## 工具(12 个)
 
 | 工具 | 作用 |
 |---|---|
@@ -129,8 +133,9 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 | `import_asset` | 将本地图片导入工作区(基于 sha256,幂等)。单个文件用 `path`,批量(最多 64 个)用 `paths`(单个文件失败不会中断整批)。若导入的字节已是本工作区某个配方的输出,会通过 `already_derived_from` 发出提醒 |
 | `inspect_image` | 检查尺寸、EXIF、ICC 配置文件、是否含 GPS 信息等(只读) |
 | `detect_tilt` | 通过 Canny+Hough(粗定位)加投影轮廓法(精细化到 0.1° 以内)估算倾斜角度,同时返回水平/垂直族的估计值;完整评分曲线需通过 `include_score_curve:true` 显式开启。置信度低时返回"不进行校正"(只读) |
+| `detect_document` | 通过 Canny + 轮廓提取找到主导四边形(纸张、屏幕、白板、标牌),返回可直接用于 `perspective` 的 `quad`(tl, tr, br, bl)以及 `confidence`、`area_ratio`、`output_size_hint` 和可直接粘贴的 `suggested_operation`。找不到时不猜测,返回 `quad:null` 及原因(`no_quad_found` / `already_rectified` / `low_confidence`)(只读) |
 | `generate_mask` | 确定性地生成灰度蒙版(`linear_gradient` / `radial_gradient` / `luminosity_range` / `color_range`),存为与参考图像同尺寸的 PNG 修订版本,供操作的 `mask` 字段引用(幂等) |
-| `render_preview` | 以低分辨率(长边 ≤768)应用配方(或 `preset` 预设)并以内联图像返回。可通过 `overlay:"grid"\|"thirds"\|"horizon"` 叠加构图参考线,或通过 `overlay:"mask"`(配合 `mask_revision_id`)叠加蒙版覆盖范围(仅绘制在预览图上,不影响实际变换) |
+| `render_preview` | 以低分辨率(默认长边 ≤768,可用 `long_edge` 256..1568 放大到视觉模型能读清文字的尺寸)应用配方(或 `preset` 预设)并以内联图像返回。可通过 `overlay:"grid"\|"thirds"\|"horizon"` 叠加构图参考线,或通过 `overlay:"mask"`(配合 `mask_revision_id`)叠加蒙版覆盖范围(仅绘制在预览图上,不影响实际变换) |
 | `apply_transform` | 以完整分辨率应用配方(或 `preset` 预设)并生成新的修订版本(同一配方 → 同一修订版本)。单张用 `revision_id`,把同一配方批量应用到最多 64 个修订版本用 `revision_ids` |
 | `compare_revisions` | 将两个修订版本缩放到长边 ≤640,通过 `layout:"side_by_side"\|"stacked"` 拼接为一张内联图像返回(用于 A/B 或前后对比的可视化);`layout:"diff"` 则返回单张像素差异热力图,并附带 `mean_abs_diff`/`max_abs_diff`/`changed_pixel_ratio` 统计值(要求两者尺寸完全一致) |
 | `list_assets` | 查阅修订版本台账(只读) |
@@ -149,9 +154,9 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 }
 ```
 
-支持的操作(op,共 27 个):`auto_orient` / `rotate` / `perspective` / `crop`(crop、pad)/
+支持的操作(op,共 29 个):`auto_orient` / `rotate` / `perspective` / `crop`(crop、pad)/ `trim` /
 `resize`(cover、contain、fill)/ `adjust` / `color_matrix` / `curves` / `levels` /
-`lut` / `white_balance` / `hsl` / `blur` / `median` / `unsharp_mask` / `convolve` /
+`lut` / `white_balance` / `hsl` / `blur` / `median` / `unsharp_mask` / `convolve` / `threshold` /
 `clone` / `heal` / `svg_overlay` / `flip` / `vignette` / `grain` / `gradient_map` /
 `pixelate` / `auto_levels` / `encode`(jpeg、png、webp、avif)/ `strip_metadata`。
 操作清单刻意不写进工具的 schema:请调用 `list_operations` 获取最新目录,
@@ -312,6 +317,10 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 | social | `hero_2400` | 大幅 Hero/横幅图:收进 2400px → WebP q85 |
 | building block | `soft_vignette` | 单独的柔和暗角,便于叠加在其他风格之后 |
 | building block | `grain_fine` | 单独的细腻确定性颗粒,便于叠加使用 |
+| ocr | `ocr_document` | 让文档/幻灯片/白板照片可被视觉模型读清:灰度 → 自动色阶 → 轻微锐化(不做二值化) |
+| ocr | `ocr_receipt` | 面向有噪点或褪色的收据:灰度 → 中值去噪 → 更强的自动色阶 → 锐化 |
+| ocr | `ocr_binarize` | 面向外部 OCR 引擎的 Sauvola 自适应二值化(若由视觉模型阅读,请改用 `ocr_document`) |
+| ocr | `ocr_dark_ui` | 面向深色模式截图:先用 `trim` 去掉边距,再反相为白底黑字灰度图 |
 
 预设只是语法糖:解析后作为普通配方走同一条流水线,
 `recipe_hash`(幂等键)基于**解析后的配方**计算 ——

@@ -59,7 +59,8 @@ def recipe_has_op(recipe: dict[str, Any] | None, spec: str | dict[str, Any]) -> 
     """recipe が spec を満たす operation を含むか。
 
     spec が文字列なら op 名一致のみ。dict なら {"op": "...", "fields": {...},
-    "fields_present": [...]} の形式:
+    "fields_present": [...]} または {"any_of": [<spec>, ...]} の形式:
+    - "any_of" は選択肢のいずれか 1 つを満たせば真(他のキーとは併用しない)。
     - "op" は省略可(省略時は op 名を問わず走査する。マスク付きトーン系 op のように
       エージェントがどの op を選ぶか事前に決め打てないケース用)。
     - "fields" の各 key/value が該当 operation のフィールドと一致することを要求する
@@ -75,6 +76,11 @@ def recipe_has_op(recipe: dict[str, Any] | None, spec: str | dict[str, Any]) -> 
         return False
     if isinstance(spec, str):
         return any(op.get("op") == spec for op in recipe.get("operations", []))
+    if "any_of" in spec:
+        # 選択肢のうち 1 つでも満たせば良い(「grayscale 相当の op は
+        # color_matrix でも auto_levels でもよい」のような、エージェントが
+        # どちらを選ぶか決め打てないケース用)。
+        return any(recipe_has_op(recipe, alt) for alt in spec["any_of"])
     want_op = spec.get("op")
     fields = spec.get("fields", {})
     fields_present = spec.get("fields_present", [])
@@ -421,6 +427,65 @@ def run_selftests() -> None:
     ledger_noop = [_mk_import()]
     ok, detail = evaluate(criteria, ledger_noop)
     assert not ok, "expected fail when no derivation exists"
+
+    # --- recipe_contains_ops の any_of(t14 相当: perspective + grayscale 相当のどれか) ---
+    criteria_any_of = {
+        "expect_revision": {
+            "recipe_contains_ops": [
+                "perspective",
+                {"any_of": ["color_matrix", "auto_levels"]},
+            ],
+            "min_matches": 1,
+        }
+    }
+    ledger_any_of = [
+        _mk_import(),
+        _mk_derived(
+            "rev_derived14",
+            "rev_import01",
+            804,
+            922,
+            "image/jpeg",
+            [
+                {"op": "perspective", "quad": [[0, 0], [10, 0], [10, 10], [0, 10]]},
+                {"op": "auto_levels", "clip_percent": 0.5},
+                {"op": "encode", "format": "jpeg"},
+            ],
+        ),
+    ]
+    ok, detail = evaluate(criteria_any_of, ledger_any_of)
+    assert ok, f"expected pass for any_of (auto_levels branch): {detail}"
+
+    ledger_any_of_other = [
+        _mk_import(),
+        _mk_derived(
+            "rev_derived14b",
+            "rev_import01",
+            804,
+            922,
+            "image/jpeg",
+            [
+                {"op": "perspective", "vertical_degrees": 3.0},
+                {"op": "color_matrix", "matrix": [[0.2126, 0.7152, 0.0722, 0, 0]]},
+            ],
+        ),
+    ]
+    ok, detail = evaluate(criteria_any_of, ledger_any_of_other)
+    assert ok, f"expected pass for any_of (color_matrix branch): {detail}"
+
+    ledger_any_of_bad = [
+        _mk_import(),
+        _mk_derived(
+            "rev_derived14c",
+            "rev_import01",
+            804,
+            922,
+            "image/jpeg",
+            [{"op": "perspective", "vertical_degrees": 3.0}, {"op": "encode", "format": "jpeg"}],
+        ),
+    ]
+    ok, detail = evaluate(criteria_any_of, ledger_any_of_bad)
+    assert not ok, f"expected fail when no any_of branch is present: {detail}"
 
     # --- expect_no_new_revision: passing (t02 相当, read-only report) ---
     criteria_readonly = {"expect_no_new_revision": True}

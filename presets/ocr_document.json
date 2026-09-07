@@ -1,0 +1,19 @@
+{
+  "name": "ocr_document",
+  "description": "Text for a vision model to read: grayscale, black/white point stretch, light sharpen (no binarization, no resize/encode).",
+  "recipe": {
+    "operations": [
+      {
+        "op": "color_matrix",
+        "matrix": [
+          0.2126, 0.7152, 0.0722, 0.0, 0.0,
+          0.2126, 0.7152, 0.0722, 0.0, 0.0,
+          0.2126, 0.7152, 0.0722, 0.0, 0.0,
+          0.0, 0.0, 0.0, 1.0, 0.0
+        ]
+      },
+      { "op": "auto_levels", "clip_percent": 0.5 },
+      { "op": "unsharp_mask", "amount": 0.6, "radius": 1.0, "threshold": 2 }
+    ]
+  }
+}

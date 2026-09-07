@@ -1,0 +1,15 @@
+{
+  "id": "t14_document_rectify_readable",
+  "prompt": "この書類の写真、斜めから撮っちゃって読みにくいので、まっすぐ補正して文字が読みやすくなるように整えて。",
+  "input_fixture": "evals/fixtures/document_photo.jpg",
+  "success_criteria": {
+    "expect_revision": {
+      "recipe_contains_ops": [
+        "perspective",
+        {"any_of": ["color_matrix", "auto_levels"]}
+      ],
+      "min_matches": 1
+    }
+  },
+  "max_turns": 10
+}

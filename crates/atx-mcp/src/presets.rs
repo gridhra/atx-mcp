@@ -81,6 +81,22 @@ pub const PRESET_FILES: &[(&str, &str)] = &[
         include_str!("../../../presets/matte_fade.json"),
     ),
     (
+        "ocr_binarize",
+        include_str!("../../../presets/ocr_binarize.json"),
+    ),
+    (
+        "ocr_dark_ui",
+        include_str!("../../../presets/ocr_dark_ui.json"),
+    ),
+    (
+        "ocr_document",
+        include_str!("../../../presets/ocr_document.json"),
+    ),
+    (
+        "ocr_receipt",
+        include_str!("../../../presets/ocr_receipt.json"),
+    ),
+    (
         "og_1200x630",
         include_str!("../../../presets/og_1200x630.json"),
     ),
