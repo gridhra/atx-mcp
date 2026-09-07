@@ -183,6 +183,7 @@ fn render_preview_of_layered_recipe_keeps_the_composite() {
         preset: None,
         overlay: None,
         mask_revision_id: None,
+        long_edge: None,
     });
     let layered_structured = structured(&layered_result);
     assert_eq!(layered_structured["mime_type"], "image/jpeg");
@@ -196,6 +197,7 @@ fn render_preview_of_layered_recipe_keeps_the_composite() {
         preset: None,
         overlay: None,
         mask_revision_id: None,
+        long_edge: None,
     });
     let flat_bytes = preview_jpeg_bytes(&flat_result);
     let decoded_flat = image::load_from_memory(&flat_bytes).expect("flat preview jpeg must decode");

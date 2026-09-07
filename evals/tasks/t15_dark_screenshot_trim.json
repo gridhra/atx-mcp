@@ -1,0 +1,12 @@
+{
+  "id": "t15_dark_screenshot_trim",
+  "prompt": "このスクショ、まわりの余白が邪魔なので落として、文字を読みやすくして。",
+  "input_fixture": "evals/fixtures/dark_ui_screenshot.png",
+  "success_criteria": {
+    "expect_revision": {
+      "recipe_contains_ops": ["trim"],
+      "min_matches": 1
+    }
+  },
+  "max_turns": 10
+}

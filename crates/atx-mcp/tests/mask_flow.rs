@@ -349,6 +349,7 @@ fn preview_mask_overlay_differs_from_the_plain_preview_and_coexists() {
         preset: None,
         overlay: None,
         mask_revision_id: None,
+        long_edge: None,
     });
     let plain_out = structured(&plain);
     let plain_bytes = preview_jpeg_bytes(&plain);
@@ -359,6 +360,7 @@ fn preview_mask_overlay_differs_from_the_plain_preview_and_coexists() {
         preset: None,
         overlay: Some("mask".to_string()),
         mask_revision_id: Some(mask_a_id.clone()),
+        long_edge: None,
     });
     let overlaid_out = structured(&overlaid);
     let overlaid_bytes = preview_jpeg_bytes(&overlaid);
@@ -381,6 +383,7 @@ fn preview_mask_overlay_differs_from_the_plain_preview_and_coexists() {
         preset: None,
         overlay: Some("mask".to_string()),
         mask_revision_id: Some(mask_b_id.clone()),
+        long_edge: None,
     });
     let other_out = structured(&other);
     let paths = [
@@ -405,6 +408,7 @@ fn preview_mask_overlay_differs_from_the_plain_preview_and_coexists() {
         preset: None,
         overlay: Some("mask".to_string()),
         mask_revision_id: Some(mask_a_id),
+        long_edge: None,
     });
     assert_eq!(preview_jpeg_bytes(&again), overlaid_bytes);
 }
@@ -426,6 +430,7 @@ fn mask_overlay_argument_errors_are_structured() {
         preset: None,
         overlay: Some("mask".to_string()),
         mask_revision_id: None,
+        long_edge: None,
     });
     let payload = error_payload(&missing);
     assert_eq!(payload["error"]["code"], "mask_revision_id_required");
@@ -441,6 +446,7 @@ fn mask_overlay_argument_errors_are_structured() {
         preset: None,
         overlay: None,
         mask_revision_id: Some("rev_whatever".to_string()),
+        long_edge: None,
     });
     assert_eq!(
         error_payload(&stray)["error"]["code"],
@@ -454,6 +460,7 @@ fn mask_overlay_argument_errors_are_structured() {
         preset: None,
         overlay: Some("mask".to_string()),
         mask_revision_id: Some("rev_does_not_exist".to_string()),
+        long_edge: None,
     });
     assert_eq!(
         error_payload(&unknown)["error"]["code"],

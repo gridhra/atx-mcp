@@ -281,13 +281,13 @@ fn compare_revisions_rejects_an_svg_side_naming_it() {
     }
 }
 
-/// 語彙カタログに `svg_overlay` が 1 件だけ載り、総数が 27 になっていること。
+/// 語彙カタログに `svg_overlay` が 1 件だけ載り、総数が 29 になっていること。
 #[test]
-fn the_catalog_lists_twenty_seven_operations_including_svg_overlay() {
+fn the_catalog_lists_twenty_nine_operations_including_svg_overlay() {
     let (_ws, tools) = tools();
     let out = structured(&tools.list_operations(&ListOperationsParams::default()));
     let ops = out["ops"].as_array().expect("ops array");
-    assert_eq!(ops.len(), 27, "v0.3.0 has 27 operations");
+    assert_eq!(ops.len(), 29, "v0.9 has 29 operations");
     let overlay: Vec<_> = ops
         .iter()
         .filter(|op| op["name"] == "svg_overlay")

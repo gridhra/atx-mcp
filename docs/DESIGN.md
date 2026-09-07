@@ -1113,3 +1113,226 @@ green(新 op 6 本ぶんのゴールデンを追加)。
    list_operations のプリセット行に op 要約(wb→curves→grain 形式)
 6. import_asset が「既に派生 revision として台帳にある sha256」を検知し
    二重適用警告(already_derived_from)を返す
+
+### 9.12 ドキュメント前処理(OCR 前処理)(2026-09-08)
+
+#### 動機と位置づけ
+
+エージェントが画像内の文字を読む場面(書類・レシート・スライド・ホワイトボード・
+スクリーンショット)は、メディア制作より頻度が高い。現状は Python/PIL の
+ワンショット前処理をエージェントが都度書いており、その工数とトークンが無駄になっている。
+本節はこれを「OCR エンジンは載せず、**読み手に渡す画素を決定論的に整える**」範囲で
+引き受ける設計を確定する。位置づけはプロダクト定義の拡張: 「メディア制作の画像変換」から
+「**エージェントの画像前処理基盤**」へ守備範囲を広げる。決定論・原本不変・非生成の原則は
+一切変えない。
+
+#### 読み手は VLM が既定、Tesseract 系は選択肢
+
+想定する主読者は Opus 等の**視覚言語モデル(VLM)自身**。VLM は自然画像で学習しており、
+Tesseract 向けの二値化(ストローク欠け)は判読率を**下げる**ことがある。したがって:
+
+- **既定の推奨(`ocr_document` 等)は二値化しない**: グレースケール + 黒白点ストレッチ + 軽いシャープ
+- **二値化は明示オプション**(`threshold` op / `ocr_binarize` プリセット)。用途は Tesseract 等の外部 OCR
+- VLM 側の効きは「**限られた解像度バジェットを文字に集中させる**」ことで決まる。
+  VLM は長辺 ~1568px / ~1.15MP 程度に縮小して読むため、**縮小される前に余白を落とす**
+  (`trim` / `detect_document`→`perspective`)ことが 1 グリフあたりの画素数に直結する
+
+#### 追加する語彙とツール(Agent UX 規律との整合)
+
+| 種別 | 名前 | 規律上の分類 |
+|---|---|---|
+| op | `trim` | 幾何 op(ツール追加なし) |
+| op | `threshold` | フィルタ op(ツール追加なし) |
+| ツール | `detect_document` | **検出系**(許容カテゴリ) |
+| パラメータ | `render_preview.long_edge` | 検証系ツールの拡張 |
+| プリセット | `ocr_document` / `ocr_receipt` / `ocr_binarize` / `ocr_dark_ui` | 語彙の圧縮 |
+
+**含めないもの**: OCR エンジン本体(Tesseract 等)、ML ベースの文字領域検出、
+専用 `deskew` op(`detect_tilt`→`rotate` の既存経路で足りるかを eval で検証し、
+足りない場合のみ文字行向けの検出モードを検討する)。反転専用 op も不要
+(`color_matrix` の負係数 + オフセットで表現でき、`ocr_dark_ui` に封じる)。
+
+#### op 仕様: `trim`
+
+余白(背景色に近い縁)を自動で切り落とす(ImageMagick `-trim` 相当)。
+
+```json
+{"op": "trim", "tolerance": 16, "background": "#ffffff", "padding": 8}
+```
+
+| フィールド | 型・範囲 | 既定 | 意味 |
+|---|---|---|---|
+| `tolerance` | u8 0..=255 | 16 | 背景と見なす色距離(RGB(A) u8 の **Chebyshev 距離**、各チャンネル差の最大値) |
+| `background` | CSS hex(`#rgb` / `#rrggbb` / `#rrggbbaa`)| 省略 = 自動 | 省略時は**四隅の画素の多数決**(同数なら左上優先)を背景色とする |
+| `padding` | u32 0..=4096 | 0 | 内容の外接矩形の外側に残す余白(画像端でクランプ) |
+
+- 判定は **sRGB 符号値の u8 格子**上で行う(`ensure_space(Srgb)` 後に u8 へ丸めて比較。
+  f32 のまま比較しない)。アルファ付き画像では、背景のアルファが `tolerance` 以下かつ
+  画素のアルファも `tolerance` 以下なら RGB を問わず背景と見なす(透明部分の RGB ノイズ対策)
+- 上下左右の 4 辺から内側へ走査し、`tolerance` を超える画素が現れた行/列で止める。
+  結果の矩形に `padding` を足して画像内にクランプし、`pixel_ops::crop_rect` で切る。
+  変換追跡は `crop.rect` と同じ `Affine::translate(-x, -y)` を `st.xf` に積む
+  (`coordinate_space: "source"` の後続 crop と整合させる)
+- **全画素が背景**(内容なし)の場合は恒等(切らない)とし、
+  `st.warnings` に `operations[i] (trim): no content found, image left unchanged` を積む
+- 冪等: `trim(trim(x)) == trim(x)`(padding=0 のとき厳密。proptest で固定)
+- `mask` は取らない(幾何 op)。作業空間は現在のまま(添字操作)
+
+#### op 仕様: `threshold`
+
+BT.709 輝度で 2 値化する。出力は RGB を 0 か 255 に置き換え、アルファは保持。
+
+```json
+{"op": "threshold", "method": "sauvola", "window": 31, "k": 0.2}
+{"op": "threshold", "method": "otsu"}
+{"op": "threshold", "method": "fixed", "value": 128, "invert": true}
+```
+
+| フィールド | 型・範囲 | 既定 | 意味 |
+|---|---|---|---|
+| `method` | `"otsu"` / `"sauvola"` / `"fixed"` | `"otsu"` | 大域(Otsu)/ 局所適応(Sauvola)/ 固定閾値 |
+| `value` | u8 | — | `fixed` のとき必須。他 method で指定すると validate エラー |
+| `window` | u32 奇数 3..=255 | 31 | `sauvola` の局所窓幅。偶数・他 method での指定は validate エラー |
+| `k` | f64 0.0..=1.0 | 0.2 | `sauvola` の感度。他 method での指定は validate エラー |
+| `invert` | bool | false | true で白黒を反転(既定は「明るい = 白」) |
+| `mask` | MaskRef | — | 局所適用(他のトーン系 op と同じ合成) |
+
+- 作業空間は **sRGB 符号値**。輝度は u8 格子上の整数演算
+  `luma = (2126*R + 7152*G + 722*B + 5000) / 10000`(libm 不使用)
+- Otsu: 256 ビンヒストグラムから級間分散最大の閾値を **整数/u64 演算**で求める。
+  最大値が複数なら**最小の閾値**を採る。`luma > T` を白とする
+- Sauvola: 積分画像(u64 で総和、u64/u128 で平方和)から窓内平均 m と標準偏差 s を求め、
+  `T = m * (1 + k * (s / 128 - 1))`。f64 の +,−,×,÷ と `sqrt`(IEEE 厳密丸め)のみ使用、
+  `mul_add` 禁止、`T` を 1e-6 に量子化してから比較。窓は画像端でクランプ(縮小窓)
+- 冪等: `threshold(threshold(x)) == threshold(x)`(otsu / fixed。sauvola は保証しない、テストもしない)
+- 決定論ゴールデン + proptest(出力は 0/255 のみ、アルファ不変、invert の対称性)
+
+#### ツール仕様: `detect_document`
+
+画像内の支配的な四角形(用紙・画面・ホワイトボード・看板)を read-only で検出し、
+`perspective` op にそのまま貼れる quad を返す。`detect_tilt`→`rotate` の関係を
+`detect_document`→`perspective` に再現する。
+
+入力: `revision_id`(必須)、`min_area_ratio: f64 0.05..=1.0`(既定 0.2、これ未満の四角形は候補にしない)。
+
+出力(structuredContent):
+
+```json
+{
+  "revision_id": "rev_...",
+  "detection": {
+    "quad": [[x,y],[x,y],[x,y],[x,y]],
+    "confidence": 0.87,
+    "area_ratio": 0.62,
+    "output_size_hint": {"width": 1240, "height": 1754},
+    "method": "contour",
+    "suggested_operation": {"op": "perspective", "quad": [[...],[...],[...],[...]]},
+    "warnings": []
+  }
+}
+```
+
+- `quad` は **EXIF orientation 正規化後**の画素座標(= `apply_transform` の最初の op が見る座標系。
+  `detect_tilt` と同じ)、順序は tl, tr, br, bl(`perspective.quad` と同一規約)
+- `quad: null` は「補正しない」。理由を `warnings` に入れる:
+  `no_quad_found`(候補なし)/ `already_rectified`(検出四角形が画像枠とほぼ一致:
+  `area_ratio > 0.97` かつ全隅が画像隅から長辺の 1% 以内)/ `low_confidence`
+- `output_size_hint` は `perspective` の出力寸法規則(対辺長の平均を丸める)と同じ式で算出し、
+  `perspective` 実行結果と一致させる(テストで固定)
+- `confidence` 0..1 は「辺サポート(quad 周上でエッジ画素が乗っている割合)」を主成分に、
+  凸性・直角性(4 内角の 90° からの偏差)で減点。`< 0.4` は `quad: null` + `low_confidence`
+
+アルゴリズム(`atx-geometry` に `quad` モジュールとして追加。`detect_tilt` と同じ規律):
+
+1. グレースケール化 + 長辺 ≤ 1024 へ Triangle 縮小(整数演算、`detect_tilt` の同処理を共用)
+2. 軽いガウス平滑(σ 1.0、係数は f64 生成→量子化)→ `imageproc::edges::canny`
+   (閾値は `detect_tilt` と同じパーセンタイル適応)→ 3×3 dilate 1 回で断線を接ぐ
+3. `imageproc::contours::find_contours` → 外側輪郭のうち外接矩形面積 ≥ `min_area_ratio` を候補に
+4. 各候補を `approximate_polygon_dp`(ε = 周長の 2%、closed)で近似し、**頂点数 4 かつ凸**のものを残す
+5. スコア = 面積(大きいものを優先)。同点は直角性で決める。辺サポートから confidence を計算
+6. 座標を原寸へ戻し、tl/tr/br/bl に並べ替える(重心からの角度順 → 最も左上に近い頂点を tl に)
+7. 4 頂点が取れなければ `method: null`, `quad: null`(Hough 直線 2+2 本からの交点推定は
+   将来の fallback とし、今回は入れない)
+
+決定論: `find_contours` の走査順は決定的。`HashMap` 反復順に依存する処理を書かない。
+テスト: 合成ドキュメント写真(下記フィクスチャ)で既知 quad との頂点誤差 ≤ 長辺の 1%、
+用紙が画面いっぱいの画像で `already_rectified`、`synthetic_scene.jpg`(建物)で
+`quad` が用紙でないもの(ビル)を拾っても `confidence` が低いか、または結果が安定していること
+(2 回呼んでバイト同一の JSON)。
+
+#### `render_preview.long_edge`
+
+`long_edge: u32 256..=1568`(既定 768 = 従来値)。VLM が受け取れる上限(~1568)まで
+インライン画像を大きくできるようにする。文字を読む用途では 768 は不足する。
+既定値は変えない(既存挙動・eval の互換)。範囲外は構造化エラー(有効範囲を含める)。
+`compare_revisions` は対象外。
+
+#### プリセット(4 本追加、30 → 34)
+
+| 名前 | 中身 | 用途 |
+|---|---|---|
+| `ocr_document` | grayscale(BT.709 color_matrix)→ auto_levels(clip 0.5)→ unsharp_mask(0.6 / 1.0 / 2) | 書類・スライド・ホワイトボード写真を VLM が読む(既定推奨) |
+| `ocr_receipt` | grayscale → median(1)→ auto_levels(clip 1.0)→ unsharp_mask(0.8 / 1.0 / 3) | 感熱紙レシート等、ノイズ多め・退色気味 |
+| `ocr_binarize` | grayscale → threshold(sauvola, window 31, k 0.2) | Tesseract 等の外部 OCR エンジンに渡す |
+| `ocr_dark_ui` | trim(tolerance 8)→ color_matrix(反転 + グレースケール: 各行 `[-0.2126,-0.7152,-0.0722,0,1]`)| ダークモードのスクリーンショット |
+
+いずれも resize / encode を含まない部品プリセット(既存の部品プリセットと同じ規約)。
+`ocr_binarize` の説明文には「読み手が VLM なら ocr_document を使う」旨を入れる。
+
+#### 推奨ワークフロー(サーバ instructions に英語で追記する内容)
+
+1. `inspect_image` → 2. `detect_document`(quad が返れば `perspective` を先頭に)→
+3. `detect_tilt`(quad が null のとき、行の傾きだけ直す)→
+4. `apply_transform` に `ocr_document`(または生レシピ: perspective → trim → ocr プリセット相当 → resize)→
+5. 読むときは `render_preview` を `long_edge: 1568` で、あるいは長い文書は `crop.rect` で
+   帯状に分割して数回に分けてプレビューする。VLM が読むなら二値化しない。
+
+#### フィクスチャと eval
+
+- `gen_fixture` を拡張し、決定論的に生成する(第三者素材は使わない。文字は描かず
+  「文字らしい」矩形バー列で行を表現する):
+  - `tests/fixtures/synthetic_document.png`: 白い用紙に黒い単語状バー列(左寄せ・行間一定)、
+    用紙の周囲に一様な灰色余白(`trim` の期待値が定義できる)。軸平行
+  - `evals/fixtures/document_photo.jpg`: 上記用紙を暗い机面に置き、atx-core 自身の
+    `perspective`(既知 quad の逆写像)で台形に歪ませ、微細ノイズを加える。
+    生成直後に `detect_document` を実行し、既知 quad との誤差 ≤ 長辺 1% を assert する
+    (tilted_scene.jpg と同じ「生成器が自分の検出器で答え合わせする」方針)
+  - `evals/fixtures/dark_ui_screenshot.png`: 暗い背景 + 一様な余白 + 明るい UI 要素の合成
+- eval タスク追加(13 → 15):
+  - `t14_document_rectify_readable`: 「この書類の写真、読みやすく補正して」→ 台帳に
+    `perspective` を含む revision があり、`ocr_document` 相当の op(color_matrix / auto_levels)も含む
+  - `t15_dark_screenshot_trim`: 「このスクショ、余白落として文字を読みやすくして」→
+    `trim` を含む revision がある
+
+#### 明示的な割り切り
+
+- 文字行の傾き検出は `detect_tilt`(投影プロファイル法は古典的なテキスト deskew 手法でもある)で
+  賄えると見込むが、未検証。eval t14 で `rotate` が必要な場面が出た時点で判断する
+- `detect_document` は輪郭ベース 1 本。背景と用紙のコントラストが低い写真では取れない。
+  取れないときは `quad: null` を正直に返し、`perspective` の手動 quad 指定へ誘導する
+- 効果の大きさは実行環境依存(シェルのある Claude Code では PIL 10 行との差は小さく、
+  シェルのない MCP ホストと revision 系譜の監査性で差が出る)。効果測定は eval のトークン数で行う
+
+#### 実装時差分(2026-09-08、実装完了時点)
+
+- **`detect_document` に隅の精密化(4b)を追加**: DP 近似の頂点は輪郭上の実在点なので、
+  dilate による隅の面取りで長辺の数 % ずれることがあった。4 辺を直交回帰で当て直し隣接直線の
+  交点を隅とする(退化・大きな移動・凸性の破れは DP 頂点へ戻す)。合成フィクスチャで
+  最悪頂点誤差 3.2px / 1400px(規定 1%)、confidence 0.98。Hough fallback は未実装のまま
+- **`already_rectified` の判定**: 用紙が枠に完全に接する画像では Canny が閉ループを作れず
+  そもそも検出されない。判定条件(面積比 > 0.97 かつ隅が長辺 1% 以内)自体は仕様どおり
+- **Otsu は完全整数演算**: 級間分散の比較は 100MP で u128 も溢れるため、
+  (商, 余り, 分母) の 3 つ組で厳密比較する。f64 を一切使わない
+- **`trim` の作業空間は `Space::Srgb` 固定**(`crop` は空間不問だが、tolerance が u8 格子で
+  定義されているため sRGB へ寄せてから u8 に丸めて比較する)
+- **`document_photo.jpg` の歪ませ方**: `perspective` の keystone 形式(順写像が解析的に書ける)で
+  生成し、期待 quad を解析式から求めて生成器が `detect_document` で答え合わせする。
+  quad 形式(quad→長方形)で既知台形を作るには出力寸法規則の逆算が要るため採用しなかった
+- **eval 採点 `any_of`**: `recipe_contains_ops` に `{"any_of": [...]}` を追加し、
+  t14 の「perspective かつ (color_matrix または auto_levels)」を表現できるようにした
+- **サイズ予算の引き上げ**: `list_operations` 本文 9,500 → 10,500 字、合計 11,500 → 12,600 字
+  (実測 12,088)。サーバ instructions 4,700 → 5,600 字(実測 5,466)。いずれも op 2 + プリセット 4 +
+  読解ワークフロー 3 行の固有分で、説明文は最短化済み
+- **未検証**: eval t14 / t15 の実走(課金のためリリース前ゲートで実施)、
+  Sauvola の `sqrt` 経路のクロスプラットフォーム決定論(CI の Linux アームで確認する)、
+  実写の書類・レシート・ダークモード UI での見た目(合成フィクスチャのみ)

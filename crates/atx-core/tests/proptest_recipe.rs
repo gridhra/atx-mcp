@@ -5,7 +5,7 @@
 
 use atx_core::recipe::{
     validate, Anchor, CoordinateSpace, CropMode, Fit, Operation, OutputFormat, Rect, RotateCrop,
-    StripScope, TransformRecipe,
+    StripScope, ThresholdMethod, TransformRecipe,
 };
 use atx_core::{canonical_json, recipe_hash};
 use proptest::prelude::*;
@@ -56,6 +56,40 @@ fn arb_strip_scope() -> impl Strategy<Value = StripScope> {
         Just(StripScope::Gps),
         Just(StripScope::Exif)
     ]
+}
+
+fn arb_threshold_method() -> impl Strategy<Value = ThresholdMethod> {
+    prop_oneof![
+        Just(ThresholdMethod::Otsu),
+        Just(ThresholdMethod::Sauvola),
+        Just(ThresholdMethod::Fixed),
+    ]
+}
+
+/// validate を通る `threshold`(method ごとに指定できるフィールドが違う)。
+fn arb_valid_threshold() -> impl Strategy<Value = Operation> {
+    (
+        arb_threshold_method(),
+        any::<u8>(),
+        (1u32..=127).prop_map(|n| n * 2 + 1),
+        0.0f64..=1.0,
+        any::<bool>(),
+    )
+        .prop_map(|(method, value, window, k, invert)| {
+            let (value, window, k) = match method {
+                ThresholdMethod::Fixed => (Some(value), None, None),
+                ThresholdMethod::Sauvola => (None, Some(window), Some(k)),
+                ThresholdMethod::Otsu => (None, None, None),
+            };
+            Operation::Threshold {
+                method,
+                value,
+                window,
+                k,
+                invert,
+                mask: None,
+            }
+        })
 }
 
 fn arb_coordinate_space() -> impl Strategy<Value = CoordinateSpace> {
@@ -149,6 +183,14 @@ fn arb_op_no_encode() -> impl Strategy<Value = Operation> {
                 mask: None,
             }
         ),
+        (any::<u8>(), arb_valid_pad_color(), 0u32..=4096).prop_map(
+            |(tolerance, background, padding)| Operation::Trim {
+                tolerance,
+                background,
+                padding,
+            }
+        ),
+        arb_valid_threshold(),
         arb_strip_scope().prop_map(|scope| Operation::StripMetadata { scope }),
     ]
 }
@@ -272,6 +314,31 @@ fn arb_any_op() -> impl Strategy<Value = Operation> {
                 bit_depth: None,
             }
         }),
+        (
+            any::<u8>(),
+            prop::option::of(arb_any_string()),
+            any::<u32>()
+        )
+            .prop_map(|(tolerance, background, padding)| Operation::Trim {
+                tolerance,
+                background,
+                padding,
+            }),
+        (
+            arb_threshold_method(),
+            prop::option::of(any::<u8>()),
+            prop::option::of(any::<u32>()),
+            prop::option::of(arb_any_f64()),
+            any::<bool>()
+        )
+            .prop_map(|(method, value, window, k, invert)| Operation::Threshold {
+                method,
+                value,
+                window,
+                k,
+                invert,
+                mask: None,
+            }),
         arb_strip_scope().prop_map(|scope| Operation::StripMetadata { scope }),
     ]
 }

@@ -5,7 +5,7 @@
 
 use atx_core::recipe::{
     Anchor, CoordinateSpace, CropMode, Fit, Operation, OutputFormat, Rect, RotateCrop,
-    TransformRecipe,
+    ThresholdMethod, TransformRecipe,
 };
 use atx_core::{apply_recipe, Limits};
 use image::{ImageFormat, RgbaImage};
@@ -49,10 +49,32 @@ fn arb_pipeline_recipe() -> impl Strategy<Value = TransformRecipe> {
             prop_oneof![Just(Fit::Cover), Just(Fit::Contain), Just(Fit::Fill)],
         )),
         prop::option::of((-1.0f64..=1.0, -1.0f64..=1.0, -1.0f64..=1.0, 0.0f64..=1.0)),
+        // trim(余白落とし)と threshold(2 値化)。どちらも v0.9 の追加 op。
+        prop::option::of((any::<u8>(), 0u32..=8)),
+        prop::option::of((
+            prop_oneof![
+                Just(ThresholdMethod::Otsu),
+                Just(ThresholdMethod::Sauvola),
+                Just(ThresholdMethod::Fixed),
+            ],
+            any::<u8>(),
+            (1u32..=8).prop_map(|n| n * 2 + 1),
+            0.0f64..=1.0,
+            any::<bool>(),
+        )),
         arb_encode_format(),
     )
         .prop_map(
-            |(auto_orient, rotate, crop_ratio, resize, adjust, (format, quality))| {
+            |(
+                auto_orient,
+                rotate,
+                crop_ratio,
+                resize,
+                adjust,
+                trim,
+                threshold,
+                (format, quality),
+            )| {
                 let mut ops = Vec::new();
                 if auto_orient {
                     ops.push(Operation::AutoOrient);
@@ -87,6 +109,29 @@ fn arb_pipeline_recipe() -> impl Strategy<Value = TransformRecipe> {
                         contrast,
                         saturation,
                         sharpness,
+                        mask: None,
+                    });
+                }
+                if let Some((tolerance, padding)) = trim {
+                    ops.push(Operation::Trim {
+                        tolerance,
+                        background: None,
+                        padding,
+                    });
+                }
+                if let Some((method, value, window, k, invert)) = threshold {
+                    // method ごとに指定できるフィールドが違う(validate の制約)。
+                    let (value, window, k) = match method {
+                        ThresholdMethod::Fixed => (Some(value), None, None),
+                        ThresholdMethod::Sauvola => (None, Some(window), Some(k)),
+                        ThresholdMethod::Otsu => (None, None, None),
+                    };
+                    ops.push(Operation::Threshold {
+                        method,
+                        value,
+                        window,
+                        k,
+                        invert,
                         mask: None,
                     });
                 }
