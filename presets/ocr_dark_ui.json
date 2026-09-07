@@ -1,0 +1,18 @@
+{
+  "name": "ocr_dark_ui",
+  "description": "Dark-mode screenshots: trim the margin, then invert to dark-on-light grayscale (no resize/encode).",
+  "recipe": {
+    "operations": [
+      { "op": "trim", "tolerance": 8 },
+      {
+        "op": "color_matrix",
+        "matrix": [
+          -0.2126, -0.7152, -0.0722, 0.0, 1.0,
+          -0.2126, -0.7152, -0.0722, 0.0, 1.0,
+          -0.2126, -0.7152, -0.0722, 0.0, 1.0,
+          0.0, 0.0, 0.0, 1.0, 0.0
+        ]
+      }
+    ]
+  }
+}

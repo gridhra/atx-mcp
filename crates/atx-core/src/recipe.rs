@@ -71,6 +71,28 @@ pub enum Operation {
         #[serde(default, skip_serializing_if = "CoordinateSpace::is_current")]
         coordinate_space: CoordinateSpace,
     },
+    /// 余白の自動切り落とし(ImageMagick `-trim` 相当。v0.9、DESIGN.md §9.12)。
+    ///
+    /// 背景色に近い縁を上下左右から走査して落とす。**幾何 op** なので `mask` は取らない。
+    /// 判定は sRGB 符号値の u8 格子上で行い(f32 のまま比較しない)、
+    /// 変換追跡は `crop.rect` と同じ平行移動を積むので、後続の
+    /// `coordinate_space: "source"` の crop が正しく写る。
+    ///
+    /// 全画素が背景(= 内容なし)なら恒等とし、警告だけを積む。
+    Trim {
+        /// 背景と見なす色距離。RGBA u8 の **Chebyshev 距離**(各チャンネル差の最大値)。
+        #[serde(
+            default = "default_trim_tolerance",
+            skip_serializing_if = "is_default_trim_tolerance"
+        )]
+        tolerance: u8,
+        /// 背景色(CSS hex)。省略時は**四隅の画素の多数決**(同数なら左上優先)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background: Option<String>,
+        /// 内容の外接矩形の外側に残す余白 [px](0..=4096、画像端でクランプ)。
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        padding: u32,
+    },
     /// リサイズ。width/height の少なくとも一方を指定。
     Resize {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -357,6 +379,32 @@ pub enum Operation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mask: Option<MaskRef>,
     },
+    /// 2 値化(v0.9、DESIGN.md §9.12)。BT.709 輝度で白黒に振り分け、
+    /// RGB を 0 か 255 に置き換える(アルファは保持)。
+    ///
+    /// 作業空間は **sRGB 符号値**。輝度は u8 格子上の整数演算
+    /// `luma = (2126*R + 7152*G + 722*B + 5000) / 10000` で求め、`luma > T` を白とする。
+    /// 主用途は Tesseract 等の外部 OCR エンジンへの受け渡しで、
+    /// **読み手が VLM なら二値化しない方が判読率が高い**(ストロークが欠けるため)。
+    Threshold {
+        /// 大域(otsu)/ 局所適応(sauvola)/ 固定(fixed)。
+        #[serde(default, skip_serializing_if = "ThresholdMethod::is_otsu")]
+        method: ThresholdMethod,
+        /// 固定閾値 0..=255。`fixed` のとき必須、他 method で指定すると validate エラー。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<u8>,
+        /// `sauvola` の局所窓幅(奇数 3..=255、既定 31)。他 method での指定は validate エラー。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<u32>,
+        /// `sauvola` の感度 0.0..=1.0(既定 0.2)。他 method での指定は validate エラー。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        k: Option<f64>,
+        /// true で白黒を反転する(既定は「明るい = 白」)。
+        #[serde(default, skip_serializing_if = "is_false")]
+        invert: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mask: Option<MaskRef>,
+    },
     /// 出力エンコード指定。レシピ内で最後に1回のみ許可。省略時は入力フォーマット維持。
     Encode {
         format: OutputFormat,
@@ -549,6 +597,35 @@ pub enum BlendMode {
     Luminosity,
 }
 
+/// `threshold` の閾値決定法。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ThresholdMethod {
+    /// 大域: 256 ビンヒストグラムから級間分散最大の閾値を選ぶ(既定)。
+    #[default]
+    Otsu,
+    /// 局所適応: 窓内平均 m と標準偏差 s から `T = m * (1 + k * (s / 128 - 1))`。
+    Sauvola,
+    /// 固定閾値(`value` 必須)。
+    Fixed,
+}
+
+impl ThresholdMethod {
+    /// 既定値(= 正規化 JSON に出さない)かどうか。
+    pub fn is_otsu(&self) -> bool {
+        matches!(self, ThresholdMethod::Otsu)
+    }
+
+    /// エラーメッセージ用の JSON 表記。
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            ThresholdMethod::Otsu => "otsu",
+            ThresholdMethod::Sauvola => "sauvola",
+            ThresholdMethod::Fixed => "fixed",
+        }
+    }
+}
+
 /// 色相域ごとの HSL シフト量。各値 -100..=100(0 = 変更なし)。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -588,6 +665,7 @@ impl Operation {
             | Operation::Convolve { mask, .. }
             | Operation::Grain { mask, .. }
             | Operation::GradientMap { mask, .. }
+            | Operation::Threshold { mask, .. }
             | Operation::AutoLevels { mask, .. } => mask.as_ref(),
             Operation::AutoOrient
             | Operation::Flip { .. }
@@ -595,6 +673,7 @@ impl Operation {
             | Operation::Pixelate { .. }
             | Operation::Rotate { .. }
             | Operation::Crop { .. }
+            | Operation::Trim { .. }
             | Operation::Resize { .. }
             | Operation::Perspective { .. }
             | Operation::Clone { .. }
@@ -654,6 +733,23 @@ fn default_gamma() -> f64 {
 
 fn default_true() -> bool {
     true
+}
+
+/// `trim.tolerance` の既定値(DESIGN.md §9.12)。
+pub(crate) fn default_trim_tolerance() -> u8 {
+    16
+}
+
+fn is_default_trim_tolerance(v: &u8) -> bool {
+    *v == default_trim_tolerance()
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1093,6 +1189,18 @@ fn validate_operations(operations: &[Operation]) -> crate::Result<()> {
             Operation::AutoLevels { clip_percent, .. } => {
                 crate::ops::auto_levels::validate(index, *clip_percent)?
             }
+            Operation::Trim {
+                background,
+                padding,
+                ..
+            } => crate::ops::trim::validate(index, background, *padding)?,
+            Operation::Threshold {
+                method,
+                value,
+                window,
+                k,
+                ..
+            } => crate::ops::threshold::validate(index, *method, *value, *window, *k)?,
             Operation::Blur { sigma, .. } => crate::ops::blur::validate_blur(index, *sigma)?,
             Operation::Median { radius, .. } => crate::ops::blur::validate_median(index, *radius)?,
             Operation::UnsharpMask {

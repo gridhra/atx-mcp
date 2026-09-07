@@ -184,6 +184,21 @@ Adobe の強さの一半は既存アセット(フィルタ・プリセット・L
 - `clone` / `heal`(PatchMatch、シード・反復固定で決定論)
 - `compare_revisions` に diff モード(差分ヒートマップ)
 
+### v0.9 — ドキュメント前処理(OCR 前処理。2026-09-08 追加)
+
+エージェントが「画像の文字を読む」場面(書類・レシート・スライド・スクショ)向けに、
+OCR エンジンは載せずに**読み手に渡す画素を決定論的に整える**語彙を足す。
+プロダクト定義を「メディア制作」から「エージェントの画像前処理基盤」へ広げる判断を含む
+(詳細は DESIGN.md §9.12)。
+
+- op 追加: `trim`(余白の自動切り落とし)、`threshold`(Otsu / Sauvola / 固定の二値化)
+- 検出系ツール追加: `detect_document`(用紙・画面の四角形 → `perspective.quad` にそのまま貼れる)
+- `render_preview` に `long_edge`(256..=1568、既定 768 のまま): VLM が文字を読める解像度で返す
+- プリセット: `ocr_document` / `ocr_receipt` / `ocr_binarize` / `ocr_dark_ui`
+- 読み手は VLM を既定とし、**二値化は既定にしない**(VLM にはストローク欠けが逆効果)
+- eval: 合成ドキュメント写真・ダーク UI スクショのフィクスチャと t14 / t15 を追加
+- 含めない: OCR エンジン本体、ML 文字領域検出、専用 deskew op(detect_tilt で足りるか eval で判定)
+
 ### v0.8+ — 入出力の翼(Phase E、需要駆動)
 
 RAW(rawler)→ レンズ補正(lensfun DB)→ PSD 読み → resvg 焼き込み → LUT 書き出し。

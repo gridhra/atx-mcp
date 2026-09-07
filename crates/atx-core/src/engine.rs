@@ -673,6 +673,49 @@ impl OpRunner<'_> {
                         ));
                     }
                 }
+                Operation::Trim {
+                    tolerance,
+                    background,
+                    padding,
+                } => {
+                    // 閾値は u8 符号値の色距離で定義されているので、比較の前に
+                    // 必ず sRGB 符号値空間へ移す(`ops::trim` のモジュールドキュメント)。
+                    ensure_space(&mut st.img, &mut st.space, Space::Srgb);
+                    let bg = match background {
+                        Some(c) => Some(
+                            parse_hex_color(c)
+                                .ok_or_else(|| fail(format!("invalid background {c:?}")))?,
+                        ),
+                        None => None,
+                    };
+                    match crate::ops::trim::content_rect(&st.img, *tolerance, bg, *padding) {
+                        Some(rect) => {
+                            st.img = pixel_ops::crop_rect(&st.img, rect).map_err(fail)?;
+                            // crop.rect と同じ平行移動を積む(後続の
+                            // `coordinate_space: "source"` の crop を正しく写すため)。
+                            st.xf = st
+                                .xf
+                                .then(Affine::translate(-(rect.x as f64), -(rect.y as f64)));
+                        }
+                        // 全画素が背景 = 切る根拠が無い。恒等にして理由を警告に残す。
+                        None => st.warnings.push(format!(
+                            "operations[{index}] (trim): no content found, image left unchanged"
+                        )),
+                    }
+                }
+                Operation::Threshold {
+                    method,
+                    value,
+                    window,
+                    k,
+                    invert,
+                    ..
+                } => {
+                    ensure_space(&mut st.img, &mut st.space, Space::Srgb);
+                    st.img = crate::ops::threshold::apply(
+                        &st.img, *method, *value, *window, *k, *invert,
+                    );
+                }
                 Operation::Resize {
                     width,
                     height,
@@ -1026,6 +1069,10 @@ fn op_space(op: &Operation) -> Option<Space> {
         | Operation::SvgOverlay { .. }
         | Operation::Grain { .. }
         | Operation::GradientMap { .. }
+        // trim / threshold は閾値を u8 符号値の距離で定義しているので、
+        // 比較の直前に符号値の格子へ丸められる空間が要る(DESIGN.md §9.12)。
+        | Operation::Trim { .. }
+        | Operation::Threshold { .. }
         | Operation::AutoLevels { .. } => Some(Space::Srgb),
     }
 }
@@ -1052,6 +1099,8 @@ fn op_name(op: &Operation) -> &'static str {
         Operation::AutoOrient => "auto_orient",
         Operation::Rotate { .. } => "rotate",
         Operation::Crop { .. } => "crop",
+        Operation::Trim { .. } => "trim",
+        Operation::Threshold { .. } => "threshold",
         Operation::Resize { .. } => "resize",
         Operation::Adjust { .. } => "adjust",
         Operation::Encode { .. } => "encode",

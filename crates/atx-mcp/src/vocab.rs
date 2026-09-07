@@ -1013,6 +1013,91 @@ pub const OPERATIONS: &[OpDoc] = &[
         ],
     },
     OpDoc {
+        name: "trim",
+        category: "geometry",
+        summary: "Cut the uniform margin away from around the content.",
+        params: &[
+            ParamDoc {
+                name: "tolerance",
+                type_hint: "u8 0..255",
+                requirement: "default: 16",
+                semantics: "How far a pixel may differ from the background and still count as background: the Chebyshev distance (largest per-channel difference) over RGBA on the 0..255 sRGB grid. 0 demands an exact match; raise it for scanned paper or JPEG ringing.",
+            },
+            ParamDoc {
+                name: "background",
+                type_hint: "css hex",
+                requirement: "optional",
+                semantics: "Background color as CSS hex (#rgb / #rrggbb / #rrggbbaa). Omit it and the background is the majority vote of the four corner pixels (ties go to the top-left corner).",
+            },
+            ParamDoc {
+                name: "padding",
+                type_hint: "u32 0..4096",
+                requirement: "default: 0",
+                semantics: "Margin in pixels to keep outside the content's bounding box, clamped to the image edges. Use a small value (4-16) so glyphs on the outer edge are not shaved.",
+            },
+        ],
+        examples: &[
+            r#"{"op": "trim"}"#,
+            r###"{"op": "trim", "tolerance": 8, "background": "#ffffff", "padding": 8}"###,
+        ],
+        warnings: &[
+            "Trim BEFORE resize when the goal is reading text: a reader downsamples the image to a fixed budget, so removing margin first spends those pixels on the glyphs instead of the paper.",
+            "If every pixel counts as background (a blank or entirely uniform image), trim is a no-op and reports \"no content found, image left unchanged\" in warnings rather than producing an empty image.",
+            "On an image with alpha, a pixel whose alpha is <= tolerance counts as background whatever its RGB is (fully transparent pixels often carry junk color).",
+            "A geometric op, so there is no mask param. Like crop, it shifts the coordinate system: a later crop with coordinate_space=\"source\" is mapped through the trim automatically.",
+        ],
+    },
+    OpDoc {
+        name: "threshold",
+        category: "filter",
+        summary: "Binarize to black and white by BT.709 luma.",
+        params: &[
+            ParamDoc {
+                name: "method",
+                type_hint: "enum otsu|sauvola|fixed",
+                requirement: "default: otsu",
+                semantics: "otsu picks one global threshold by maximizing between-class variance of the luma histogram. sauvola adapts per pixel from a local window (best for uneven lighting or a shadowed page). fixed uses the value you give.",
+            },
+            ParamDoc {
+                name: "value",
+                type_hint: "u8 0..255",
+                requirement: "optional",
+                semantics: "The threshold for method=fixed, where it is REQUIRED; giving it with otsu or sauvola is an error. A pixel is white when luma > value, so value=128 keeps luma 128 black.",
+            },
+            ParamDoc {
+                name: "window",
+                type_hint: "u32 odd 3..255",
+                requirement: "optional",
+                semantics: "Local window width for method=sauvola (default 31); must be odd so the window is centred, and is only valid with sauvola. Roughly 2-3x the stroke thickness works well. The window is clamped at the image edges.",
+            },
+            ParamDoc {
+                name: "k",
+                type_hint: "f64 0..1",
+                requirement: "optional",
+                semantics: "Sensitivity for method=sauvola (default 0.2), only valid with sauvola: T = m * (1 + k * (s/128 - 1)) over the window's mean m and standard deviation s. Higher k pulls the threshold down and keeps less ink.",
+            },
+            ParamDoc {
+                name: "invert",
+                type_hint: "bool",
+                requirement: "default: false",
+                semantics: "false (the default) makes the bright side white; true swaps black and white, e.g. for light text on a dark screenshot.",
+            },
+            MASK_PARAM,
+        ],
+        examples: &[
+            r#"{"op": "threshold"}"#,
+            r#"{"op": "threshold", "method": "sauvola", "window": 31, "k": 0.2}"#,
+            r#"{"op": "threshold", "method": "fixed", "value": 128, "invert": true}"#,
+        ],
+        warnings: &[
+            "DO NOT BINARIZE FOR A VISION MODEL. If the reader is a VLM (you, or any vision model looking at render_preview), thresholding thins and breaks strokes and usually LOWERS accuracy - use grayscale + auto_levels + unsharp_mask (the ocr_document preset) instead. threshold is for handing pixels to an external OCR engine such as Tesseract.",
+            "value belongs to method=fixed only, and window/k to method=sauvola only; mixing them is a structured error naming the operation index.",
+            "The output keeps only two RGB levels (0 and 255), so any later tone op (adjust/curves/levels/auto_levels) has nothing left to work with. Put threshold LAST among the pixel ops, and encode to png - jpeg re-introduces grey ringing around every edge.",
+            "Alpha is preserved untouched; only RGB is replaced.",
+            MASK_WARNING,
+        ],
+    },
+    OpDoc {
         name: "encode",
         category: "output",
         summary: "Output format/quality. At most one, and it must be last.",
@@ -1212,7 +1297,7 @@ mod tests {
     #[test]
     fn catalog_covers_every_operation_exactly_once() {
         let names = operation_names();
-        assert_eq!(names.len(), 27, "v0.3.0 has 27 operations");
+        assert_eq!(names.len(), 29, "v0.9 has 29 operations");
         let mut sorted = names.clone();
         sorted.sort_unstable();
         sorted.dedup();

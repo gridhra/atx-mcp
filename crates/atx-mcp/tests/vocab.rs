@@ -56,7 +56,7 @@ fn tools() -> (tempfile::TempDir, AtxTools) {
     (workspace, tools)
 }
 
-const V03_OPERATIONS: [&str; 27] = [
+const V03_OPERATIONS: [&str; 29] = [
     "auto_orient",
     "rotate",
     "crop",
@@ -82,11 +82,13 @@ const V03_OPERATIONS: [&str; 27] = [
     "gradient_map",
     "pixelate",
     "auto_levels",
+    "trim",
+    "threshold",
     "encode",
     "strip_metadata",
 ];
 
-const BUILTIN_PRESETS: [&str; 30] = [
+const BUILTIN_PRESETS: [&str; 34] = [
     "architecture_clean",
     "bw_high_contrast",
     "bw_neutral",
@@ -107,6 +109,10 @@ const BUILTIN_PRESETS: [&str; 30] = [
     "instagram_square_1080",
     "landscape_punch",
     "matte_fade",
+    "ocr_binarize",
+    "ocr_dark_ui",
+    "ocr_document",
+    "ocr_receipt",
     "og_1200x630",
     "portrait_soft",
     "product_clean",
@@ -126,7 +132,7 @@ fn list_operations_returns_every_op_and_the_presets() {
     let out = structured(&result);
     let body = text(&result);
 
-    assert_eq!(out["count"], 27);
+    assert_eq!(out["count"], 29);
     let names: Vec<&str> = out["ops"]
         .as_array()
         .expect("ops must be an array")
@@ -171,11 +177,12 @@ fn list_operations_returns_every_op_and_the_presets() {
     assert!(body.contains("0.1..100"));
 
     // 段階的開示: カタログはトークン的に軽いこと
-    // (27 op + 14 op に付く mask の1行 + 30 プリセット行。プリセット行には
+    // (29 op + 15 op に付く mask の1行 + 34 プリセット行。プリセット行には
     //  中身が見えるように op の骨組み("wb→curves→grain")も入るので、
-    //  目安 ~2400 tokens ≒ 9500 chars を上限とする)。
+    //  目安 ~2600 tokens ≒ 10500 chars を上限とする。§9.12 で op 2 本と
+    //  ocr_* プリセット 4 本が増えた分だけ広げた)。
     assert!(
-        body.len() < 9_500,
+        body.len() < 10_500,
         "the catalog must stay compact, got {} chars",
         body.len()
     );
@@ -217,6 +224,7 @@ fn list_operations_filters_by_category_and_rejects_unknown_ones() {
             "vignette",
             "grain",
             "pixelate",
+            "threshold",
         ]
     );
     // プリセットは分類で絞っても常に出す(語彙の圧縮層は分類に属さない)。
@@ -369,7 +377,7 @@ fn explain_operation_rejects_unknown_names_with_the_valid_list() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert_eq!(valid.len(), 27);
+    assert_eq!(valid.len(), 29);
     for op in V03_OPERATIONS {
         assert!(valid.contains(&op));
     }
@@ -394,7 +402,7 @@ fn embedded_presets_are_well_formed() {
         assert!(!preset.description.is_empty());
         assert!(!preset.recipe.operations.is_empty());
     }
-    // 全 30 プリセットが atx-core の validate を通ること(名前を手で並べない)。
+    // 全 34 プリセットが atx-core の validate を通ること(名前を手で並べない)。
     for name in BUILTIN_PRESETS {
         let preset = atx_mcp::presets::resolve(name).expect("preset must resolve");
         atx_core::recipe::validate(&preset.recipe)
@@ -496,6 +504,7 @@ fn preset_apply_is_pure_sugar_over_the_resolved_recipe() {
         preset: Some("web_optimize".to_string()),
         overlay: None,
         mask_revision_id: None,
+        long_edge: None,
     }));
     assert_eq!(preview["recipe_hash"].as_str().unwrap(), preset_hash);
     assert_eq!(preview["mime_type"], "image/jpeg");
@@ -564,6 +573,7 @@ fn recipe_and_preset_are_mutually_exclusive_and_one_is_required() {
         preset: None,
         overlay: None,
         mask_revision_id: None,
+        long_edge: None,
     });
     assert_eq!(
         error_payload(&preview_neither)["error"]["code"],
@@ -686,6 +696,7 @@ fn list_operations_payload_size() {
         (body.len() + structured_json.len()) / 4
     );
     // プリセット行に op の骨組み("wb→curves→grain")を足した分だけ上限を広げている
-    // (実運用 FB: 中身が見えないプリセットは使われない)。
-    assert!(body.len() + structured_json.len() < 11_500);
+    // (実運用 FB: 中身が見えないプリセットは使われない)。さらに DESIGN.md §9.12 の
+    // op 2 本(trim / threshold)と ocr_* プリセット 4 本ぶんを加算している。
+    assert!(body.len() + structured_json.len() < 12_600);
 }
