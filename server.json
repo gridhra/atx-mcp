@@ -3,7 +3,7 @@
   "name": "io.github.gridhra/atx-mcp",
   "title": "atx-mcp",
   "description": "Deterministic, non-generative image transform MCP server: reproducible recipes, immutable originals.",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "websiteUrl": "https://github.com/gridhra/atx-mcp",
   "repository": {
     "url": "https://github.com/gridhra/atx-mcp",
@@ -15,7 +15,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "atx-mcp",
-      "version": "0.4.1",
+      "version": "0.5.0",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
