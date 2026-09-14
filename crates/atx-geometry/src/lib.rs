@@ -2,6 +2,8 @@
 //!
 //! - 傾き検出 [`detect_tilt`](Canny + Hough + 投影プロファイル)
 //! - ドキュメント四角形検出 [`detect_document`](Canny + 輪郭近似。[`quad`] モジュール)
+//! - 文字ブロック検出 [`detect_text_blocks`](Otsu + run-length smearing +
+//!   連結成分。[`text_blocks`] モジュール)
 //!
 //! いずれも read-only で、適用はしない(判断はホスト AI に委ねる)。
 //!
@@ -50,6 +52,7 @@ mod angle;
 mod hough;
 mod projection;
 mod quad;
+mod text_blocks;
 
 use image::{imageops::FilterType, DynamicImage, GrayImage};
 use imageproc::gradients::sobel_gradients;
@@ -61,6 +64,10 @@ use crate::projection::{ProjectionEstimate, ProjectionSearch};
 
 pub use crate::quad::{
     detect_document, DocumentDetection, DocumentParams, OutputSizeHint, SuggestedOperation,
+};
+pub use crate::text_blocks::{
+    detect_text_blocks, BlockRect, Legibility, SuggestedCrop, TextBlock, TextBlockDetection,
+    TextBlockParams,
 };
 
 /// 傾き検出の結果。MCP structuredContent 互換。

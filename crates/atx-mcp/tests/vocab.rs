@@ -180,9 +180,10 @@ fn list_operations_returns_every_op_and_the_presets() {
     // (29 op + 15 op に付く mask の1行 + 34 プリセット行。プリセット行には
     //  中身が見えるように op の骨組み("wb→curves→grain")も入るので、
     //  目安 ~2600 tokens ≒ 10500 chars を上限とする。§9.12 で op 2 本と
-    //  ocr_* プリセット 4 本が増えた分だけ広げた)。
+    //  ocr_* プリセット 4 本が増えた分だけ広げた。v0.6 で svg_overlay の
+    //  render_text / font_revision_ids の 2 行ぶんだけさらに広げた: 実測 10,533 chars)。
     assert!(
-        body.len() < 10_500,
+        body.len() < 10_700,
         "the catalog must stay compact, got {} chars",
         body.len()
     );

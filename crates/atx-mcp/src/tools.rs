@@ -14,8 +14,11 @@ use std::path::{Component, Path, PathBuf};
 
 use atx_core::recipe::{Fit, Operation, OutputFormat};
 use atx_core::{AtxError, ImageInfo, Limits, TransformRecipe, ENGINE_VERSION};
-use atx_geometry::{DetectParams, DocumentDetection, DocumentParams, TiltDetection};
-use atx_store::{AssetRevision, AssetStore, StoreError};
+use atx_geometry::{
+    DetectParams, DocumentDetection, DocumentParams, TextBlockDetection, TextBlockParams,
+    TiltDetection,
+};
+use atx_store::{ext_for_mime, AssetRevision, AssetStore, StoreError};
 use base64::Engine as _;
 use image::{ImageEncoder, RgbImage};
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -25,6 +28,8 @@ use sha2::{Digest, Sha256};
 
 /// プレビューの長辺上限(DESIGN.md §4.1)。
 pub const PREVIEW_LONG_EDGE: u32 = 768;
+/// `inspect_image` のテキストサマリに EXIF 全量から抜粋する件数。
+const EXIF_SUMMARY_HEAD: usize = 5;
 /// `detect_document` の `min_area_ratio` に指定できる下限(DESIGN.md §9.12)。
 pub const MIN_AREA_RATIO_MIN: f64 = 0.05;
 /// `detect_document` の `min_area_ratio` に指定できる上限。
@@ -76,6 +81,53 @@ pub const SVG_MIME: &str = "image/svg+xml";
 pub const MAX_SVG_BYTES: u64 = 16 * 1024 * 1024;
 /// SVG 判定で内容を覗くバイト数の上限(先頭 4KiB)。
 const SVG_SNIFF_BYTES: usize = 4 * 1024;
+/// TrueType フォントアセットの MIME type(v0.6「`svg_overlay` の文字描画」)。
+///
+/// `image/` で始まらないので [`is_raster_image`] は最初から false を返す
+/// (= inspect_image / detect_* / apply_transform は既存の `not_an_image` で弾く)。
+/// atx-store の `ext_for_mime` がこれを `.ttf` 拡張子に写す。
+pub const FONT_TTF_MIME: &str = "font/ttf";
+/// OpenType(CFF アウトライン、`OTTO`)フォントアセットの MIME type。
+pub const FONT_OTF_MIME: &str = "font/otf";
+/// `detect_text_blocks` の `max_blocks` に指定できる下限。
+pub const MAX_TEXT_BLOCKS_MIN: usize = 1;
+/// `detect_text_blocks` の `max_blocks` に指定できる上限。
+pub const MAX_TEXT_BLOCKS_MAX: usize = 128;
+/// `detect_text_blocks` の `min_block_area_ratio` に指定できる下限。
+pub const MIN_BLOCK_AREA_RATIO_MIN: f64 = 0.0;
+/// `detect_text_blocks` の `min_block_area_ratio` に指定できる上限。
+pub const MIN_BLOCK_AREA_RATIO_MAX: f64 = 1.0;
+
+/// レシピ内プリセットマクロの op 名(`{"op":"preset","name":"<preset>"}`)。
+///
+/// atx-core の DSL には存在しない **MCP 層だけの糖衣**で、
+/// [`expand_preset_macros`] が deserialize の前にその場で展開する。
+pub const PRESET_MACRO_OP: &str = "preset";
+
+/// `explain_operation "preset"` が返すマクロのリファレンス。
+///
+/// `vocab::OPERATIONS`(= `list_operations` のカタログ)には入れない:
+/// これは core の op ではなく MCP 層の糖衣なので、op 件数を固定している
+/// テストと語彙の定義を汚さないため(ROADMAP「Agent UX の規律」)。
+const PRESET_MACRO_DOC: crate::vocab::OpDoc = crate::vocab::OpDoc {
+    name: PRESET_MACRO_OP,
+    category: "structure",
+    summary: "Recipe macro (not a core op): inlines a built-in preset's operations at this position, so a preset can be combined with your own operations in one recipe.",
+    params: &[crate::vocab::ParamDoc {
+        name: "name",
+        type_hint: "string (a built-in preset name)",
+        requirement: "required",
+        semantics: "The preset whose operations are spliced in here, in order. Call list_operations for the preset names, or explain_operation with a preset name to read the operations it will insert. A preset that carries a layers stack cannot be inlined (pass it as the top-level preset instead).",
+    }],
+    examples: &[
+        r#"{"operations": [{"op": "perspective", "vertical_degrees": -3.5}, {"op": "trim"}, {"op": "preset", "name": "ocr_document"}, {"op": "encode", "format": "png"}]}"#,
+    ],
+    warnings: &[
+        "The macro is expanded before anything else runs, and the recipe_hash is computed on the EXPANDED recipe: the macro, the equivalent hand-written operations and a plain preset=<name> call all land on the same revision.",
+        "Expansion is flat: the preset's operations take the macro's place one after another, so an encode inside the preset must still end up last in the whole recipe (a preset ending in encode cannot be followed by more operations).",
+        "It works in layers[].ops too. The error messages point at the EXPANDED index and name the preset they came from, e.g. operations[4] (encode) ... (expanded from preset \"web_optimize\").",
+    ],
+};
 
 // ---------------------------------------------------------------------------
 // 入力パラメータ(tool inputSchema はこれらから生成される)
@@ -119,11 +171,62 @@ impl ImportAssetParams {
     }
 }
 
-/// revision を1つ指定するだけのツールの引数。
+/// `inspect_image` の引数。
+///
+/// `include_exif` は既定 false なので、v0.5 までの
+/// `{"revision_id": "rev_..."}` だけの呼び出しはそのまま同じ結果を返す。
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct RevisionParams {
+pub struct InspectImageParams {
     /// 対象 revision ID("rev_...")。
     pub revision_id: String,
+    /// EXIF 全フィールドを `info.exif` に載せるか。既定 false。
+    ///
+    /// 既定で落としているのはプライバシーのため: 全量には GPS 座標や
+    /// 個人名が入りうるので、明示的に要求されたときだけ返す
+    /// (`exif_summary` と `has_gps` は従来どおり常に載る)。
+    #[serde(default)]
+    pub include_exif: bool,
+}
+
+impl InspectImageParams {
+    /// EXIF 全量なしの引数を作る(テスト・呼び出し側の糖衣)。
+    pub fn new(revision_id: impl Into<String>) -> Self {
+        Self {
+            revision_id: revision_id.into(),
+            include_exif: false,
+        }
+    }
+
+    /// `include_exif: true` にした自分を返す。
+    pub fn with_exif(mut self) -> Self {
+        self.include_exif = true;
+        self
+    }
+}
+
+/// `detect_text_blocks` の引数。
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct DetectTextBlocksParams {
+    /// 対象 revision ID("rev_...")。
+    pub revision_id: String,
+    /// 返すブロック数の上限(1..=128)。省略時は 32。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_blocks: Option<usize>,
+    /// 作業画像面積に対する 1 ブロックの最小面積比(0.0..=1.0)。
+    /// これ未満の成分はノイズとして捨てる。省略時は 0.00005。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_block_area_ratio: Option<f64>,
+}
+
+impl DetectTextBlocksParams {
+    /// 既定パラメータの引数を作る(テスト・呼び出し側の糖衣)。
+    pub fn new(revision_id: impl Into<String>) -> Self {
+        Self {
+            revision_id: revision_id.into(),
+            max_blocks: None,
+            min_block_area_ratio: None,
+        }
+    }
 }
 
 /// `detect_tilt` の引数。
@@ -292,15 +395,74 @@ pub struct ListAssetsParams {
 }
 
 /// `export_asset` の引数。
+///
+/// 単数形(`revision_id` + `dest_path`)と複数形(`revision_ids` + `dest_dir`
+/// + 任意の `filename_template`)のどちらか一方。単数形は v0.5 までと完全に同じ挙動。
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct ExportAssetParams {
-    /// 書き出す revision ID("rev_...")。
-    pub revision_id: String,
-    /// 書き出し先パス(ワークスペース外)。
-    pub dest_path: String,
+    /// 書き出す revision ID("rev_...")。`revision_ids` とは排他で、どちらか一方が必須。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_id: Option<String>,
+    /// 複数 revision を1回で書き出す(1..=64 件)。`revision_id` とは排他。
+    /// このときは `dest_path` ではなく `dest_dir` を渡す。
+    /// 1件が失敗してもバッチは中断せず、`failed` に理由が入る。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_ids: Option<Vec<String>>,
+    /// 書き出し先パス(ワークスペース外)。`revision_id`(単数)専用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dest_path: Option<String>,
+    /// 書き出し先ディレクトリ(ワークスペース外、既存のディレクトリ)。
+    /// `revision_ids`(複数)専用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dest_dir: Option<String>,
+    /// `dest_dir` 内のファイル名の組み立て方。既定 `"{revision_id}.{ext}"`。
+    /// `revision_ids`(複数)専用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename_template: Option<String>,
     /// 既存ファイルを上書きしてよいか。既定 false(既存なら失敗する)。
     #[serde(default)]
     pub overwrite: bool,
+}
+
+impl ExportAssetParams {
+    /// 単数形の引数を作る(テスト・呼び出し側の糖衣)。
+    pub fn single(revision_id: impl Into<String>, dest_path: impl Into<String>) -> Self {
+        Self {
+            revision_id: Some(revision_id.into()),
+            revision_ids: None,
+            dest_path: Some(dest_path.into()),
+            dest_dir: None,
+            filename_template: None,
+            overwrite: false,
+        }
+    }
+
+    /// バッチ引数を作る。
+    pub fn batch<S: Into<String>>(
+        revision_ids: impl IntoIterator<Item = S>,
+        dest_dir: impl Into<String>,
+    ) -> Self {
+        Self {
+            revision_id: None,
+            revision_ids: Some(revision_ids.into_iter().map(Into::into).collect()),
+            dest_path: None,
+            dest_dir: Some(dest_dir.into()),
+            filename_template: None,
+            overwrite: false,
+        }
+    }
+
+    /// `overwrite: true` にした自分を返す(テスト・呼び出し側の糖衣)。
+    pub fn with_overwrite(mut self) -> Self {
+        self.overwrite = true;
+        self
+    }
+
+    /// `filename_template` を差し替えた自分を返す。
+    pub fn with_filename_template(mut self, template: impl Into<String>) -> Self {
+        self.filename_template = Some(template.into());
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -368,6 +530,11 @@ pub struct ImportOutput {
     /// その派生の素性(= 同じレシピをもう一度当てると二重処理になる、というサイン)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub already_derived_from: Option<AlreadyDerivedFrom>,
+    /// Font family names this asset provides, present only when the imported file is a
+    /// font. Use one of these verbatim in the SVG's `font-family` and reference this
+    /// revision from `svg_overlay.font_revision_ids`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_families: Option<Vec<String>>,
 }
 
 /// バッチの1件分の失敗(パスと構造化エラーの要点)。
@@ -462,6 +629,14 @@ pub struct DetectDocumentOutput {
     pub detection: DocumentDetection,
 }
 
+/// `detect_text_blocks` の structuredContent。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DetectTextBlocksOutput {
+    pub revision_id: String,
+    /// 検出結果。ブロックが無ければ `blocks` は空で `warnings` に理由が入る。
+    pub detection: TextBlockDetection,
+}
+
 /// `apply_transform` の structuredContent。
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ApplyTransformOutput {
@@ -525,6 +700,10 @@ pub struct RenderPreviewOutput {
     pub height: u32,
     pub byte_size: u64,
     pub mime_type: String,
+    /// Rough token cost of reading this preview inline: a rule of thumb for Anthropic
+    /// vision models (pixels / 750, rounded up); other hosts differ. Use it to decide
+    /// whether a larger `long_edge` (or reading a long document in bands) is worth it.
+    pub estimated_vision_tokens: u32,
     pub warnings: Vec<String>,
     /// 適用した overlay。未指定なら null。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -591,6 +770,17 @@ pub struct CompareRevisionsOutput {
     /// `layout: "diff"` のときだけ載る: d > 2 の画素が全体に占める割合(0.0..=1.0)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub changed_pixel_ratio: Option<f64>,
+    /// Hamming distance (0..=64) between the two revisions' perceptual hashes (dHash),
+    /// on every layout. 0 means the thumbnails are identical; 5 or less usually means
+    /// the same picture re-encoded or resized; 20 or more means different pictures.
+    /// Null when either side's pixels could not be hashed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub perceptual_hash_distance: Option<u32>,
+    /// Structural similarity (SSIM, 0..=1) over the two images' luma. Present only with
+    /// `layout: "diff"` and equal dimensions. 1.0 is pixel-identical; above ~0.98 the
+    /// difference is usually invisible; below ~0.9 it is a visible change of content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssim: Option<f64>,
 }
 
 /// `list_assets` の structuredContent。
@@ -687,6 +877,32 @@ pub struct ExportAssetOutput {
     pub overwritten: bool,
 }
 
+/// `export_asset`(バッチ)の1件分。単数形の出力と同じ形。
+pub type ExportEntry = ExportAssetOutput;
+
+/// `export_asset`(バッチ)の structuredContent。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ExportBatchOutput {
+    /// 書き出しに成功した件数(= `exported` の長さ)。
+    pub count: usize,
+    /// 入力順の成功結果。
+    pub exported: Vec<ExportEntry>,
+    /// 失敗した revision(1件の失敗でバッチは中断しない)。
+    pub failed: Vec<BatchFailure>,
+    /// 書き出し先ディレクトリの絶対パス。
+    pub dest_dir: String,
+    /// 実際に使ったファイル名テンプレート(既定を含む)。
+    pub filename_template: String,
+}
+
+/// `export_asset` の structuredContent(単一 = 従来どおり / バッチ)。
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ExportResult {
+    Single(Box<ExportAssetOutput>),
+    Batch(Box<ExportBatchOutput>),
+}
+
 // ---------------------------------------------------------------------------
 // 結果の組み立て
 // ---------------------------------------------------------------------------
@@ -776,7 +992,7 @@ fn error_info(result: &CallToolResult) -> BatchError {
 ///
 /// inputSchema から Operation enum を外した代償として、**コンパイル時スキーマ検証と
 /// 同じだけ具体的なエラー**を実行時に作るのがこの関数の仕事:
-/// まず素直に deserialize し、失敗したら `operations[i]` / `layers[j].operations[k]` を
+/// まず素直に deserialize し、失敗したら `operations[i]` / `layers[j].ops[k]` を
 /// 1件ずつ試して**壊れている位置**を特定し、op 名の打ち間違いには
 /// `did_you_mean` を添える。
 fn deserialize_recipe(recipe: &RecipeJson) -> Result<TransformRecipe, CallToolResult> {
@@ -818,14 +1034,15 @@ fn locate_recipe_error(
         );
     };
 
-    // layers[j].operations[k] → operations[i] の順に、壊れている1件を名指しする。
+    // layers[j].ops[k] → operations[i] の順に、壊れている1件を名指しする。
     if let Some(layers) = object.get("layers").and_then(|l| l.as_array()) {
         for (j, layer) in layers.iter().enumerate() {
-            if let Some(ops) = layer.get("operations").and_then(|o| o.as_array()) {
+            // `Layer` の serde 名は `ops`(`operations` ではない)。
+            if let Some(ops) = layer.get("ops").and_then(|o| o.as_array()) {
                 if let Some((k, e)) = first_bad_operation(ops) {
                     let name = op_name_of(&ops[k]);
                     return (
-                        format!("layers[{j}].operations[{k}]{}", field_suffix(&ops[k])),
+                        format!("layers[{j}].ops[{k}]{}", field_suffix(&ops[k])),
                         e,
                         suggestions_for(name),
                     );
@@ -988,6 +1205,8 @@ fn not_an_image_side(revision_id: &str, mime_type: &str, side: Option<&str>) -> 
         "this is an imported .cube 3D LUT asset, not an image; reference it from a recipe as {\"op\": \"lut\", \"lut_revision_id\": \"...\"} instead of inspecting it"
     } else if mime_type == SVG_MIME {
         "this is an imported SVG, a VECTOR asset with no pixels of its own, not a raster image; stamp it onto a raster revision with {\"op\": \"svg_overlay\", \"svg_revision_id\": \"...\", \"x\": 0, \"y\": 0} instead of inspecting it"
+    } else if mime_type == FONT_TTF_MIME || mime_type == FONT_OTF_MIME {
+        "this is an imported font asset (.ttf/.otf), not an image; list it in {\"op\": \"svg_overlay\", \"render_text\": true, \"font_revision_ids\": [\"...\"]} so the SVG's text can be drawn with it, instead of inspecting it"
     } else {
         "call list_assets and pick a revision whose mime_type starts with \"image/\""
     };
@@ -1036,7 +1255,7 @@ fn invalid_asset(path: &Path, kind: &str, reason: &str) -> CallToolResult {
         serde_json::json!({
             "path": path.to_string_lossy(),
             "reason": reason,
-            "recovery": "check that the file really is the asset its extension says (a text .cube LUT or a plain .svg), or rename it if it is a raster image",
+            "recovery": "check that the file really is the asset its extension says (a text .cube LUT, a plain .svg, or a TrueType/OpenType .ttf/.otf font), or rename it if it is a raster image",
         }),
     )
 }
@@ -1088,6 +1307,65 @@ fn looks_like_cube(path: &Path, bytes: &[u8]) -> bool {
             let upper = line.to_ascii_uppercase();
             upper.starts_with("LUT_1D_SIZE") || upper.starts_with("LUT_3D_SIZE")
         })
+}
+
+/// 2 枚の画像の知覚ハッシュ(dHash)のハミング距離。
+///
+/// 画素をデコードできない/寸法 0 のときは `None`(「距離 0」= 同一と誤読させない)。
+fn perceptual_distance(a: &image::DynamicImage, b: &image::DynamicImage) -> Option<u32> {
+    let hash = |img: &image::DynamicImage| -> Option<u64> {
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        if w == 0 || h == 0 {
+            return None;
+        }
+        Some(atx_core::dhash_rgba8(rgba.as_raw(), w, h))
+    };
+    Some(atx_core::hamming(hash(a)?, hash(b)?))
+}
+
+/// 知覚ハッシュ距離の読み方(テキストサマリに添える一句)。
+fn hash_distance_hint(distance: u32) -> &'static str {
+    if distance == 0 {
+        "(identical thumbnails)"
+    } else if distance <= 5 {
+        "(<=5 usually means the same picture re-encoded or resized)"
+    } else if distance < 20 {
+        "(a visible change of content, but the same subject)"
+    } else {
+        "(>=20 usually means two different pictures)"
+    }
+}
+
+/// ファイルがフォントアセット(.ttf / .otf)かどうかを判定する。
+///
+/// 判定規則(どちらか一方を満たせばフォントとみなす):
+/// 1. 拡張子が `.ttf` / `.otf`(大文字小文字を無視)
+/// 2. 先頭 4 バイトが TrueType / OpenType の署名
+///    (`00 01 00 00` = TrueType アウトライン、`OTTO` = CFF アウトライン、`true` = 旧 Apple 形式)
+///
+/// 署名判定を持たせてあるのは、拡張子の無いフォントを渡されても
+/// 「画像としてデコードできない」ではなく「フォントアセット」として扱えるようにするため。
+/// コレクション(`ttcf` = .ttc)はここでは拾わない
+/// ([`atx_core::validate_font_asset`] が理由付きで拒否する経路に乗せたいので、
+///  拡張子が `.ttf` / `.otf` のときだけ拾われる)。
+fn looks_like_font(path: &Path, bytes: &[u8]) -> bool {
+    if has_extension(path, "ttf") || has_extension(path, "otf") {
+        return true;
+    }
+    matches!(
+        bytes.get(..4),
+        Some([0x00, 0x01, 0x00, 0x00]) | Some(b"OTTO") | Some(b"true")
+    )
+}
+
+/// フォントアセットの MIME type。`OTTO` 署名だけが OpenType(CFF)。
+fn font_mime_for(bytes: &[u8]) -> &'static str {
+    if bytes.get(..4) == Some(b"OTTO") {
+        FONT_OTF_MIME
+    } else {
+        FONT_TTF_MIME
+    }
 }
 
 /// レシピが参照するアセット(v0.3 では `lut` の `lut_revision_id`)を
@@ -1326,7 +1604,12 @@ impl AtxTools {
         // 超えられない上限(全種類の上限の最大値)で先に切り、種類ごとの細かい上限は
         // 従来どおり読んだ後に検査する。読み取り自体も `take` で上限 + 1 バイトに縛り、
         // 検査とのあいだにファイルが伸びても上限以上は読まない。
-        let max_read = self.limits.max_bytes.max(MAX_CUBE_BYTES).max(MAX_SVG_BYTES);
+        let max_read = self
+            .limits
+            .max_bytes
+            .max(MAX_CUBE_BYTES)
+            .max(MAX_SVG_BYTES)
+            .max(atx_core::MAX_FONT_BYTES);
         let io_error = |e: std::io::Error| {
             tool_error(
                 "io_error",
@@ -1425,11 +1708,28 @@ impl AtxTools {
                 Err(_) => is_svg = false,
             }
         }
+        // フォントアセット(v0.6: `svg_overlay` の文字描画が参照する .ttf / .otf)も
+        // 画像としては検査しない。寸法は持たないので 0x0 で台帳に載せる。
+        // 拡張子が `.ttf` / `.otf` なら検証失敗はエラー。署名だけで推定したものは、
+        // 検証に落ちたら推定の誤りとみなして画像として扱い直す(SVG と同じ規律)。
+        let mut is_font = !is_cube && !is_svg && looks_like_font(&path, &bytes);
+        let mut font_families: Option<Vec<String>> = None;
+        if is_font {
+            match atx_core::validate_font_asset(&bytes) {
+                Ok(info) => font_families = Some(info.families),
+                Err(reason) if has_extension(&path, "ttf") || has_extension(&path, "otf") => {
+                    bail!(invalid_asset(&path, "a TrueType/OpenType font", &reason));
+                }
+                Err(_) => is_font = false,
+            }
+        }
         let (mime_type, width, height) = if is_cube {
             (CUBE_MIME.to_string(), 0, 0)
         } else if is_svg {
             let (w, h) = svg_size.unwrap_or((0, 0));
             (SVG_MIME.to_string(), w, h)
+        } else if is_font {
+            (font_mime_for(&bytes).to_string(), 0, 0)
         } else {
             let info = tri!(atx_core::inspect_bytes(&bytes, &self.limits), atx_error);
             // 寸法は EXIF Orientation 適用後の実効値を記録する(atx-core はデコード時に
@@ -1453,6 +1753,9 @@ impl AtxTools {
         }
         if is_svg {
             origin.insert("asset_kind".to_string(), "svg".to_string());
+        }
+        if is_font {
+            origin.insert("asset_kind".to_string(), "font".to_string());
         }
 
         let known_before = tri!(self.known_revision_ids(), store_error);
@@ -1503,9 +1806,20 @@ impl AtxTools {
                 format!("intrinsic size {}x{}", summary.width, summary.height)
             };
             format!(
-                "{verb} {} as {} (SVG vector asset, {}, {size}, {} bytes). It is not a raster image: stamp it onto one with {{\"op\": \"svg_overlay\", \"svg_revision_id\": \"{}\", \"x\": 0, \"y\": 0}}. Text is NOT rendered (no fonts are loaded, for determinism) - convert text to paths.\npath: {}",
+                "{verb} {} as {} (SVG vector asset, {}, {size}, {} bytes). It is not a raster image: stamp it onto one with {{\"op\": \"svg_overlay\", \"svg_revision_id\": \"{}\", \"x\": 0, \"y\": 0}}. Text is rendered only with render_text:true (bundled Roboto plus any font_revision_ids); otherwise <text> is skipped, so convert text to paths.\npath: {}",
                 path.display(),
                 summary.revision_id,
+                summary.mime_type,
+                summary.byte_size,
+                summary.revision_id,
+                summary.path,
+            )
+        } else if is_font {
+            format!(
+                "{verb} {} as {} (font asset: families [{}]; {}, {} bytes). It is not an image: reference it from svg_overlay.font_revision_ids and use one of these names in font-family, e.g. {{\"op\": \"svg_overlay\", \"svg_revision_id\": \"rev_...\", \"x\": 0, \"y\": 0, \"render_text\": true, \"font_revision_ids\": [\"{}\"]}}.\npath: {}",
+                path.display(),
+                summary.revision_id,
+                font_families.as_deref().unwrap_or_default().join(", "),
                 summary.mime_type,
                 summary.byte_size,
                 summary.revision_id,
@@ -1535,6 +1849,7 @@ impl AtxTools {
                 source_path: path.to_string_lossy().into_owned(),
                 warnings,
                 already_derived_from,
+                font_families,
             },
             text,
         ))
@@ -1564,22 +1879,59 @@ impl AtxTools {
     // -- 2. inspect_image ---------------------------------------------------
 
     /// revision の寸法・フォーマット・EXIF 要約・色情報・容量を返す(read-only)。
-    pub fn inspect_image(&self, params: &RevisionParams) -> CallToolResult {
+    ///
+    /// `include_exif: true` のときだけ EXIF 全フィールドを `info.exif` に載せる
+    /// (既定で落としているのはプライバシーのため。DESIGN.md §9.15)。
+    pub fn inspect_image(&self, params: &InspectImageParams) -> CallToolResult {
         let revision = tri!(self.store.get_revision(&params.revision_id), store_error);
-        // 画像でない revision(.cube LUT 等)はデコードを試みず、構造化エラーで返す。
+        // 画像でない revision(.cube LUT / SVG / フォント等)はデコードを試みず、
+        // 構造化エラーで返す。
         if !is_raster_image(&revision.mime_type) {
             return not_an_image(&params.revision_id, &revision.mime_type);
         }
         let bytes = tri!(self.store.read_bytes(&params.revision_id), store_error);
-        let info = tri!(atx_core::inspect_bytes(&bytes, &self.limits), atx_error);
+        let info = tri!(
+            atx_core::inspect_bytes_with(&bytes, &self.limits, params.include_exif),
+            atx_error
+        );
         let path = self
             .store
             .abs_path(&revision)
             .to_string_lossy()
             .into_owned();
 
+        // 読みやすさ(sharpness)と同一性(perceptual_hash)はテキストサマリにも
+        // 1 行で出す: 「ぼけているか」「さっきの画像と同じものか」は
+        // structuredContent を読まずに判断できるほうが往復が減る。
+        let mut extra = String::new();
+        if let Some(stats) = &info.stats {
+            extra.push_str(&format!("\nsharpness: {:.1}", stats.sharpness));
+            extra.push_str(
+                " (relative: compare against a known-good capture of the same subject;                  for documents below ~30 usually means motion blur or defocus)",
+            );
+        }
+        if let Some(hash) = &info.perceptual_hash {
+            extra.push_str(&format!(
+                "\nperceptual_hash: {hash} (dHash; compare two with compare_revisions,                  a distance of 5 or less usually means the same picture)"
+            ));
+        }
+        if let Some(entries) = &info.exif {
+            extra.push_str(&format!("\nexif: {} field(s)", entries.len()));
+            if !entries.is_empty() {
+                let head: Vec<String> = entries
+                    .iter()
+                    .take(EXIF_SUMMARY_HEAD)
+                    .map(|e| format!("{}.{}={}", e.ifd, e.tag, e.value))
+                    .collect();
+                extra.push_str(&format!("; first {}: {}", head.len(), head.join(", ")));
+                if entries.len() > head.len() {
+                    extra.push_str(" (see info.exif for the rest)");
+                }
+            }
+        }
+
         let text = format!(
-            "{}: {}x{} {} ({} bytes){}{}\npath: {}",
+            "{}: {}x{} {} ({} bytes){}{}{}\npath: {}",
             params.revision_id,
             info.width,
             info.height,
@@ -1597,6 +1949,7 @@ impl AtxTools {
             } else {
                 ""
             },
+            extra,
             path,
         );
         ok_result(
@@ -1620,13 +1973,11 @@ impl AtxTools {
             return not_an_image(&params.revision_id, &revision.mime_type);
         }
         let bytes = tri!(self.store.read_bytes(&params.revision_id), store_error);
-        let info = tri!(atx_core::inspect_bytes(&bytes, &self.limits), atx_error);
-        let image = tri!(
-            image::load_from_memory(&bytes).map_err(|e| AtxError::Decode(e.to_string())),
-            atx_error
-        );
         // atx-core はデコード時に必ず Orientation を正規化する。検出も同じ向きで行う。
-        let image = apply_orientation(image, info.exif_orientation.unwrap_or(1));
+        // `decode_oriented` は limits 検査つきで「デコード + 向き正規化」だけを行う
+        // (`inspect_bytes` を通すと、使わない stats / sharpness / dHash のために
+        // 全画素を数回走ってしまう)。
+        let image = tri!(atx_core::decode_oriented(&bytes, &self.limits), atx_error);
 
         let detect_params = DetectParams {
             max_abs_angle: params
@@ -1726,14 +2077,9 @@ impl AtxTools {
             return not_an_image(&params.revision_id, &revision.mime_type);
         }
         let bytes = tri!(self.store.read_bytes(&params.revision_id), store_error);
-        let info = tri!(atx_core::inspect_bytes(&bytes, &self.limits), atx_error);
-        let image = tri!(
-            image::load_from_memory(&bytes).map_err(|e| AtxError::Decode(e.to_string())),
-            atx_error
-        );
         // atx-core はデコード時に必ず Orientation を正規化する。検出も同じ向きで行う
         // (返す quad は apply_transform の最初の op が見る座標系)。
-        let image = apply_orientation(image, info.exif_orientation.unwrap_or(1));
+        let image = tri!(atx_core::decode_oriented(&bytes, &self.limits), atx_error);
 
         let detect_params = DocumentParams {
             min_area_ratio,
@@ -1763,6 +2109,108 @@ impl AtxTools {
         ok_result(
             text,
             &DetectDocumentOutput {
+                revision_id: params.revision_id.clone(),
+                detection,
+            },
+        )
+    }
+
+    // -- 3c. detect_text_blocks ---------------------------------------------
+
+    /// 文字らしいブロック(見出し・段落)を読み順に返す(read-only、適用はしない)。
+    ///
+    /// 「この画像の文字は今のプレビュー寸法で読めるのか、帯に割るならどこで割るのか」を
+    /// 1 回で答えるためのツール(DESIGN.md §9.15)。`legibility.recommended_bands[i]` は
+    /// そのまま `crop` op としてレシピに貼れる。
+    pub fn detect_text_blocks(&self, params: &DetectTextBlocksParams) -> CallToolResult {
+        let defaults = TextBlockParams::default();
+        // 範囲外は「有効範囲を含む構造化エラー」で返す(エラーは教師である)。
+        let max_blocks = match params.max_blocks {
+            None => defaults.max_blocks,
+            Some(v) if (MAX_TEXT_BLOCKS_MIN..=MAX_TEXT_BLOCKS_MAX).contains(&v) => v,
+            Some(v) => {
+                return tool_error(
+                    "invalid_max_blocks",
+                    format!(
+                        "max_blocks must be within {MAX_TEXT_BLOCKS_MIN}..={MAX_TEXT_BLOCKS_MAX}, got {v}"
+                    ),
+                    serde_json::json!({
+                        "given": v,
+                        "min": MAX_TEXT_BLOCKS_MIN,
+                        "max": MAX_TEXT_BLOCKS_MAX,
+                        "default": defaults.max_blocks,
+                        "recovery": "call detect_text_blocks again with max_blocks omitted (defaults to 32) or a value inside the valid range",
+                    }),
+                )
+            }
+        };
+        let min_block_area_ratio = match params.min_block_area_ratio {
+            None => defaults.min_block_area_ratio,
+            Some(v)
+                if v.is_finite()
+                    && (MIN_BLOCK_AREA_RATIO_MIN..=MIN_BLOCK_AREA_RATIO_MAX).contains(&v) =>
+            {
+                v
+            }
+            Some(v) => {
+                return tool_error(
+                    "invalid_min_block_area_ratio",
+                    format!(
+                        "min_block_area_ratio must be within {MIN_BLOCK_AREA_RATIO_MIN}..={MIN_BLOCK_AREA_RATIO_MAX}, got {v}"
+                    ),
+                    serde_json::json!({
+                        "given": v,
+                        "min": MIN_BLOCK_AREA_RATIO_MIN,
+                        "max": MIN_BLOCK_AREA_RATIO_MAX,
+                        "default": defaults.min_block_area_ratio,
+                        "recovery": "call detect_text_blocks again with min_block_area_ratio omitted (defaults to 0.00005) or a value inside the valid range",
+                    }),
+                )
+            }
+        };
+
+        let revision = tri!(self.store.get_revision(&params.revision_id), store_error);
+        // 画像でない revision(.cube LUT / SVG / フォント等)は detect_document と同じ
+        // 構造化エラー。
+        if !is_raster_image(&revision.mime_type) {
+            return not_an_image(&params.revision_id, &revision.mime_type);
+        }
+        let bytes = tri!(self.store.read_bytes(&params.revision_id), store_error);
+        // detect_tilt / detect_document と同じく、EXIF Orientation 正規化後の画像で検出する
+        // (返す rect は apply_transform の最初の op が見る座標系)。
+        let image = tri!(atx_core::decode_oriented(&bytes, &self.limits), atx_error);
+
+        let detect_params = TextBlockParams {
+            max_blocks,
+            min_block_area_ratio,
+            ..defaults
+        };
+        let detection = atx_geometry::detect_text_blocks(&image, &detect_params);
+
+        let text = match (&detection.median_line_height_px, &detection.legibility) {
+            (Some(line_height), Some(legibility)) => {
+                let bands = legibility.recommended_bands.len();
+                let plan = if bands <= 1 {
+                    "large enough to read in one pass: render_preview with long_edge 1568"
+                        .to_string()
+                } else {
+                    format!(
+                        "read in {bands} bands - paste legibility.recommended_bands[i] as a crop op before render_preview long_edge 1568"
+                    )
+                };
+                format!(
+                    "{}: {} text-like block(s) (covering {:.0}% of the frame), median line height {line_height}px = {:.0}px at long_edge 1568: {plan}",
+                    params.revision_id,
+                    detection.blocks.len(),
+                    detection.text_like_area_ratio * 100.0,
+                    legibility.line_height_at_1568_px,
+                )
+            }
+            _ => format!("{}: no text-like regions found", params.revision_id,),
+        };
+        ok_result(
+            text,
+            &DetectTextBlocksOutput {
                 revision_id: params.revision_id.clone(),
                 detection,
             },
@@ -1848,7 +2296,9 @@ impl AtxTools {
         if !presets.is_empty() {
             // 実運用 FB: 名前と1行説明だけでは「中身が見えない」ので敬遠された。
             // op タグを → でつないだ骨組みだけ添える(パラメータは explain_operation 側)。
-            text.push_str("\nPresets (pass preset=<name> instead of recipe):");
+            text.push_str(
+                "\nPresets (pass preset=<name> instead of recipe, or inline one inside a recipe with {\"op\":\"preset\",\"name\":\"...\"} - see explain_operation \"preset\"):",
+            );
             for preset in &presets {
                 text.push_str(&format!(
                     "\n- {} — {}: {}",
@@ -1881,6 +2331,10 @@ impl AtxTools {
         let trimmed = params.operation.trim();
         let doc = if trimmed == crate::vocab::LAYERS_DOC.name {
             &crate::vocab::LAYERS_DOC
+        } else if trimmed == PRESET_MACRO_OP {
+            // プリセットマクロは MCP 層だけの糖衣なので OPERATIONS 表には入れず、
+            // ここで別経路で説明する(unknown 扱いにはしない)。
+            &PRESET_MACRO_DOC
         } else {
             match crate::vocab::find(trimmed) {
                 Some(doc) => doc,
@@ -1989,14 +2443,9 @@ impl AtxTools {
             self.store.read_bytes(&params.reference_revision_id),
             store_error
         );
-        let info = tri!(atx_core::inspect_bytes(&bytes, &self.limits), atx_error);
-        let image = tri!(
-            image::load_from_memory(&bytes).map_err(|e| AtxError::Decode(e.to_string())),
-            atx_error
-        );
         // atx-core はデコード時に必ず Orientation を焼き込むので、マスクも同じ向き
         // ・同じ寸法(= 実効寸法)で作る。そうでないと op 側で寸法が食い違う。
-        let image = apply_orientation(image, info.exif_orientation.unwrap_or(1)).to_rgb8();
+        let image = tri!(atx_core::decode_oriented(&bytes, &self.limits), atx_error).to_rgb8();
 
         let rendered = spec.render(&image);
         let (width, height) = rendered.dimensions();
@@ -2072,11 +2521,15 @@ impl AtxTools {
     /// 冪等ショートサーキットは revision ごとに個別に効き、1件の失敗では
     /// バッチを止めずにその要素へ error を入れる。
     pub fn apply_transform(&self, params: &TransformParams) -> CallToolResult {
-        let recipe = match resolve_recipe(params.recipe.as_ref(), params.preset.as_deref()) {
-            Ok(recipe) => recipe,
-            Err(result) => return result,
-        };
-        tri!(atx_core::recipe::validate(&recipe), atx_error);
+        let (recipe, expansions) =
+            match resolve_recipe(params.recipe.as_ref(), params.preset.as_deref()) {
+                Ok(resolved) => resolved,
+                Err(result) => return result,
+            };
+        // validate エラーは展開後の添字を指すので、マクロ由来なら展開元プリセット名を添える。
+        if let Err(e) = atx_core::recipe::validate(&recipe) {
+            return expansions.annotate(atx_error(e));
+        }
         let recipe_hash = tri!(atx_core::recipe_hash(&recipe), atx_error);
 
         match (params.revision_id.as_deref(), params.revision_ids.as_deref()) {
@@ -2351,11 +2804,14 @@ impl AtxTools {
     /// `apply_transform` と同等の画素処理コストがかかる。
     /// 代わりに「プレビューで見た構図 = 本適用の構図」が厳密に一致する。
     pub fn render_preview(&self, params: &RenderPreviewParams) -> CallToolResult {
-        let recipe = match resolve_recipe(params.recipe.as_ref(), params.preset.as_deref()) {
-            Ok(recipe) => recipe,
-            Err(result) => return result,
-        };
-        tri!(atx_core::recipe::validate(&recipe), atx_error);
+        let (recipe, expansions) =
+            match resolve_recipe(params.recipe.as_ref(), params.preset.as_deref()) {
+                Ok(resolved) => resolved,
+                Err(result) => return result,
+            };
+        if let Err(e) = atx_core::recipe::validate(&recipe) {
+            return expansions.annotate(atx_error(e));
+        }
         if let Some(overlay) = params.overlay.as_deref() {
             if !OVERLAY_VALUES.contains(&overlay) {
                 return tool_error(
@@ -2487,8 +2943,9 @@ impl AtxTools {
         );
         let path = path.to_string_lossy().into_owned();
 
+        let estimated_vision_tokens = estimated_vision_tokens(output.width, output.height);
         let text = format!(
-            "Preview of {} with this {}recipe: {}x{} jpeg ({} bytes, long edge <= {}).{} This is a downscaled proof; call apply_transform with the same recipe for the full-resolution revision.{}\npath: {}",
+            "Preview of {} with this {}recipe: {}x{} jpeg ({} bytes, long edge <= {}) (~{estimated_vision_tokens} vision tokens).{} This is a downscaled proof; call apply_transform with the same recipe for the full-resolution revision.{}\npath: {}",
             params.revision_id,
             preset_note(params.preset.as_deref()),
             output.width,
@@ -2524,6 +2981,7 @@ impl AtxTools {
                 height: output.height,
                 byte_size: final_bytes.len() as u64,
                 mime_type: output.mime_type,
+                estimated_vision_tokens,
                 warnings: output.warnings,
                 overlay: params.overlay.clone(),
                 mask_revision_id,
@@ -2571,8 +3029,20 @@ impl AtxTools {
             atx_error
         );
 
+        // 知覚ハッシュ距離は全 layout で返す(「同じ絵か」は並べ方と無関係な問い)。
+        // 縮小前の画素で計算する: dHash は自前で 9x8 に潰すので、
+        // プレビュー用の縮小を先に掛けると結果が縮小の丸めに依存してしまう。
+        let perceptual_hash_distance = perceptual_distance(&img_a, &img_b);
+
         if params.layout == CompareLayout::Diff {
-            return self.compare_revisions_diff(params, &rev_a, &rev_b, img_a, img_b);
+            return self.compare_revisions_diff(
+                params,
+                &rev_a,
+                &rev_b,
+                img_a,
+                img_b,
+                perceptual_hash_distance,
+            );
         }
 
         let scaled_a = scale_contain(img_a, COMPARE_LONG_EDGE).to_rgb8();
@@ -2642,6 +3112,10 @@ impl AtxTools {
             composed_bytes.len(),
             path,
         );
+        let text = match perceptual_hash_distance {
+            Some(d) => format!("{text}\nhash distance {d} {}", hash_distance_hint(d)),
+            None => text,
+        };
         let image_block = ContentBlock::image(
             base64::engine::general_purpose::STANDARD.encode(&composed_bytes),
             "image/jpeg",
@@ -2662,6 +3136,8 @@ impl AtxTools {
                 mean_abs_diff: None,
                 max_abs_diff: None,
                 changed_pixel_ratio: None,
+                perceptual_hash_distance,
+                ssim: None,
             },
             vec![image_block],
         )
@@ -2682,6 +3158,7 @@ impl AtxTools {
         rev_b: &AssetRevision,
         img_a: image::DynamicImage,
         img_b: image::DynamicImage,
+        perceptual_hash_distance: Option<u32>,
     ) -> CallToolResult {
         let full_a = img_a.to_rgb8();
         let full_b = img_b.to_rgb8();
@@ -2708,6 +3185,21 @@ impl AtxTools {
 
         let (heatmap, mean_abs_diff, max_abs_diff, changed_pixel_ratio) =
             diff_heatmap(&full_a, &full_b);
+        // SSIM は寸法一致が前提なので diff レイアウトでだけ計算できる。
+        // グレー化は atx-core の輝度定義(`gray_from_rgb8`)で行う:
+        // `image` の `to_luma8()` は丸めが違うので混ぜると値が揺れる。
+        // RGB8 バッファを直接渡す(以前はフル解像度を clone して RGBA8 へ広げていたが、
+        // 輝度は R/G/B からだけ作るのでアルファ列は 1 ビットも使われていなかった)。
+        let ssim = {
+            let (w, h) = full_a.dimensions();
+            match (
+                atx_core::similarity::gray_from_rgb8(full_a.as_raw(), w, h),
+                atx_core::similarity::gray_from_rgb8(full_b.as_raw(), w, h),
+            ) {
+                (Some(ga), Some(gb)) => atx_core::ssim_gray(&ga, &gb),
+                _ => None,
+            }
+        };
         let canvas =
             scale_contain(image::DynamicImage::ImageRgb8(heatmap), COMPARE_LONG_EDGE).to_rgb8();
         let (cw, ch) = canvas.dimensions();
@@ -2759,6 +3251,15 @@ impl AtxTools {
             side_b.byte_size,
             composed_bytes.len(),
         );
+        let mut text = text;
+        if let Some(d) = perceptual_hash_distance {
+            text.push_str(&format!("\nhash distance {d} {}", hash_distance_hint(d)));
+        }
+        if let Some(v) = ssim {
+            text.push_str(&format!(
+                "\nSSIM {v:.4} (1.0 = identical; above ~0.98 the difference is usually invisible, below ~0.9 it is a visible change)"
+            ));
+        }
         let image_block = ContentBlock::image(
             base64::engine::general_purpose::STANDARD.encode(&composed_bytes),
             "image/jpeg",
@@ -2780,6 +3281,8 @@ impl AtxTools {
                 mean_abs_diff: Some(mean_abs_diff),
                 max_abs_diff: Some(max_abs_diff),
                 changed_pixel_ratio: Some(changed_pixel_ratio),
+                perceptual_hash_distance,
+                ssim,
             },
             vec![image_block],
         )
@@ -2832,44 +3335,329 @@ impl AtxTools {
     // -- 7. export_asset ----------------------------------------------------
 
     /// revision をワークスペース外へ書き出す。既存ファイルは `overwrite: true` の明示が必要。
+    ///
+    /// 単数形(`revision_id` + `dest_path`)と複数形(`revision_ids` + `dest_dir`)は排他で、
+    /// どちらか一方が必須。複数形でも各件は単数形とまったく同じ検査
+    /// (DESIGN.md §9.14: ワークスペース内拒否・symlink 拒否・create_new・temp+rename)を通る。
     pub fn export_asset(&self, params: &ExportAssetParams) -> CallToolResult {
-        let revision = tri!(self.store.get_revision(&params.revision_id), store_error);
+        match (params.revision_id.as_deref(), params.revision_ids.as_deref()) {
+            (Some(revision_id), None) => {
+                if params.dest_dir.is_some() || params.filename_template.is_some() {
+                    return export_params_mismatch(
+                        "revision_id",
+                        "dest_dir / filename_template",
+                        "dest_path",
+                    );
+                }
+                let Some(dest_path) = params.dest_path.as_deref() else {
+                    return export_params_mismatch("revision_id", "no dest_path", "dest_path");
+                };
+                let dest = match absolutize(dest_path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return tool_error(
+                            "invalid_dest_path",
+                            format!("cannot resolve dest_path {dest_path:?}: {e}"),
+                            serde_json::json!({ "dest_path": dest_path }),
+                        )
+                    }
+                };
+                match self.export_one(revision_id, &dest, params.overwrite) {
+                    Ok((output, text)) => {
+                        ok_result(text, &ExportResult::Single(Box::new(output)))
+                    }
+                    Err(result) => result,
+                }
+            }
+            (None, Some(revision_ids)) => self.export_batch(revision_ids, params),
+            (Some(_), Some(_)) => tool_error(
+                "revision_id_and_revision_ids_conflict",
+                "revision_id and revision_ids are mutually exclusive, but both were given",
+                serde_json::json!({
+                    "recovery": "pass revision_id + dest_path for one file, or revision_ids + dest_dir for a batch of up to 64, not both",
+                }),
+            ),
+            (None, None) => tool_error(
+                "revision_id_or_revision_ids_required",
+                "one of revision_id (a single file) or revision_ids (a batch of up to 64) is required",
+                serde_json::json!({
+                    "recovery": "pass revision_id = \"rev_...\" with dest_path = \"/abs/out.jpg\", or revision_ids = [\"rev_...\", ...] with dest_dir = \"/abs/dir\"; call list_assets to see the available revision_ids",
+                }),
+            ),
+        }
+    }
 
-        let dest = match absolutize(&params.dest_path) {
+    /// 複数 revision を1つのディレクトリへ書き出す。入力順を保ち、失敗しても続行する。
+    ///
+    /// 書き込みを1件も始める前に、ディレクトリの検査とファイル名の衝突検査を済ませる
+    /// (途中まで書いてから「名前が衝突していた」と分かるのが最悪なので)。
+    fn export_batch(&self, revision_ids: &[String], params: &ExportAssetParams) -> CallToolResult {
+        if params.dest_path.is_some() {
+            return export_params_mismatch("revision_ids", "dest_path", "dest_dir");
+        }
+        if let Err(result) = check_batch_size(revision_ids.len(), "revision_ids") {
+            return result;
+        }
+        let Some(dest_dir) = params.dest_dir.as_deref() else {
+            return export_params_mismatch("revision_ids", "no dest_dir", "dest_dir");
+        };
+        let template = params
+            .filename_template
+            .as_deref()
+            .unwrap_or(DEFAULT_FILENAME_TEMPLATE);
+        if let Err(result) = validate_filename_template(template) {
+            return result;
+        }
+
+        let dir = match absolutize(dest_dir) {
             Ok(p) => p,
             Err(e) => {
                 return tool_error(
                     "invalid_dest_path",
-                    format!("cannot resolve dest_path {:?}: {e}", params.dest_path),
-                    serde_json::json!({ "dest_path": params.dest_path }),
+                    format!("cannot resolve dest_dir {dest_dir:?}: {e}"),
+                    serde_json::json!({ "dest_dir": dest_dir }),
                 )
             }
         };
-
-        // ワークスペース root 配下への書き込みは**一律に**拒否する。
-        // objects / previews だけでなく台帳(assets.jsonl)も、将来増えるファイルも同じ:
-        // 不変ストアの管理領域へ export するのが正当なケースは存在しない。
-        //
-        // 比較は**両側を canonicalize してから**行う: macOS の /tmp は
-        // /private/tmp へのシンボリックリンクなので、文字列比較だけでは
-        // シンボリックリンク経由のパスが素通りしてしまう。
-        let ws_root = real_prefix(self.store.root());
-        let dest_real = real_prefix(&dest);
-        if dest_real.starts_with(&ws_root) {
+        if let Err(result) = self.check_dest_inside_workspace(&dir, "dest_dir") {
+            return result;
+        }
+        let dir_meta = std::fs::symlink_metadata(&dir).ok();
+        if dir_meta
+            .as_ref()
+            .is_some_and(|m| m.file_type().is_symlink())
+        {
             return tool_error(
-                "dest_inside_workspace",
+                "dest_is_symlink",
                 format!(
-                    "{} is inside the immutable workspace store; exporting there is not allowed",
-                    dest.display()
+                    "{} is a symbolic link; exporting through a link is not allowed",
+                    dir.display()
                 ),
                 serde_json::json!({
-                    "dest_path": dest.to_string_lossy(),
-                    "resolved_dest_path": dest_real.to_string_lossy(),
-                    "workspace": ws_root.to_string_lossy(),
-                    "recovery": "choose a destination outside the workspace directory entirely (objects/, previews/ and the assets.jsonl ledger all live there)",
+                    "dest_dir": dir.to_string_lossy(),
+                    "recovery": "pass the real directory path you want to write into (not a symbolic link), or remove the link first",
                 }),
             );
         }
+        match dir_meta {
+            None => {
+                return tool_error(
+                    "dest_dir_missing",
+                    format!("directory {} does not exist", dir.display()),
+                    serde_json::json!({
+                        "dest_dir": dir.to_string_lossy(),
+                        "recovery": "create the directory first, or pass an existing one",
+                    }),
+                )
+            }
+            Some(meta) if !meta.is_dir() => {
+                return tool_error(
+                    "dest_dir_not_a_directory",
+                    format!("{} is not a directory", dir.display()),
+                    serde_json::json!({
+                        "dest_dir": dir.to_string_lossy(),
+                        "recovery": "pass a directory for dest_dir (use revision_id + dest_path to write a single file)",
+                    }),
+                )
+            }
+            Some(_) => {}
+        }
+
+        // --- 書き込み前: ファイル名を全件組み立て、衝突を検出する ---
+        //
+        // 台帳(assets.jsonl)の走査はここで **1 回だけ**行い、revision の取得も
+        // `{stem}` の系譜辿りもこの写像の中で済ませる。以前は 1 件ごとに
+        // `get_revision` が、さらに `{stem}` の有無に関わらず系譜の 1 段ごとに
+        // もう 1 回、台帳を全走査していた。
+        let ledger = match self.store.list_revisions(None) {
+            Ok(ledger) => ledger,
+            Err(e) => return store_error(e),
+        };
+        let by_id: BTreeMap<&str, &AssetRevision> =
+            ledger.iter().map(|r| (r.revision_id.as_str(), r)).collect();
+
+        let width = revision_ids.len().to_string().len();
+        let mut planned: Vec<(String, String)> = Vec::new(); // (revision_id, file name)
+        let mut failed: Vec<BatchFailure> = Vec::new();
+        for (i, revision_id) in revision_ids.iter().enumerate() {
+            let Some(revision) = by_id.get(revision_id.as_str()).copied() else {
+                failed.push(BatchFailure {
+                    path: revision_id.clone(),
+                    error: error_info(&store_error(StoreError::RevisionNotFound(
+                        revision_id.clone(),
+                    ))),
+                });
+                continue;
+            };
+            let name = match render_filename(template, revision, i + 1, width, &by_id) {
+                Ok(name) => name,
+                Err(result) => return result,
+            };
+            planned.push((revision_id.clone(), name));
+        }
+        let mut seen: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (revision_id, name) in &planned {
+            seen.entry(name.as_str()).or_default().push(revision_id);
+        }
+        let duplicates: Vec<(&&str, &Vec<&str>)> =
+            seen.iter().filter(|(_, ids)| ids.len() > 1).collect();
+        if !duplicates.is_empty() {
+            let listed: Vec<String> = duplicates
+                .iter()
+                .map(|(name, ids)| format!("{name} ({})", ids.join(", ")))
+                .collect();
+            return tool_error(
+                "filename_collision",
+                format!(
+                    "filename_template {template:?} maps more than one revision to the same file name: {}",
+                    listed.join("; ")
+                ),
+                serde_json::json!({
+                    "filename_template": template,
+                    "duplicates": duplicates.iter().map(|(name, ids)| serde_json::json!({ "file_name": name, "revision_ids": ids })).collect::<Vec<_>>(),
+                    "recovery": format!("include {{revision_id}} or {{index}} in filename_template so every entry gets its own name (nothing was written; the default is {DEFAULT_FILENAME_TEMPLATE:?})"),
+                }),
+            );
+        }
+
+        // --- 書き込み: 各件は単数形とまったく同じ経路(§9.14 の全検査)を通る ---
+        let mut exported: Vec<ExportEntry> = Vec::new();
+        for (revision_id, name) in &planned {
+            match self.export_one(revision_id, &dir.join(name), params.overwrite) {
+                Ok((output, _)) => exported.push(output),
+                Err(result) => failed.push(BatchFailure {
+                    path: revision_id.clone(),
+                    error: error_info(&result),
+                }),
+            }
+        }
+
+        if exported.is_empty() {
+            let listed: Vec<String> = failed
+                .iter()
+                .map(|f| format!("- {}: [{}] {}", f.path, f.error.code, f.error.message))
+                .collect();
+            return tool_error(
+                "export_failed",
+                format!(
+                    "all {} exports failed:\n{}",
+                    failed.len(),
+                    listed.join("\n")
+                ),
+                serde_json::json!({
+                    "failed": failed,
+                    "dest_dir": dir.to_string_lossy(),
+                    "recovery": "fix the revision_ids or the destination above and call export_asset again; call list_assets to see the available revision_ids",
+                }),
+            );
+        }
+
+        let overwritten = exported.iter().filter(|e| e.overwritten).count();
+        let mut text = format!(
+            "Exported {} of {} revision(s) to {}{}{}",
+            exported.len(),
+            revision_ids.len(),
+            dir.display(),
+            if overwritten > 0 {
+                format!(" ({overwritten} overwrote an existing file)")
+            } else {
+                String::new()
+            },
+            if failed.is_empty() {
+                String::new()
+            } else {
+                format!(", {} failed", failed.len())
+            },
+        );
+        for entry in &exported {
+            text.push_str(&format!(
+                "\n- {} -> {} ({} bytes){}",
+                entry.revision_id,
+                entry.path,
+                entry.byte_size,
+                if entry.overwritten {
+                    " [overwrote]"
+                } else {
+                    ""
+                },
+            ));
+        }
+        if !failed.is_empty() {
+            text.push_str("\nfailed:");
+            for failure in &failed {
+                text.push_str(&format!(
+                    "\n- {}: [{}] {}",
+                    failure.path, failure.error.code, failure.error.message
+                ));
+            }
+        }
+
+        ok_result(
+            text,
+            &ExportResult::Batch(Box::new(ExportBatchOutput {
+                count: exported.len(),
+                exported,
+                failed,
+                dest_dir: dir.to_string_lossy().into_owned(),
+                filename_template: template.to_string(),
+            })),
+        )
+    }
+
+    /// 書き出し先がワークスペース内なら構造化エラー。
+    ///
+    /// ワークスペース root 配下への書き込みは**一律に**拒否する。
+    /// objects / previews だけでなく台帳(assets.jsonl)も、将来増えるファイルも同じ:
+    /// 不変ストアの管理領域へ export するのが正当なケースは存在しない。
+    ///
+    /// 比較は**両側を canonicalize してから**行う: macOS の /tmp は
+    /// /private/tmp へのシンボリックリンクなので、文字列比較だけでは
+    /// シンボリックリンク経由のパスが素通りしてしまう。
+    fn check_dest_inside_workspace(&self, dest: &Path, field: &str) -> Result<(), CallToolResult> {
+        let ws_root = real_prefix(self.store.root());
+        let dest_real = real_prefix(dest);
+        if !dest_real.starts_with(&ws_root) {
+            return Ok(());
+        }
+        Err(tool_error(
+            "dest_inside_workspace",
+            format!(
+                "{} is inside the immutable workspace store; exporting there is not allowed",
+                dest.display()
+            ),
+            serde_json::json!({
+                field: dest.to_string_lossy(),
+                "resolved_dest_path": dest_real.to_string_lossy(),
+                "workspace": ws_root.to_string_lossy(),
+                "recovery": "choose a destination outside the workspace directory entirely (objects/, previews/ and the assets.jsonl ledger all live there)",
+            }),
+        ))
+    }
+
+    /// 1 revision を1つの絶対パスへ書き出す。成功なら `(structuredContent, テキストサマリ)`、
+    /// 失敗なら単一呼び出しがそのまま返せる構造化エラー。
+    ///
+    /// DESIGN.md §9.14 の検査順(ワークスペース内 → symlink → 既存 → ディレクトリ →
+    /// 親の存在 → create_new / temp+rename)はここに1本化してある。
+    fn export_one(
+        &self,
+        revision_id: &str,
+        dest: &Path,
+        overwrite: bool,
+    ) -> Result<(ExportAssetOutput, String), CallToolResult> {
+        macro_rules! tri {
+            ($expr:expr, $map:expr) => {
+                match $expr {
+                    Ok(v) => v,
+                    Err(e) => return Err($map(e)),
+                }
+            };
+        }
+
+        let revision = tri!(self.store.get_revision(revision_id), store_error);
+        let dest = dest.to_path_buf();
+
+        self.check_dest_inside_workspace(&dest, "dest_path")?;
 
         // 書き出し先そのものがシンボリックリンクなら拒否する(セキュリティ点検、DESIGN.md §9.14)。
         // リンク先が存在しない(宙ぶらりんの)リンクは `exists()` が false になり、
@@ -2882,7 +3670,7 @@ impl AtxTools {
             .as_ref()
             .is_some_and(|m| m.file_type().is_symlink())
         {
-            return tool_error(
+            return Err(tool_error(
                 "dest_is_symlink",
                 format!(
                     "{} is a symbolic link; exporting through a link is not allowed",
@@ -2892,12 +3680,12 @@ impl AtxTools {
                     "dest_path": dest.to_string_lossy(),
                     "recovery": "pass the real file path you want to write (not a symbolic link), or remove the link first",
                 }),
-            );
+            ));
         }
 
         let exists = dest_meta.is_some();
-        if exists && !params.overwrite {
-            return tool_error(
+        if exists && !overwrite {
+            return Err(tool_error(
                 "dest_exists",
                 format!(
                     "{} already exists; refusing to overwrite it",
@@ -2907,29 +3695,29 @@ impl AtxTools {
                     "dest_path": dest.to_string_lossy(),
                     "recovery": "ask the user to confirm, then call export_asset again with overwrite=true, or pick a different dest_path",
                 }),
-            );
+            ));
         }
         if exists && dest.is_dir() {
-            return tool_error(
+            return Err(tool_error(
                 "dest_is_directory",
                 format!("{} is a directory", dest.display()),
                 serde_json::json!({ "dest_path": dest.to_string_lossy(), "recovery": "pass a full file path including the file name" }),
-            );
+            ));
         }
         if let Some(parent) = dest.parent() {
             if !parent.exists() {
-                return tool_error(
+                return Err(tool_error(
                     "dest_parent_missing",
                     format!("directory {} does not exist", parent.display()),
                     serde_json::json!({
                         "dest_path": dest.to_string_lossy(),
                         "recovery": "create the directory first, or choose an existing one",
                     }),
-                );
+                ));
             }
         }
 
-        let bytes = tri!(self.store.read_bytes(&params.revision_id), store_error);
+        let bytes = tri!(self.store.read_bytes(revision_id), store_error);
         tri!(write_export(&dest, &bytes, exists), |e: std::io::Error| {
             tool_error(
                 "io_error",
@@ -2941,7 +3729,7 @@ impl AtxTools {
         let path = dest.to_string_lossy().into_owned();
         let text = format!(
             "Exported {} ({}x{} {}, {} bytes) to {}{}",
-            params.revision_id,
+            revision_id,
             revision.width,
             revision.height,
             revision.mime_type,
@@ -2953,15 +3741,15 @@ impl AtxTools {
                 ""
             },
         );
-        ok_result(
-            text,
-            &ExportAssetOutput {
-                revision_id: params.revision_id.clone(),
+        Ok((
+            ExportAssetOutput {
+                revision_id: revision_id.to_string(),
                 path,
                 byte_size: bytes.len() as u64,
                 overwritten: exists,
             },
-        )
+            text,
+        ))
     }
 
     // -- helpers ------------------------------------------------------------
@@ -2994,10 +3782,270 @@ fn fmt_angle(a: Option<f64>) -> String {
 /// `recipe_hash`(= 冪等キー)は**解決後のレシピ**に対して計算される。
 /// したがって `preset: "web_optimize"` と、その中身をそのまま書いた生レシピは
 /// 同じ revision に落ちる。
+/// プリセットマクロ(`{"op":"preset","name":"..."}`)1件の展開跡。
+///
+/// 展開後のレシピは core にとっては「ただの op 列」なので、validate エラーの位置
+/// (`operations[5]` 等)がどのマクロ由来なのかは core からは分からない。
+/// 展開時にこの対応表を残しておき、エラーメッセージに展開元のプリセット名を付け直す。
+#[derive(Debug, Clone)]
+struct PresetExpansion {
+    /// 展開した配列の位置。`"operations"` または `"layers[<j>].ops"`。
+    path: String,
+    /// 展開後の添字範囲(`start..end`)。
+    start: usize,
+    end: usize,
+    /// 展開元のプリセット名。
+    name: String,
+}
+
+/// 1レシピ分の展開跡(マクロを使っていなければ空)。
+#[derive(Debug, Clone, Default)]
+struct PresetExpansions(Vec<PresetExpansion>);
+
+impl PresetExpansions {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// エラーメッセージが指す位置が展開範囲の中なら、展開元プリセット名を教える。
+    fn preset_at(&self, path: &str, index: usize) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|e| e.path == path && (e.start..e.end).contains(&index))
+            .map(|e| e.name.as_str())
+    }
+
+    /// 構造化エラーの message 末尾に ` (expanded from preset "<name>")` を付け直す。
+    ///
+    /// 展開後の添字を指すエラー(core の validate / レシピ deserialize)は、
+    /// そのままではエージェントが自分の書いた JSON の中に該当する op を見つけられない。
+    fn annotate(&self, result: CallToolResult) -> CallToolResult {
+        if self.is_empty() {
+            return result;
+        }
+        let Some(payload) = result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text())
+            .find_map(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok())
+        else {
+            return result;
+        };
+        let error = &payload["error"];
+        let (Some(code), Some(message)) = (error["code"].as_str(), error["message"].as_str())
+        else {
+            return result;
+        };
+        let Some((path, index)) = parse_error_location(message) else {
+            return result;
+        };
+        let Some(name) = self.preset_at(&path, index) else {
+            return result;
+        };
+        let mut details = error["details"].clone();
+        if let Some(object) = details.as_object_mut() {
+            object.insert(
+                "expanded_from_preset".to_string(),
+                serde_json::Value::from(name),
+            );
+        }
+        tool_error(
+            code,
+            format!("{message} (expanded from preset {name:?})"),
+            details,
+        )
+    }
+}
+
+/// エラーメッセージから `(配列の位置, 添字)` を読み取る。
+///
+/// 見る文言は 2 系統ある。どちらも**先頭に前置き**が付く
+/// (`"invalid recipe: "` / `"invalid recipe at "`)ので、位置は文中から探す:
+///
+/// | 出どころ | 例 |
+/// |---|---|
+/// | core の validate(トップレベル) | `invalid recipe: operations[3] (encode): ...` |
+/// | core の validate(レイヤー内) | `invalid recipe: layers[1].ops: operations[0] (blur): ...` |
+/// | core の validate(レイヤー内・直接) | `invalid recipe: layers[1].ops[1] (encode): ...` |
+/// | [`locate_recipe_error`] | `invalid recipe at operations[3].width: ...` / `... at layers[1].ops[0]: ...` |
+///
+/// 返す位置は [`PresetExpansion::path`] と同じ綴り(`"operations"` または
+/// `"layers[<j>].ops"`)。以前は先頭が `layers[` で始まるかどうかで分岐していたため
+/// レイヤー分岐が一度も成立せず、レイヤー内のエラーをトップレベルの添字と
+/// 読み違えていた(無関係なプリセットの名前が付いていた)。
+fn parse_error_location(message: &str) -> Option<(String, usize)> {
+    if let Some(at) = message.find("layers[") {
+        let rest = &message[at + "layers[".len()..];
+        let (layer, rest) = rest.split_once(']')?;
+        // 数字でなければ位置表記ではない(例: 散文中の "layers[...]")。
+        layer.parse::<usize>().ok()?;
+        let rest = rest.strip_prefix(".ops")?;
+        let path = format!("layers[{layer}].ops");
+        // `layers[j].ops[k]` なら直後の添字、`layers[j].ops: operations[k]` なら後者。
+        if let Some(tail) = rest.strip_prefix('[') {
+            let (index, _) = tail.split_once(']')?;
+            return Some((path, index.parse().ok()?));
+        }
+        return Some((path, operations_index(rest)?));
+    }
+    Some(("operations".to_string(), operations_index(message)?))
+}
+
+/// 文中の最初の `operations[<i>]` の添字。
+fn operations_index(message: &str) -> Option<usize> {
+    let at = message.find("operations[")?;
+    let tail = &message[at + "operations[".len()..];
+    let (index, _) = tail.split_once(']')?;
+    index.parse().ok()
+}
+
+/// レシピ JSON の中の `{"op":"preset","name":"<preset>"}` をその場で展開する。
+///
+/// マクロは **MCP 層だけの糖衣**で、atx-core の DSL には存在しない。展開後のレシピで
+/// ハッシュを取るので「マクロで書いたレシピ」「手で展開したレシピ」「`preset` 引数で
+/// 呼んだ場合」の 3 つは同じ revision に落ちる。
+/// `operations[]` と `layers[*].ops[]` の両方を走査する。
+fn expand_preset_macros(value: &mut serde_json::Value) -> Result<PresetExpansions, CallToolResult> {
+    let mut expansions: Vec<PresetExpansion> = Vec::new();
+    let Some(object) = value.as_object_mut() else {
+        return Ok(PresetExpansions(expansions));
+    };
+    if let Some(layers) = object.get_mut("layers").and_then(|l| l.as_array_mut()) {
+        for (j, layer) in layers.iter_mut().enumerate() {
+            if let Some(ops) = layer.get_mut("ops").and_then(|o| o.as_array_mut()) {
+                expand_preset_macros_in(ops, &format!("layers[{j}].ops"), &mut expansions)?;
+            }
+        }
+    }
+    if let Some(ops) = object.get_mut("operations").and_then(|o| o.as_array_mut()) {
+        expand_preset_macros_in(ops, "operations", &mut expansions)?;
+    }
+    Ok(PresetExpansions(expansions))
+}
+
+/// op 配列1本のマクロ展開(splice)。
+fn expand_preset_macros_in(
+    ops: &mut Vec<serde_json::Value>,
+    path: &str,
+    expansions: &mut Vec<PresetExpansion>,
+) -> Result<(), CallToolResult> {
+    if !ops
+        .iter()
+        .any(|op| op.get("op").and_then(|v| v.as_str()) == Some(PRESET_MACRO_OP))
+    {
+        return Ok(());
+    }
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(ops.len());
+    for (i, op) in ops.iter().enumerate() {
+        if op.get("op").and_then(|v| v.as_str()) != Some(PRESET_MACRO_OP) {
+            out.push(op.clone());
+            continue;
+        }
+        let Some(name) = op.get("name").and_then(|v| v.as_str()) else {
+            return Err(tool_error(
+                "preset_macro_missing_name",
+                format!(
+                    "{path}[{i}] is a preset macro but has no \"name\": write {{\"op\": \"preset\", \"name\": \"<preset>\"}}"
+                ),
+                serde_json::json!({
+                    "location": format!("{path}[{i}]"),
+                    "valid_presets": crate::presets::preset_names(),
+                    "recovery": "add \"name\": \"<one of valid_presets>\" to that operation, or drop the macro and write the operations out",
+                }),
+            ));
+        };
+        let preset = match crate::presets::resolve(name) {
+            Ok(preset) => preset,
+            Err(crate::presets::PresetError::Unknown) => return Err(unknown_preset_error(name)),
+            Err(crate::presets::PresetError::Malformed(reason)) => {
+                return Err(preset_malformed_error(name, &reason))
+            }
+        };
+        let (start, end) = inline_preset(name, &preset.recipe, path, i, &mut out)?;
+        expansions.push(PresetExpansion {
+            path: path.to_string(),
+            start,
+            end,
+            name: name.to_string(),
+        });
+    }
+    *ops = out;
+    Ok(())
+}
+
+/// 解決済みプリセットの op 列を `out` の末尾へ差し込み、`(start, end)` を返す。
+///
+/// `layers` を持つプリセットは「レシピまるごと」なので op 列には差し込めない
+/// (差し込めるのは `operations` だけで、レイヤー段は落ちてしまう)。
+fn inline_preset(
+    name: &str,
+    recipe: &TransformRecipe,
+    path: &str,
+    macro_index: usize,
+    out: &mut Vec<serde_json::Value>,
+) -> Result<(usize, usize), CallToolResult> {
+    if recipe.layers.is_some() {
+        return Err(tool_error(
+            "preset_not_inlinable",
+            format!(
+                "preset {name:?} carries a layers stack, so it cannot be inlined as one operation inside {path}"
+            ),
+            serde_json::json!({
+                "preset": name,
+                "location": format!("{path}[{macro_index}]"),
+                "recovery": format!("pass preset=\"{name}\" as the top-level preset instead"),
+            }),
+        ));
+    }
+    let start = out.len();
+    for op in &recipe.operations {
+        match serde_json::to_value(op) {
+            Ok(value) => out.push(value),
+            Err(e) => {
+                return Err(tool_error(
+                    "internal_serialization_failed",
+                    format!("failed to expand preset {name:?}: {e}"),
+                    serde_json::Value::Null,
+                ))
+            }
+        }
+    }
+    Ok((start, out.len()))
+}
+
+/// 未知のプリセット名の構造化エラー(`preset` 引数とマクロで同じ形を使う)。
+fn unknown_preset_error(name: &str) -> CallToolResult {
+    tool_error(
+        "unknown_preset",
+        format!(
+            "unknown preset {name:?}; valid presets are {}",
+            crate::presets::preset_names().join(", ")
+        ),
+        serde_json::json!({
+            "given": name,
+            "valid_values": crate::presets::preset_names(),
+            "recovery": "call list_operations to see the presets with their descriptions, then retry with one of valid_values (or pass a raw recipe instead)",
+        }),
+    )
+}
+
+/// 埋め込みプリセット JSON が壊れている(ビルド時のバグ)場合の構造化エラー。
+fn preset_malformed_error(name: &str, reason: &str) -> CallToolResult {
+    tool_error(
+        "preset_malformed",
+        format!("built-in preset {name:?} could not be parsed: {reason}"),
+        serde_json::json!({
+            "given": name,
+            "reason": reason,
+            "recovery": "this is a server bug; pass an explicit recipe instead",
+        }),
+    )
+}
+
 fn resolve_recipe(
     recipe: Option<&RecipeJson>,
     preset: Option<&str>,
-) -> Result<TransformRecipe, CallToolResult> {
+) -> Result<(TransformRecipe, PresetExpansions), CallToolResult> {
     match (recipe, preset) {
         (Some(_), Some(preset)) => Err(tool_error(
             "recipe_and_preset_conflict",
@@ -3018,30 +4066,22 @@ fn resolve_recipe(
                 "recovery": "pass recipe = {\"operations\": [...]} (call list_operations / explain_operation for the vocabulary), or preset = one of valid_presets",
             }),
         )),
-        (Some(recipe), None) => deserialize_recipe(recipe),
+        // 生レシピ: deserialize の**前に**プリセットマクロを展開する。
+        // 以降(deserialize / validate / hash / 実行)は展開後のレシピしか見ない。
+        (Some(recipe), None) => {
+            let mut value = recipe.0.clone();
+            let expansions = expand_preset_macros(&mut value)?;
+            match deserialize_recipe(&RecipeJson(value)) {
+                Ok(recipe) => Ok((recipe, expansions)),
+                Err(result) => Err(expansions.annotate(result)),
+            }
+        }
         (None, Some(name)) => match crate::presets::resolve(name) {
-            Ok(preset) => Ok(preset.recipe),
-            Err(crate::presets::PresetError::Unknown) => Err(tool_error(
-                "unknown_preset",
-                format!(
-                    "unknown preset {name:?}; valid presets are {}",
-                    crate::presets::preset_names().join(", ")
-                ),
-                serde_json::json!({
-                    "given": name,
-                    "valid_values": crate::presets::preset_names(),
-                    "recovery": "call list_operations to see the presets with their descriptions, then retry with one of valid_values (or pass a raw recipe instead)",
-                }),
-            )),
-            Err(crate::presets::PresetError::Malformed(reason)) => Err(tool_error(
-                "preset_malformed",
-                format!("built-in preset {name:?} could not be parsed: {reason}"),
-                serde_json::json!({
-                    "given": name,
-                    "reason": reason,
-                    "recovery": "this is a server bug; pass an explicit recipe instead",
-                }),
-            )),
+            Ok(preset) => Ok((preset.recipe, PresetExpansions::default())),
+            Err(crate::presets::PresetError::Unknown) => Err(unknown_preset_error(name)),
+            Err(crate::presets::PresetError::Malformed(reason)) => {
+                Err(preset_malformed_error(name, &reason))
+            }
         },
     }
 }
@@ -3169,12 +4209,162 @@ fn check_batch_size(len: usize, field: &str) -> Result<(), CallToolResult> {
     ))
 }
 
+/// 単数形と複数形の引数を混ぜた場合の構造化エラー。
+fn export_params_mismatch(given: &str, wrong: &str, expected: &str) -> CallToolResult {
+    tool_error(
+        "export_params_mismatch",
+        format!("{given} was given with {wrong}; the {given} form takes {expected}"),
+        serde_json::json!({
+            "given": given,
+            "expected": expected,
+            "recovery": "pass revision_id + dest_path (one file), or revision_ids + dest_dir (+ optional filename_template) for a batch",
+        }),
+    )
+}
+
+/// `dest_dir` 内のファイル名テンプレートの既定値。
+pub const DEFAULT_FILENAME_TEMPLATE: &str = "{revision_id}.{ext}";
+
+/// `filename_template` で使えるプレースホルダ。
+const FILENAME_PLACEHOLDERS: [&str; 4] = ["{revision_id}", "{index}", "{ext}", "{stem}"];
+
+/// テンプレートそのものの検査(展開前)。
+///
+/// ファイル名の組み立てにパス区切りを許すと `dest_dir` の外へ書けてしまう
+/// (`"../{revision_id}.{ext}"`)。テンプレートは**1つのファイル名**に限る。
+fn validate_filename_template(template: &str) -> Result<(), CallToolResult> {
+    let reject = |reason: &str| {
+        Err(tool_error(
+            "invalid_filename_template",
+            format!("filename_template {template:?} is not usable: {reason}"),
+            serde_json::json!({
+                "given": template,
+                "reason": reason,
+                "default": DEFAULT_FILENAME_TEMPLATE,
+                "valid_placeholders": FILENAME_PLACEHOLDERS,
+                "recovery": format!("pass a plain file name built from the placeholders (no directories), for example {DEFAULT_FILENAME_TEMPLATE:?}"),
+            }),
+        ))
+    };
+    if template.trim().is_empty() {
+        return reject("it is empty");
+    }
+    if template.contains('/') || template.contains('\\') {
+        return reject("it contains a path separator; the file name must stay inside dest_dir");
+    }
+    if template.contains("..") {
+        return reject("it contains \"..\"; the file name must stay inside dest_dir");
+    }
+    if template.contains('\0') {
+        return reject("it contains a NUL byte");
+    }
+    // 未知のプレースホルダは黙って literal にせず、その場で教える。
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let tail = &rest[open..];
+        let Some(close) = tail.find('}') else {
+            return reject("it has an unclosed \"{\"");
+        };
+        let token = &tail[..=close];
+        if !FILENAME_PLACEHOLDERS.contains(&token) {
+            return reject(&format!("{token} is not a known placeholder"));
+        }
+        rest = &tail[close + 1..];
+    }
+    Ok(())
+}
+
+/// 展開後のファイル名の検査(`{stem}` 等の値が区切りを持ち込まないこと)。
+fn check_file_name(name: &str, template: &str) -> Result<(), CallToolResult> {
+    let bad = name.trim().is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+        || name.contains("..")
+        || name == ".";
+    if !bad {
+        return Ok(());
+    }
+    Err(tool_error(
+        "invalid_filename_template",
+        format!(
+            "filename_template {template:?} expanded to {name:?}, which is not a usable file name"
+        ),
+        serde_json::json!({
+            "given": template,
+            "expanded": name,
+            "default": DEFAULT_FILENAME_TEMPLATE,
+            "valid_placeholders": FILENAME_PLACEHOLDERS,
+            "recovery": "the expanded name must be a single file name (no path separators, no \"..\"); use {revision_id} or {index} instead of {stem} if the source file name is unusual",
+        }),
+    ))
+}
+
+/// ファイル名テンプレートを1件分に展開する。
+///
+/// `{stem}` は**系譜の根**(`source_revision_id` を辿った import 元)の取り込み時
+/// ファイル名の stem。台帳に由来情報が無ければ revision_id を使う。
+/// `by_id` は呼び出し側が 1 回だけ走査した台帳(revision_id → revision)。
+fn render_filename(
+    template: &str,
+    revision: &AssetRevision,
+    index: usize,
+    pad_width: usize,
+    by_id: &BTreeMap<&str, &AssetRevision>,
+) -> Result<String, CallToolResult> {
+    let mut name = template
+        .replace("{revision_id}", &revision.revision_id)
+        .replace("{index}", &format!("{index:0pad_width$}"))
+        .replace("{ext}", ext_for_mime(&revision.mime_type));
+    // 系譜を辿るのはテンプレートが実際に `{stem}` を使うときだけ。
+    if template.contains("{stem}") {
+        name = name.replace("{stem}", &lineage_stem(revision, by_id));
+    }
+    check_file_name(&name, template)?;
+    Ok(name)
+}
+
+/// 系譜の根(import 起点)の元ファイル名の stem。辿れなければ revision_id。
+fn lineage_stem(revision: &AssetRevision, by_id: &BTreeMap<&str, &AssetRevision>) -> String {
+    let mut current = revision;
+    // 系譜は有限だが、台帳が壊れている場合に無限ループしないよう上限を置く。
+    for _ in 0..64 {
+        if let Some(name) = current.origin.get("file_name") {
+            let stem = Path::new(name)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if !stem.is_empty() {
+                return stem;
+            }
+        }
+        let Some(parent) = current.source_revision_id.as_deref() else {
+            break;
+        };
+        match by_id.get(parent) {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    revision.revision_id.clone()
+}
+
 /// テキストサマリ用: プリセット由来なら `"preset \"x\" "` を、生レシピなら空文字を返す。
 fn preset_note(preset: Option<&str>) -> String {
     match preset {
         Some(name) => format!("preset {name:?} "),
         None => String::new(),
     }
+}
+
+/// インライン画像1枚の概算トークン数 `ceil(width * height / 750)`。
+///
+/// Anthropic の vision モデル向けの目安(画素数 / 750)であり、他のホストでは違う。
+/// プレビューの長辺を上げるか帯に分けるかの判断材料として返す。
+fn estimated_vision_tokens(width: u32, height: u32) -> u32 {
+    let pixels = u64::from(width) * u64::from(height);
+    let tokens = pixels.div_ceil(750);
+    u32::try_from(tokens).unwrap_or(u32::MAX)
 }
 
 /// プレビュー用レシピ: encode を落とし、末尾に `resize(contain long_edge) + jpeg` を足す。
@@ -3613,23 +4803,26 @@ fn absolutize(path: &str) -> std::io::Result<PathBuf> {
     Ok(out)
 }
 
-/// EXIF Orientation(1-8)を画素に焼き込む。atx-core のデコード時正規化と同じ規約。
-fn apply_orientation(image: image::DynamicImage, orientation: u16) -> image::DynamicImage {
-    match orientation {
-        2 => image.fliph(),
-        3 => image.rotate180(),
-        4 => image.flipv(),
-        5 => image.rotate90().fliph(),
-        6 => image.rotate90(),
-        7 => image.rotate270().fliph(),
-        8 => image.rotate270(),
-        _ => image,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// レイヤー内の壊れた op は `layers[j].ops[k]` の形で名指しされる
+    /// (以前は `Layer` の serde 名と違う `operations` キーを探していて、レイヤー内の
+    /// 位置特定が一度も効いていなかった)。
+    #[test]
+    fn recipe_error_inside_a_layer_is_located_by_the_ops_key() {
+        let value = serde_json::json!({
+            "operations": [],
+            "layers": [
+                {"source": "base", "ops": []},
+                {"source": "base", "ops": [{"op": "blur", "sigma": 1.0}, {"op": "bogus_op"}]}
+            ]
+        });
+        let err = serde_json::from_value::<TransformRecipe>(value.clone()).unwrap_err();
+        let (location, _message, _did_you_mean) = locate_recipe_error(&value, &err);
+        assert_eq!(location, "layers[1].ops[1]");
+    }
 
     #[test]
     fn preview_recipe_drops_user_encode_and_appends_downscale() {
@@ -3765,6 +4958,124 @@ mod tests {
         assert!(!looks_like_cube(image_path, &[0xFF, 0xD8, 0xFF, 0xE0]));
         assert!(!looks_like_cube(image_path, b"hello world\n"));
         assert!(!looks_like_cube(image_path, b""));
+    }
+
+    /// 構造化エラー([`tool_error`])から code を読む(ユニットテスト用)。
+    fn error_code(result: &CallToolResult) -> String {
+        error_info(result).code
+    }
+
+    /// `layers` を持つプリセットはマクロとして差し込めない。
+    ///
+    /// 現在の埋め込みプリセットに `layers` 持ちは無い(= この経路は将来のための門)ので、
+    /// 差し込み関数を直接呼んで門が閉じていることを固定する。
+    #[test]
+    fn a_preset_with_layers_cannot_be_inlined() {
+        use atx_core::recipe::{Layer, LayerSource};
+
+        let layered = TransformRecipe {
+            operations: vec![Operation::AutoOrient],
+            layers: Some(vec![Layer {
+                source: LayerSource::base(),
+                ops: vec![],
+                mask: None,
+                blend_mode: Default::default(),
+                opacity: 1.0,
+            }]),
+        };
+        let mut out = Vec::new();
+        let err = inline_preset("fake_layered", &layered, "operations", 0, &mut out)
+            .expect_err("a layered preset must be refused");
+        assert_eq!(error_code(&err), "preset_not_inlinable");
+        assert!(out.is_empty(), "nothing may be spliced in on refusal");
+
+        // layers を持たないプリセットは普通に差し込まれる。
+        let flat = TransformRecipe {
+            operations: vec![Operation::AutoOrient, Operation::AutoOrient],
+            layers: None,
+        };
+        let mut out = vec![serde_json::json!({"op": "trim"})];
+        let (start, end) =
+            inline_preset("fake_flat", &flat, "operations", 0, &mut out).expect("must inline");
+        assert_eq!((start, end), (1, 3));
+        assert_eq!(out.len(), 3);
+    }
+
+    /// 展開後の位置を指すエラーから「どのマクロ由来か」を引けること。
+    #[test]
+    fn error_locations_are_mapped_back_to_the_expanded_preset() {
+        let expansions = PresetExpansions(vec![
+            PresetExpansion {
+                path: "operations".to_string(),
+                start: 1,
+                end: 3,
+                name: "web_optimize".to_string(),
+            },
+            PresetExpansion {
+                path: "layers[1].ops".to_string(),
+                start: 0,
+                end: 1,
+                name: "grayscale".to_string(),
+            },
+        ]);
+        assert_eq!(
+            parse_error_location("operations[2] (encode): encode must be the last operation"),
+            Some(("operations".to_string(), 2))
+        );
+        assert_eq!(
+            parse_error_location("layers[1].ops: operations[0] (encode): ..."),
+            Some(("layers[1].ops".to_string(), 0))
+        );
+        assert_eq!(expansions.preset_at("operations", 2), Some("web_optimize"));
+        assert_eq!(expansions.preset_at("operations", 0), None);
+        assert_eq!(expansions.preset_at("layers[1].ops", 0), Some("grayscale"));
+    }
+
+    #[test]
+    fn filename_templates_must_stay_inside_the_destination_directory() {
+        assert!(validate_filename_template(DEFAULT_FILENAME_TEMPLATE).is_ok());
+        assert!(validate_filename_template("{index}-{stem}.{ext}").is_ok());
+        for bad in [
+            "",
+            "   ",
+            "sub/{revision_id}.{ext}",
+            "sub\\{revision_id}.{ext}",
+            "../{revision_id}.{ext}",
+            "{revision_id}\0.{ext}",
+            "{nope}.{ext}",
+            "{revision_id.{ext}",
+        ] {
+            let err = validate_filename_template(bad)
+                .expect_err("{bad:?} must be refused as a file name template");
+            assert_eq!(error_code(&err), "invalid_filename_template", "{bad:?}");
+        }
+        // 展開後に区切りが混ざった場合も同じ code で弾く。
+        let err = check_file_name("../evil.jpg", "{stem}.{ext}").expect_err("must be refused");
+        assert_eq!(error_code(&err), "invalid_filename_template");
+    }
+
+    #[test]
+    fn vision_token_estimate_rounds_up() {
+        // 768x576 = 442,368 px / 750 = 589.8 -> 590
+        assert_eq!(estimated_vision_tokens(768, 576), 590);
+        // 1568x1568 = 2,458,624 px / 750 = 3278.2 -> 3279
+        assert_eq!(estimated_vision_tokens(1568, 1568), 3279);
+        assert_eq!(estimated_vision_tokens(1, 1), 1);
+        assert_eq!(estimated_vision_tokens(0, 0), 0);
+    }
+
+    #[test]
+    fn export_extensions_follow_the_stored_mime_type() {
+        assert_eq!(ext_for_mime("image/jpeg"), "jpg");
+        assert_eq!(ext_for_mime("image/png"), "png");
+        assert_eq!(ext_for_mime("image/webp"), "webp");
+        assert_eq!(ext_for_mime("image/avif"), "avif");
+        assert_eq!(ext_for_mime(CUBE_MIME), "cube");
+        assert_eq!(ext_for_mime(SVG_MIME), "svg");
+        // フォントも表に載っている(二重表をやめて atx-store の 1 本に寄せた結果)。
+        assert_eq!(ext_for_mime(FONT_TTF_MIME), "ttf");
+        assert_eq!(ext_for_mime(FONT_OTF_MIME), "otf");
+        assert_eq!(ext_for_mime("application/octet-stream"), "bin");
     }
 
     #[test]

@@ -16,11 +16,11 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use crate::mask::GenerateMaskParams;
 use crate::tools::{
     ApplyResult, AtxTools, CompareRevisionsOutput, CompareRevisionsParams, DetectDocumentOutput,
-    DetectDocumentParams, DetectTiltOutput, DetectTiltParams, ExplainOperationParams,
-    ExplainResult, ExportAssetOutput, ExportAssetParams, GenerateMaskOutput, ImportAssetParams,
-    ImportResult, InspectOutput, ListAssetsOutput, ListAssetsParams, ListOperationsOutput,
-    ListOperationsParams, RenderPreviewOutput, RenderPreviewParams, RevisionParams,
-    TransformParams,
+    DetectDocumentParams, DetectTextBlocksOutput, DetectTextBlocksParams, DetectTiltOutput,
+    DetectTiltParams, ExplainOperationParams, ExplainResult, ExportAssetParams, ExportResult,
+    GenerateMaskOutput, ImportAssetParams, ImportResult, InspectImageParams, InspectOutput,
+    ListAssetsOutput, ListAssetsParams, ListOperationsOutput, ListOperationsParams,
+    RenderPreviewOutput, RenderPreviewParams, TransformParams,
 };
 
 /// `schema_for_output` の最上位に `type: "object"` を保証した outputSchema。
@@ -59,7 +59,7 @@ Example:
 ]}
 EXIF orientation is always normalized into the pixels at decode time, so auto_orient is an explicit no-op.
 LUT workflow: a .cube 3D LUT is an asset, not an image - import_asset it first, then reference the returned id as {"op": "lut", "lut_revision_id": "rev_...", "strength": 1.0}.
-SVG / watermark workflow: an .svg is a VECTOR asset - import_asset it first, then stamp it as {"op": "svg_overlay", "svg_revision_id": "rev_...", "x": 24, "y": 24, "width": 320, "opacity": 0.25} (x/y = top-left in the CURRENT image; text is never rendered, so convert text to paths first).
+SVG / watermark workflow: an .svg is a VECTOR asset - import_asset it first, then stamp it as {"op": "svg_overlay", "svg_revision_id": "rev_...", "x": 24, "y": 24, "width": 320, "opacity": 0.25} (x/y = top-left in the CURRENT image). <text> is drawn only with "render_text": true, which loads the bundled Roboto plus any font assets you import and list in "font_revision_ids" (CJK needs an imported font); without it <text> is skipped, so convert text to paths.
 Mask workflow (local adjustments): make a grayscale mask revision with generate_mask (or import_asset your own), attach it to any tone/filter operation as "mask": {"revision_id": "rev_...", "invert": false, "feather_px": 0}, and check the coverage with render_preview overlay="mask".
 Layered recipes: a recipe may carry {"layers": [...]} - a bottom-to-top stack composited with the 16 W3C blend modes, after which the top-level operations run once as the finishing pass (resize and encode belong there). Call explain_operation {"operation":"layers"} for the full reference before writing one.
 
@@ -68,7 +68,7 @@ Discovering the vocabulary (the ops are deliberately NOT enumerated in the tool 
 - explain_operation - full parameter table, examples and gotchas for one operation, or the full op list behind a preset name.
 Errors are teachers: an invalid recipe or an unknown name comes back with the valid values and a recovery step, so one round trip is enough to fix it.
 
-Presets: apply_transform and render_preview take either `recipe` (the raw DSL) or `preset` (a built-in named recipe such as web_optimize) - mutually exclusive, exactly one required. A preset is pure sugar: the recipe_hash is computed on the RESOLVED recipe, so a preset call and the equivalent raw recipe land on the same revision.
+Presets: apply_transform and render_preview take either `recipe` (the raw DSL) or `preset` (a built-in named recipe such as web_optimize) - mutually exclusive, exactly one required. A preset is pure sugar: the recipe_hash is computed on the RESOLVED recipe, so a preset call and the equivalent raw recipe land on the same revision. A preset can also be inlined inside a recipe as one operation - {"op": "preset", "name": "ocr_document"} - to combine it with your own ops; it expands in place before anything runs (explain_operation {"operation":"preset"} for the rules).
 
 Recommended flow
 0. list_operations / explain_operation - look up the recipe vocabulary on demand (or pick a preset).
@@ -76,9 +76,10 @@ Recommended flow
 2. inspect_image - dimensions, format, EXIF summary, GPS/PII flag, byte size.
 3. detect_tilt   - read-only tilt candidates with a confidence; a null angle means "do not correct".
 3b. detect_document - read-only: the dominant quadrilateral (paper, screen, whiteboard) as a ready-to-paste perspective op; null means "do not correct".
+3c. detect_text_blocks - read-only: text-like blocks in reading order, the median line height, and crop bands that make the text readable in a preview.
 4. render_preview- run a candidate recipe, get an inline JPEG (long edge 768, up to 1568 via `long_edge`) plus a file path, to check composition cheaply.
 5. apply_transform - run the same recipe at full resolution, producing a new revision (`revision_ids` applies it to up to 64 revisions in one call).
-6. export_asset  - copy a revision out of the workspace (refuses to overwrite unless overwrite=true; ask the user first, and it never writes inside the workspace store).
+6. export_asset  - copy a revision out of the workspace (`revision_ids` + `dest_dir` writes up to 64 at once, named by `filename_template`; refuses to overwrite unless overwrite=true, ask the user first, and it never writes inside the workspace store).
 
 Use list_assets to review the ledger (lineage, recipes, sizes). Every result carries a human-readable text summary with absolute paths plus machine-readable structuredContent; prefer the structured fields for chaining.
 
@@ -86,8 +87,9 @@ Note on ICC: for png/webp/avif encode output any ICC color profile on the source
 
 Reading text in an image (documents, receipts, slides, screenshots)
 1. detect_document - if it returns a quad, paste its `suggested_operation` as the FIRST op of your recipe; a null quad means fall back to detect_tilt + rotate.
-2. apply_transform with a recipe of: the detected perspective op -> trim (drop margins) -> the ocr_document preset's ops (grayscale, auto_levels, unsharp_mask); the preset alone covers only the last part. Do NOT binarize for a vision model - thresholding thins strokes; `threshold` / ocr_binarize are for external OCR engines such as Tesseract.
-3. Read it with render_preview `long_edge: 1568`. A vision model reads a downscaled image, so dropping the margins BEFORE that downscale is what buys pixels per glyph; preview a long document in bands with crop.rect.
+2. apply_transform with a recipe of: the detected perspective op -> {"op": "trim"} (drop margins) -> {"op": "preset", "name": "ocr_document"} - that last entry is the preset macro, which inlines the preset's own ops (grayscale, auto_levels, unsharp_mask) at that position. Do NOT binarize for a vision model - thresholding thins strokes; `threshold` / ocr_binarize are for external OCR engines such as Tesseract.
+3. detect_text_blocks on the rectified revision - if `legibility.line_height_at_1568_px` is under ~16 the whole page is too small to read at once, so paste `legibility.recommended_bands[i]` (already a crop op, in reading order) one band at a time; a single band means one preview is enough.
+4. Read it with render_preview `long_edge: 1568`. A vision model reads a downscaled image, so dropping the margins BEFORE that downscale is what buys pixels per glyph; preview a long document in bands with crop.rect.
 
 Visual verification: render_preview takes an optional `overlay` ("grid" | "thirds" | "horizon", or "mask" with a mask_revision_id); compare_revisions shows two revisions side by side or stacked inline, or layout="diff" (same dimensions) for a difference heatmap plus mean/max/changed-ratio stats."#;
 
@@ -138,7 +140,13 @@ impl AtxServer {
     }
 
     /// Inspect a revision: dimensions, MIME type, byte size, alpha/ICC presence,
-    /// EXIF orientation and summary, and whether GPS (PII) metadata is present.
+    /// EXIF orientation and summary, whether GPS (PII) metadata is present, luma
+    /// statistics, a `sharpness` score (variance of the Laplacian - relative, so compare
+    /// it against a known-good capture rather than an absolute; for documents below ~30
+    /// usually means motion blur or defocus) and a `perceptual_hash` (dHash, 16 hex
+    /// digits) for telling "is this the same picture?" without comparing pixels.
+    /// Set include_exif=true to also get every EXIF field as {ifd, tag, value} entries;
+    /// it is off by default because the full dump can carry GPS coordinates and names.
     #[tool(
         name = "inspect_image",
         output_schema = object_output_schema::<InspectOutput>(),
@@ -152,7 +160,7 @@ impl AtxServer {
     )]
     pub async fn inspect_image(
         &self,
-        Parameters(params): Parameters<RevisionParams>,
+        Parameters(params): Parameters<InspectImageParams>,
     ) -> CallToolResult {
         self.tools.inspect_image(&params)
     }
@@ -207,6 +215,37 @@ impl AtxServer {
         Parameters(params): Parameters<DetectDocumentParams>,
     ) -> CallToolResult {
         self.tools.detect_document(&params)
+    }
+
+    /// Find the text-like blocks (headline, paragraphs, table, caption) of a revision with
+    /// a binarize + run-length smearing + connected-components pass, and report whether the
+    /// text will survive a preview downscale. Read-only: it never modifies the image.
+    /// Blocks come back in reading order (top to bottom, then left to right) in
+    /// post-EXIF-orientation pixel coordinates, each with its line_count,
+    /// median_line_height_px and ink_ratio. `legibility.line_height_at_1568_px` is the
+    /// median line height once the whole image is shrunk to long edge 1568 (below ~16 the
+    /// text is usually unreadable), and `legibility.recommended_bands` splits the image into
+    /// horizontal bands that clear that bar - each entry is already a `crop` operation, so
+    /// paste one into a recipe before render_preview `long_edge: 1568` and read the bands in
+    /// order. Optional `max_blocks` (1..=128, default 32) and `min_block_area_ratio`
+    /// (0.0..=1.0, default 0.00005) bound how many and how small the blocks may be.
+    /// No block found means the image has no text-like structure, not an error.
+    #[tool(
+        name = "detect_text_blocks",
+        output_schema = object_output_schema::<DetectTextBlocksOutput>(),
+        annotations(
+            title = "Detect text blocks",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn detect_text_blocks(
+        &self,
+        Parameters(params): Parameters<DetectTextBlocksParams>,
+    ) -> CallToolResult {
+        self.tools.detect_text_blocks(&params)
     }
 
     /// Compact catalog of the recipe vocabulary: every operation with a one-line
@@ -348,7 +387,11 @@ impl AtxServer {
     /// (side by side, or stacked) with an 8px gap, returned inline as a JPEG. A is placed
     /// left/top, B is placed right/bottom. Useful for before/after or A/B visual checks.
     /// layout="diff" instead requires A and B to share the exact same dimensions and returns
-    /// a single pixel-difference heatmap plus mean_abs_diff/max_abs_diff/changed_pixel_ratio.
+    /// a single pixel-difference heatmap plus mean_abs_diff/max_abs_diff/changed_pixel_ratio
+    /// and an `ssim` score (structural similarity, 1.0 = identical).
+    /// Every layout also reports `perceptual_hash_distance`: the Hamming distance between
+    /// the two dHash values (0..=64), where 5 or less usually means the same picture
+    /// re-encoded or resized and 20 or more means two different pictures.
     #[tool(
         name = "compare_revisions",
         output_schema = object_output_schema::<CompareRevisionsOutput>(),
@@ -386,11 +429,18 @@ impl AtxServer {
         self.tools.list_assets(&params)
     }
 
-    /// Copy a revision's bytes out of the workspace to a destination path.
-    /// Refuses to overwrite an existing file unless overwrite=true (ask the user first).
+    /// Copy revisions' bytes out of the workspace. Pass either `revision_id` + `dest_path`
+    /// (one file) or `revision_ids` + `dest_dir` (a batch of up to 64 into one existing
+    /// directory; one failure does not abort the rest) - exactly one of the two forms.
+    /// For a batch, `filename_template` (default "{revision_id}.{ext}") builds each file
+    /// name from {revision_id} / {index} (1-based, zero-padded) / {ext} (from the MIME type) /
+    /// {stem} (the file name the lineage was imported from); it must be a plain file name,
+    /// and if two entries would collide nothing is written.
+    /// Refuses to overwrite an existing file unless overwrite=true (ask the user first),
+    /// and never writes inside the workspace store or through a symbolic link.
     #[tool(
         name = "export_asset",
-        output_schema = object_output_schema::<ExportAssetOutput>(),
+        output_schema = object_output_schema::<ExportResult>(),
         annotations(
             title = "Export asset",
             read_only_hint = false,

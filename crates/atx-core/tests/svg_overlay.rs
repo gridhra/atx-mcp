@@ -683,3 +683,358 @@ fn golden_svg_overlay_pipeline_sha256() {
         "08cf5c9d53e482d10a7fe7c1d32ce9112ec6f10df25183c1186e4b4b519aa606"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 文字描画(`render_text` + `font_revision_ids`)
+// ---------------------------------------------------------------------------
+//
+// 前提: この op は「同梱書体(Apache-2.0 の Roboto Regular)+ 明示的に渡された
+// font アセット」だけで文字を描き、システムフォントは一切読まない。したがって
+// 以下のテストはインストール済みフォントに依存せず、CI のどのアームでも同じ画素を出す
+// (クロスアームの一致は push 後の CI が最終的な証拠になる)。
+
+/// 64px で "Atx 123" を描くだけの SVG。ラテン文字なので同梱 Roboto だけで足りる。
+const TEXT_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="220" height="80" viewBox="0 0 220 80"><text x="6" y="62" font-size="64" fill="#ffffff">Atx 123</text></svg>"##;
+/// 同梱書体にグリフが無い文字(日本語)を含む SVG。
+const CJK_TEXT_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="220" height="80" viewBox="0 0 220 80"><text x="6" y="62" font-size="48" fill="#ffffff">日本語</text></svg>"##;
+/// `font-family` が DB に無い名前を指す SVG(未知 family のフォールバック確認用)。
+const UNKNOWN_FAMILY_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="220" height="80" viewBox="0 0 220 80"><text x="6" y="62" font-size="64" font-family="Nonexistent" fill="#ffffff">Atx 123</text></svg>"##;
+
+const TEXT_ID: &str = "rev_text_svg";
+const FONT_ID: &str = "rev_font";
+
+/// 同梱書体と同じバイト列。「font アセット経由」の経路を、同梱のみの結果と
+/// 突き合わせて検証するために使う(テスト用の合成フォントは作れないため)。
+const ROBOTO: &[u8] = include_bytes!("../assets/fonts/Roboto-Regular.ttf");
+
+/// 文字入り SVG を貼るレシピ(PNG 出力)。
+fn text_json(extra: &str) -> String {
+    format!(
+        r#"{{"operations":[
+            {{"op":"svg_overlay","svg_revision_id":"{TEXT_ID}","x":0,"y":0{extra}}},
+            {{"op":"encode","format":"png"}}
+        ]}}"#
+    )
+}
+
+fn text_assets(svg: &[u8]) -> MockAssets {
+    MockAssets(HashMap::from([
+        (TEXT_ID.to_string(), svg.to_vec()),
+        (FONT_ID.to_string(), ROBOTO.to_vec()),
+    ]))
+}
+
+/// 白画素(= 描かれた文字)の数。キャンバスはグレーなので白は文字だけ。
+fn white_pixels(img: &RgbaImage) -> usize {
+    img.pixels().filter(|p| p.0 == [255, 255, 255, 255]).count()
+}
+
+/// 既定(`render_text` 省略)は v0.8 の挙動そのまま: 文字は描かれず警告が出る。
+#[test]
+fn render_text_defaults_to_off() {
+    let src = canvas(220, 80, GRAY);
+    let (out, warnings) = run_with_warnings(&src, &text_json(""), &text_assets(TEXT_SVG));
+    assert_eq!(white_pixels(&out), 0, "text must not be drawn by default");
+    assert!(warnings[0].contains("text is not rendered"), "{warnings:?}");
+    // canonical JSON に新フィールドは現れない = 既存レシピの hash は動かない。
+    assert!(!atx_core::canonical_json(&recipe(&text_json("")))
+        .unwrap()
+        .contains("render_text"));
+}
+
+/// `render_text: true` で画素が変わる(文字が描かれる)。
+#[test]
+fn render_text_true_draws_glyphs() {
+    let src = canvas(220, 80, GRAY);
+    let off = run(&src, &text_json(""), &text_assets(TEXT_SVG));
+    let (on, warnings) = run_with_warnings(
+        &src,
+        &text_json(r#","render_text":true"#),
+        &text_assets(TEXT_SVG),
+    );
+    assert!(
+        white_pixels(&on) > 200,
+        "expected glyphs, got {} white pixels",
+        white_pixels(&on)
+    );
+    assert_ne!(off.into_raw(), on.into_raw());
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+/// 同じ入力を 2 回描くとバイト同一(整形・ラスタライズとも決定論的)。
+#[test]
+fn text_rendering_is_byte_identical_across_runs() {
+    let src = encode_png(&canvas(220, 80, GRAY));
+    let r = recipe(&text_json(r#","render_text":true"#));
+    let assets = text_assets(TEXT_SVG);
+    let a = apply_recipe_with_assets(&src, &r, &Limits::default(), &assets).unwrap();
+    let b = apply_recipe_with_assets(&src, &r, &Limits::default(), &assets).unwrap();
+    assert_eq!(sha256_hex(&a.bytes), sha256_hex(&b.bytes));
+}
+
+/// 文字描画のゴールデン(同梱書体で "Atx 123" を 64px、PNG 出力)。
+///
+/// これが CI の macOS arm64 と Linux x86_64 で一致することが、
+/// 「文字の形とアンチエイリアスまで環境に依存しない」ことの実証になる。
+const GOLDEN_SVG_TEXT_SHA256: &str =
+    "6d0efb5585639d23dbd0e854ed7925d654cd9cb1652c5b5ca0d616e28b19c885";
+
+#[test]
+fn golden_svg_text_sha256() {
+    let out = apply_recipe_with_assets(
+        &encode_png(&canvas(220, 80, GRAY)),
+        &recipe(&text_json(r#","render_text":true"#)),
+        &Limits::default(),
+        &text_assets(TEXT_SVG),
+    )
+    .unwrap();
+    assert_eq!((out.width, out.height), (220, 80));
+    assert_eq!(
+        sha256_hex(&out.bytes),
+        GOLDEN_SVG_TEXT_SHA256,
+        "svg text golden moved (a different font, shaper version or rasterizer setting)"
+    );
+}
+
+/// 未知の `font-family` は同梱書体に落ちる(= 既定と同じ画素)。
+/// システムフォントを引かないので「環境によって違う書体」にはならない。
+#[test]
+fn unknown_font_family_falls_back_to_the_bundled_font() {
+    let src = canvas(220, 80, GRAY);
+    let plain = run(
+        &src,
+        &text_json(r#","render_text":true"#),
+        &text_assets(TEXT_SVG),
+    );
+    let unknown = run(
+        &src,
+        &text_json(r#","render_text":true"#),
+        &text_assets(UNKNOWN_FAMILY_SVG),
+    );
+    assert_eq!(plain.into_raw(), unknown.into_raw());
+}
+
+/// font アセットを渡す経路の検証: 同梱書体と同じバイト列を font アセットとして
+/// 渡しても結果は同梱のみと同一(= アセットは読まれ、同じ書体として使われた)。
+#[test]
+fn passing_the_same_font_as_an_asset_changes_nothing() {
+    let src = canvas(220, 80, GRAY);
+    let bundled_only = run(
+        &src,
+        &text_json(r#","render_text":true"#),
+        &text_assets(TEXT_SVG),
+    );
+    let via_asset = run(
+        &src,
+        &text_json(&format!(
+            r#","render_text":true,"font_revision_ids":["{FONT_ID}"]"#
+        )),
+        &text_assets(TEXT_SVG),
+    );
+    assert_eq!(bundled_only.into_raw(), via_asset.into_raw());
+}
+
+/// font ではない revision(ここでは PNG 画像)を `font_revision_ids` に渡すと、
+/// op 位置と添字を名指しする構造化エラーになる。
+#[test]
+fn a_non_font_revision_is_a_structured_error() {
+    let src = canvas(220, 80, GRAY);
+    let assets = MockAssets(HashMap::from([
+        (TEXT_ID.to_string(), TEXT_SVG.to_vec()),
+        (FONT_ID.to_string(), encode_png(&canvas(4, 4, GRAY))),
+    ]));
+    let err = apply_recipe_with_assets(
+        &encode_png(&src),
+        &recipe(&text_json(&format!(
+            r#","render_text":true,"font_revision_ids":["{FONT_ID}"]"#
+        ))),
+        &Limits::default(),
+        &assets,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("operation 0 (svg_overlay) failed"), "{err}");
+    assert!(
+        err.contains(&format!("font_revision_ids[0] {FONT_ID} is not a font")),
+        "{err}"
+    );
+}
+
+/// `font_revision_ids` は 4 本まで。5 本目は validate エラー。
+#[test]
+fn more_than_four_font_assets_is_a_validate_error() {
+    let ids = |n: usize| {
+        (0..n)
+            .map(|i| format!(r#""rev_f{i}""#))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let ok = recipe(&text_json(&format!(
+        r#","render_text":true,"font_revision_ids":[{}]"#,
+        ids(4)
+    )));
+    assert!(atx_core::recipe::validate(&ok).is_ok());
+    let too_many = recipe(&text_json(&format!(
+        r#","render_text":true,"font_revision_ids":[{}]"#,
+        ids(5)
+    )));
+    let err = atx_core::recipe::validate(&too_many)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("at most 4 entries"), "{err}");
+    // "rev_" 始まりでない id も拒否する(アセット参照の共通規約)。
+    let bad = recipe(&text_json(
+        r#","render_text":true,"font_revision_ids":["font1"]"#,
+    ));
+    let err = atx_core::recipe::validate(&bad).unwrap_err().to_string();
+    assert!(
+        err.contains("font_revision_ids[0] must start with"),
+        "{err}"
+    );
+}
+
+/// 新フィールドは canonical JSON に「既定なら現れず、指定すれば現れる」。
+#[test]
+fn text_fields_are_omitted_from_canonical_json_when_default() {
+    let with = recipe(&text_json(
+        r#","render_text":true,"font_revision_ids":["rev_f0"]"#,
+    ));
+    let json = atx_core::canonical_json(&with).unwrap();
+    assert!(json.contains(r#""font_revision_ids":["rev_f0"]"#), "{json}");
+    assert!(json.contains(r#""render_text":true"#), "{json}");
+    // 既定値を明示的に書いても canonical は「省略形」と一致する = hash も同じ。
+    let explicit = recipe(&text_json(r#","render_text":false,"font_revision_ids":[]"#));
+    assert_eq!(
+        atx_core::canonical_json(&explicit).unwrap(),
+        atx_core::canonical_json(&recipe(&text_json(""))).unwrap()
+    );
+}
+
+/// 同梱書体にグリフが無い文字(日本語)は、描画前に数えて警告にする。
+#[test]
+fn missing_glyphs_are_counted_in_a_warning() {
+    let src = canvas(220, 80, GRAY);
+    let (out, warnings) = run_with_warnings(
+        &src,
+        &text_json(r#","render_text":true"#),
+        &text_assets(CJK_TEXT_SVG.as_bytes()),
+    );
+    assert_eq!(
+        warnings,
+        vec![
+            "operations[0] (svg_overlay): svg text uses 3 character(s) with no glyph in the \
+             loaded fonts (import a font asset and pass font_revision_ids)"
+                .to_string()
+        ]
+    );
+    // 依頼した字は出ず、同梱書体の .notdef(いわゆる豆腐の四角)が描かれる。
+    // 「文字化けしている」ことは画素からは判断できないので、上の警告が唯一の手がかりになる。
+    assert!(white_pixels(&out) > 0);
+}
+
+/// `<text>` の孫要素の中の文字もグリフ被覆の検査対象にする。
+///
+/// 以前は `<text>` / `<tspan>` の**直接の**子テキストノードだけを見ていたので、
+/// `<textPath>` / `<a>` / `<tref>` に包まれた文字は 1 文字も検査されず、
+/// 豆腐(.notdef の □)で描かれても警告が 0 件だった。
+#[test]
+fn missing_glyphs_inside_nested_text_children_are_counted() {
+    let src = canvas(220, 80, GRAY);
+    let expected = "operations[0] (svg_overlay): svg text uses 3 character(s) with no glyph in \
+                    the loaded fonts (import a font asset and pass font_revision_ids)";
+
+    for svg in [
+        // <textPath>: 文字はパスに沿って描かれるが、依頼した字は同じ。
+        r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="220" height="80" viewBox="0 0 220 80"><defs><path id="p" d="M6 62 H214"/></defs><text font-size="48" fill="#ffffff"><textPath xlink:href="#p">日本語</textPath></text></svg>"##,
+        // <a>: リンクで包んだ文字。
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="220" height="80" viewBox="0 0 220 80"><text x="6" y="62" font-size="48" fill="#ffffff"><a>日本語</a></text></svg>"##,
+    ] {
+        let (_, warnings) = run_with_warnings(
+            &src,
+            &text_json(r#","render_text":true"#),
+            &text_assets(svg.as_bytes()),
+        );
+        assert_eq!(warnings, vec![expected.to_string()], "svg = {svg}");
+    }
+}
+
+/// `render_text: false` のまま font を渡したら「無視した」と伝える(黙って捨てない)。
+#[test]
+fn fonts_without_render_text_warn_that_they_are_ignored() {
+    let src = canvas(220, 80, GRAY);
+    let (_, warnings) = run_with_warnings(
+        &src,
+        &text_json(&format!(r#","font_revision_ids":["{FONT_ID}"]"#)),
+        &text_assets(TEXT_SVG),
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("font_revision_ids are ignored because render_text is false")),
+        "{warnings:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// validate_font_asset(import_asset の入口)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn validate_font_asset_accepts_the_bundled_roboto() {
+    let info = atx_core::validate_font_asset(ROBOTO).expect("bundled Roboto must validate");
+    assert!(
+        info.families.iter().any(|f| f == "Roboto"),
+        "{:?}",
+        info.families
+    );
+    assert!(info.glyph_count > 100, "{}", info.glyph_count);
+}
+
+#[test]
+fn validate_font_asset_rejects_collections_and_non_fonts() {
+    // .ttc(フォントコレクション)は「1 フェイスを取り出せ」と明示して拒否する。
+    let mut ttc = b"ttcf".to_vec();
+    ttc.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    let err = atx_core::validate_font_asset(&ttc).unwrap_err();
+    assert!(
+        err.contains("font collections are not supported; extract one face"),
+        "{err}"
+    );
+    // PNG は署名で弾く。
+    let err = atx_core::validate_font_asset(&encode_png(&canvas(2, 2, GRAY))).unwrap_err();
+    assert!(err.contains("does not start with a TrueType"), "{err}");
+    // 4 バイト未満。
+    assert!(atx_core::validate_font_asset(b"\x00\x01").is_err());
+    // 署名は正しいが中身が壊れている。
+    let err = atx_core::validate_font_asset(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00]).unwrap_err();
+    assert!(err.contains("not parseable"), "{err}");
+}
+
+/// グリフを 1 つも持たないフォントは拒否する。
+///
+/// `maxp.numGlyphs == 0` のフォントは読み込めてもどの文字も描けない = 渡された意味が無い。
+/// import 時に弾かないと、「フォントを渡したのに全部豆腐」の原因が利用者に見えない。
+/// 入力は同梱 Roboto の `maxp` の numGlyphs を 0 に書き換えて作る
+/// (テーブルディレクトリを引いて 2 バイトだけ潰す。合成フォントを 1 から書くより短い)。
+#[test]
+fn validate_font_asset_rejects_a_font_with_no_glyphs() {
+    let mut font = ROBOTO.to_vec();
+    let num_tables = u16::from_be_bytes([font[4], font[5]]) as usize;
+    let maxp = (0..num_tables)
+        .map(|i| 12 + 16 * i)
+        .find(|&e| &font[e..e + 4] == b"maxp")
+        .expect("Roboto には maxp がある");
+    let offset = u32::from_be_bytes(font[maxp + 8..maxp + 12].try_into().unwrap()) as usize;
+    // maxp: version(4) の次が numGlyphs(2)。
+    assert_ne!(u16::from_be_bytes([font[offset + 4], font[offset + 5]]), 0);
+    font[offset + 4] = 0;
+    font[offset + 5] = 0;
+
+    let err = atx_core::validate_font_asset(&font).unwrap_err();
+    assert!(err.contains("no glyphs"), "{err}");
+}
+
+#[test]
+fn max_font_bytes_is_32_mib() {
+    assert_eq!(atx_core::MAX_FONT_BYTES, 32 * 1024 * 1024);
+}

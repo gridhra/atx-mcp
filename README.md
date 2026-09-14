@@ -46,7 +46,7 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the full design.
 
 8. **Reading documents (OCR pre-processing)**
    > "Read this receipt photo for me." / "What does this slide say?"
-   `detect_document` finds the page or screen and returns a `perspective` quad ready to paste, the `ocr_document` preset (grayscale, auto levels, light sharpen) and `trim` concentrate the pixel budget on the text, and `render_preview` with `long_edge:1568` hands the model an image it can actually read. No OCR engine is bundled: the model does the reading, atx only makes the pixels legible and reproducible. `threshold` (Otsu / Sauvola) and `ocr_binarize` exist for external OCR engines.
+   `detect_document` finds the page or screen and returns a `perspective` quad ready to paste, the `ocr_document` preset (grayscale, auto levels, light sharpen) and `trim` concentrate the pixel budget on the text, and `render_preview` with `long_edge:1568` hands the model an image it can actually read. No OCR engine is bundled: the model does the reading, atx only makes the pixels legible and reproducible. `detect_text_blocks` answers the question that decides the rest — "will this text survive the downscale, and where do I cut?" — by returning the text blocks in reading order plus ready-to-paste `crop` bands. `threshold` (Otsu / Sauvola) and `ocr_binarize` exist for external OCR engines.
 
 9. **Verification and accountability**
    > "Show me this image before and after the edits, side by side."
@@ -129,22 +129,23 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 `--workspace` (env: `ATX_WORKSPACE`) is the directory used as the asset store.
 It is created automatically if it doesn't exist.
 
-## Tools (12)
+## Tools (13)
 
 | Tool | Role |
 |---|---|
 | `list_operations` | Compact catalog of the recipe vocabulary: every operation with a one-line description and terse parameter hints, plus the built-in preset names. Optional `category:"geometry"\|"color"\|"filter"\|"output"` narrows it (read-only) |
 | `explain_operation` | Full reference for one operation: parameter table (type, range, required/default, semantics), ready-to-paste JSON examples and gotchas. A built-in preset name works too and returns its full operation list. An unknown name returns the valid operations and presets, grouped (read-only) |
 | `import_asset` | Import a local image into the workspace (sha256-idempotent). Takes `path` for one file or `paths` for a batch of up to 64 (a failing file does not abort the batch). Warns via `already_derived_from` when the bytes are already the output of a recipe in this workspace |
-| `inspect_image` | Inspect dimensions, EXIF, ICC profile, presence of GPS data, etc. (read-only) |
+| `inspect_image` | Inspect dimensions, EXIF summary, ICC profile, presence of GPS data, luma statistics, a `sharpness` score (variance of the Laplacian — relative, so compare it against a known-good capture of the same subject) and a `perceptual_hash` (dHash, 16 hex digits) for "is this the same picture?". `include_exif:true` additionally returns every EXIF field as `{ifd, tag, value}` entries — off by default because the full dump can carry GPS coordinates and names (read-only) |
 | `detect_tilt` | Estimate tilt angle via Canny+Hough (coarse) plus a projection profile (sub-0.1° refinement). Also returns horizontal/vertical family estimates; the full score curve is opt-in via `include_score_curve:true`. Returns "do not correct" when confidence is low (read-only) |
 | `detect_document` | Find the dominant quadrilateral (page, screen, whiteboard, sign) via Canny + contours and return it as a `perspective`-ready `quad` (tl, tr, br, bl) with `confidence`, `area_ratio`, an `output_size_hint` and a paste-ready `suggested_operation`. Returns `quad:null` with a reason (`no_quad_found` / `already_rectified` / `low_confidence`) rather than guessing (read-only) |
+| `detect_text_blocks` | Find the text-like blocks (headline, paragraphs, table, caption) via Otsu binarization + run-length smearing + connected components, in reading order, each with `line_count`, `median_line_height_px` and `ink_ratio`. `legibility.line_height_at_1568_px` says whether the text survives a downscale to long edge 1568 (below ~16px it usually does not), and `legibility.recommended_bands` splits the image into horizontal bands that clear that bar — each entry is already a `crop` operation to paste before `render_preview` (read-only) |
 | `generate_mask` | Generate a deterministic grayscale mask (`linear_gradient` / `radial_gradient` / `luminosity_range` / `color_range`) as a PNG revision with the same dimensions as the reference image, to be referenced from an operation's `mask` field (idempotent) |
-| `render_preview` | Apply a recipe (or a `preset`) at low resolution (long edge ≤768 by default, `long_edge` 256..1568 to hand a vision model a legible page) and return it as an inline image. `overlay:"grid"\|"thirds"\|"horizon"` overlays composition guide lines, and `overlay:"mask"` (with `mask_revision_id`) tints the coverage of a mask (drawn on the preview only; it has no effect on the actual transform) |
+| `render_preview` | Apply a recipe (or a `preset`) at low resolution (long edge ≤768 by default, `long_edge` 256..1568 to hand a vision model a legible page) and return it as an inline image. `overlay:"grid"\|"thirds"\|"horizon"` overlays composition guide lines, and `overlay:"mask"` (with `mask_revision_id`) tints the coverage of a mask (drawn on the preview only; it has no effect on the actual transform). Also reports `estimated_vision_tokens`, a rough `width*height/750` budget for the returned image |
 | `apply_transform` | Apply a recipe (or a `preset`) at full resolution and produce a new revision (the same recipe always yields the same revision). Takes `revision_id` for one image or `revision_ids` to run the same recipe over a batch of up to 64 |
-| `compare_revisions` | Downscale two revisions to long edge ≤640 and return them composited into a single inline image, arranged via `layout:"side_by_side"\|"stacked"` (for A/B and before/after visual comparison), or `layout:"diff"` for a single pixel-difference heatmap plus `mean_abs_diff`/`max_abs_diff`/`changed_pixel_ratio` stats (requires equal dimensions) |
+| `compare_revisions` | Downscale two revisions to long edge ≤640 and return them composited into a single inline image, arranged via `layout:"side_by_side"\|"stacked"` (for A/B and before/after visual comparison), or `layout:"diff"` for a single pixel-difference heatmap plus `mean_abs_diff`/`max_abs_diff`/`changed_pixel_ratio` and an `ssim` score (requires equal dimensions). Every layout also reports `perceptual_hash_distance`, the Hamming distance between the two dHash values (≤5 usually means the same picture re-encoded or resized, ≥20 means two different pictures) |
 | `list_assets` | Read the revision ledger (read-only) |
-| `export_asset` | Write a revision out to a given path (an existing file is only overwritten when `overwrite:true` is explicitly set) |
+| `export_asset` | Write revisions out of the workspace: `revision_id` + `dest_path` for one file, or `revision_ids` + `dest_dir` for up to 64 at once, named by `filename_template` (default `"{revision_id}.{ext}"`, also `{index}` / `{stem}`). An existing file is only overwritten when `overwrite:true` is explicitly set, and it never writes inside the workspace store or through a symbolic link |
 
 ## Recipe example
 
@@ -216,12 +217,30 @@ with no intrinsic size is a structured error unless you give both. Compositing
 uses the same W3C formula and the same 16 `blend_mode` values as
 [layers](#layers).
 
-> **Text is never rendered.** atx loads no system fonts, because the installed
-> fonts differ from machine to machine and would break byte-for-byte
-> reproducibility. An SVG containing `<text>` renders its shapes but not its
-> glyphs and reports a warning — **convert text to paths (outlines) in your
-> vector editor before importing**, and the result is identical on every
-> machine.
+#### Text in an SVG
+
+atx never reads system fonts: the installed fonts differ from machine to machine
+and would break byte-for-byte reproducibility. `<text>` is therefore skipped
+unless you ask for it:
+
+```json
+{ "op": "svg_overlay", "svg_revision_id": "rev_...", "x": 120, "y": 80,
+  "width": 48, "render_text": true, "font_revision_ids": ["rev_..."] }
+```
+
+- `render_text` defaults to `false`, which keeps the old behaviour exactly (the
+  shapes render, the glyphs do not, and the result carries a warning). Converting
+  text to paths in your vector editor still works and needs no font at all.
+- `render_text:true` draws the text with **one bundled font, Roboto Regular**
+  (embedded in the binary), plus any fonts you pass in `font_revision_ids` (up
+  to 4). Nothing else is ever loaded, so the output is identical on every
+  machine.
+- A font is an asset like a LUT or an SVG: `import_asset` a `.ttf` / `.otf`
+  file, and the summary reports the family names to write in `font-family`.
+  **Japanese and other CJK text needs an imported font** — Roboto has no CJK
+  glyphs, and characters missing from every loaded font render as boxes and are
+  counted in a warning. `inspect_image` refuses a font revision on purpose: it
+  is an asset, not an image.
 
 ### Masks (local adjustments)
 
@@ -306,6 +325,13 @@ against its own source before it is blended onto the running composite:
 
 ## Presets
 
+A preset can also be inlined **inside** a recipe as a single operation —
+`{"op": "preset", "name": "ocr_document"}` — so a named look can be combined with
+your own ops. The macro expands in place before anything runs, so the recipe
+hashes exactly as if you had written the preset's operations out by hand, and a
+preset that carries `layers` cannot be inlined (that is a structured error).
+Call `explain_operation {"operation":"preset"}` for the rules.
+
 `apply_transform` and `render_preview` take either `recipe` (the raw DSL) or
 `preset` (a built-in named recipe from [`presets/`](presets)) — exactly one of
 the two:
@@ -382,5 +408,9 @@ has no relation to the PC ATX form factor or Markdown ATX-style headings.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+Non-crate material shipped inside the binary (the bundled Roboto Regular font)
+is listed with its source and license in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 If atx-mcp saves you time, you can [buy me a coffee](https://buymeacoffee.com/gridhra) ☕

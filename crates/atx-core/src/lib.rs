@@ -8,12 +8,13 @@ pub(crate) mod ops;
 pub(crate) mod parallel;
 mod pixel_ops;
 pub mod recipe;
+pub mod similarity;
 pub mod stats;
 pub(crate) mod transform;
 
 pub use engine::{
-    apply_recipe, apply_recipe_with_assets, inspect_bytes, AssetResolver, EncodedOutput, ImageInfo,
-    NoAssets, ENGINE_VERSION,
+    apply_recipe, apply_recipe_with_assets, decode_oriented, inspect_bytes, inspect_bytes_with,
+    read_exif_all, AssetResolver, EncodedOutput, ExifEntry, ImageInfo, NoAssets, ENGINE_VERSION,
 };
 /// .cube LUT アセットの取り込み時検証。`import_asset` が使う。
 pub use ops::lut::validate_asset as validate_cube_asset;
@@ -25,10 +26,18 @@ pub use ops::lut::validate_asset as validate_cube_asset;
 pub use ops::svg::intrinsic_size as svg_intrinsic_size;
 /// SVG アセットの取り込み時検証(成功なら固有サイズ)。`import_asset` が使う。
 pub use ops::svg::validate_asset as validate_svg_asset;
+/// font アセット(.ttf / .otf)の検証と、そのバイト上限。`import_asset` が使う。
+///
+/// `validate_font_asset` は SVG / LUT と同じ規約で、失敗を**英語の平文**
+/// (`Err(String)`)で返す(MCP 層がそのまま利用者へ見せる)。成功時の
+/// `FontAssetInfo.families` は SVG の `font-family` に書ける名前。
+pub use ops::svg::{validate_font_asset, FontAssetInfo, MAX_FONT_BYTES};
 pub use recipe::{
     canonical_json, recipe_hash, Anchor, BaseKeyword, BlendMode, CoordinateSpace, CropMode, Fit,
     Layer, LayerSource, MaskRef, Operation, OutputFormat, RotateCrop, StripScope, TransformRecipe,
 };
+/// 知覚ハッシュ(dHash)と SSIM。`inspect_image` / `compare_revisions` が使う。
+pub use similarity::{dhash_hex, dhash_rgb8, dhash_rgba8, hamming, ssim_gray};
 pub use stats::ImageStats;
 
 /// atx-core 全体のエラー型。op 単位の失敗位置を保持し、LLM が自己修復できる粒度で返す。

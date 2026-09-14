@@ -1,0 +1,24 @@
+{
+  "id": "t17_batch_export",
+  "prompt": "この写真から左・中央・右の3か所を正方形で切り出して、3枚とも web_optimize プリセットで仕上げて。できあがった3枚は {{TASK_DIR}}/export に 1.webp, 2.webp, 3.webp という名前で、1回の呼び出しでまとめて書き出して(1枚ずつ呼ばないで)。",
+  "input_fixture": "tests/fixtures/synthetic_scene.jpg",
+  "setup": {
+    "seed_files": [
+      {
+        "path": "export/.keep",
+        "text": "export_asset は既存のディレクトリにしか書き出さないので、このファイルで export/ を作っておく\n"
+      }
+    ]
+  },
+  "success_criteria": {
+    "expect_revision": {
+      "mime_type": "image/webp",
+      "min_matches": 3
+    },
+    "expect_export": {
+      "dest_path": "{{TASK_DIR}}/export/1.webp",
+      "must_exist_matching_ledger": true
+    }
+  },
+  "max_turns": 14
+}
