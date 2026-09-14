@@ -22,7 +22,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-14]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # rav1e (via ravif) assembles x86_64 SIMD with nasm; arm64 uses gas via cc.
       - name: Install nasm (x86_64 hosts)
