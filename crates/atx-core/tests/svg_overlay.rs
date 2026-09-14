@@ -490,6 +490,84 @@ fn text_svg_warns_but_still_renders_shapes() {
     assert!(quiet.is_empty(), "{quiet:?}");
 }
 
+/// 回帰(セキュリティ点検): `<image href="...">` の**外部参照はローカルファイルを読まない**。
+///
+/// usvg の既定リゾルバは href を「ファイルパス」として `std::fs::read` する。
+/// これを許すと、SVG アセット 1 枚でサーバが動くマシンの任意のファイルを読みに行き
+/// (`/dev/zero` で無制限のメモリ確保、FIFO でハング)、読めたローカル SVG は出力へ
+/// 描き込まれてしまう(情報漏えい + ファイルシステムの状態で出力が変わる非決定論)。
+///
+/// 一時ディレクトリへ全面赤の合成 SVG を書き、それを絶対パスで参照する SVG と、
+/// `<image>` を持たない同じ SVG の出力が**画素一致**すること、かつ外部参照を
+/// 名指しする警告が出ることを確かめる。
+#[test]
+fn image_href_to_a_local_file_is_never_loaded() {
+    let dir = std::env::temp_dir().join(format!("atx-svg-href-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let leak = dir.join("leak.svg");
+    std::fs::write(
+        &leak,
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="#ff0000"/></svg>"##,
+    )
+    .unwrap();
+
+    let with_image = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="20" height="10" viewBox="0 0 20 10">
+        <rect x="0" y="0" width="4" height="4" fill="#00ff00"/>
+        <image x="0" y="0" width="20" height="10" href="{0}"/>
+        <image x="0" y="0" width="20" height="10" xlink:href="{0}"/>
+      </svg>"##,
+        leak.display()
+    );
+    let without_image = r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="20" height="10" viewBox="0 0 20 10">
+        <rect x="0" y="0" width="4" height="4" fill="#00ff00"/>
+      </svg>"##;
+
+    let src = canvas(40, 30, GRAY);
+    let json = r#"{"operations":[{"op":"svg_overlay","svg_revision_id":"rev_svg","x":0,"y":0}]}"#;
+    let (a, warnings) = run_with_warnings(
+        &src,
+        json,
+        &MockAssets::with("rev_svg", with_image.as_bytes()),
+    );
+    let (b, quiet) = run_with_warnings(
+        &src,
+        json,
+        &MockAssets::with("rev_svg", without_image.as_bytes()),
+    );
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        a.as_raw() == b.as_raw(),
+        "the external file must not be read or drawn"
+    );
+    assert_eq!(
+        warnings,
+        vec![
+            "operations[0] (svg_overlay): svg contains image elements that reference external \
+             files; external references are never loaded (embed the image in the SVG, or \
+             import it and composite it with layers)"
+                .to_string()
+        ]
+    );
+    assert!(quiet.is_empty(), "{quiet:?}");
+}
+
+/// `data:` URI で**埋め込まれた** SVG 画像は自己完結・決定論的なので描かれる
+/// (外部参照だけを閉じ、埋め込みは閉じないという判断の固定)。警告も出ない。
+#[test]
+fn embedded_data_uri_svg_image_is_still_rendered() {
+    let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10" viewBox="0 0 20 10">
+        <image x="0" y="0" width="20" height="10" href="data:image/svg+xml;utf8,&lt;svg xmlns='http://www.w3.org/2000/svg' width='20' height='10'&gt;&lt;rect width='20' height='10' fill='%2300ff00'/&gt;&lt;/svg&gt;"/>
+      </svg>"##;
+    let src = canvas(40, 30, GRAY);
+    let json = r#"{"operations":[{"op":"svg_overlay","svg_revision_id":"rev_svg","x":0,"y":0}]}"#;
+    let (out, warnings) = run_with_warnings(&src, json, &MockAssets::with("rev_svg", svg));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(out.get_pixel(10, 5).0, [0, 255, 0, 255]);
+    assert_eq!(out.get_pixel(30, 20).0, GRAY_PX);
+}
+
 /// 固有サイズを持たない SVG は、寸法が完全に指定されていなければ構造化エラー。
 #[test]
 fn missing_intrinsic_size_is_a_structured_error() {

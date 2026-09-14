@@ -15,12 +15,16 @@ pub use engine::{
     apply_recipe, apply_recipe_with_assets, inspect_bytes, AssetResolver, EncodedOutput, ImageInfo,
     NoAssets, ENGINE_VERSION,
 };
+/// .cube LUT アセットの取り込み時検証。`import_asset` が使う。
+pub use ops::lut::validate_asset as validate_cube_asset;
 /// SVG バイト列の**固有サイズ**(px)。固有サイズを持たない/パースできない SVG は `None`。
 ///
 /// `import_asset` が台帳へ寸法を記録するための入口。これを core 側に生やすことで、
 /// atx-mcp / atx-store は resvg へ直接依存しなくて済む(依存はラスタライザを持つ
 /// atx-core 1 箇所に閉じる)。
 pub use ops::svg::intrinsic_size as svg_intrinsic_size;
+/// SVG アセットの取り込み時検証(成功なら固有サイズ)。`import_asset` が使う。
+pub use ops::svg::validate_asset as validate_svg_asset;
 pub use recipe::{
     canonical_json, recipe_hash, Anchor, BaseKeyword, BlendMode, CoordinateSpace, CropMode, Fit,
     Layer, LayerSource, MaskRef, Operation, OutputFormat, RotateCrop, StripScope, TransformRecipe,

@@ -99,6 +99,21 @@ fn quantize(v: f64) -> f64 {
     (v * 1e6).round() / 1e6
 }
 
+/// .cube LUT アセットとして取り込んでよいバイト列かを検証する。
+///
+/// `lut` op が適用時に要求するのと同じ条件(UTF-8 テキスト・[`parse_cube`] が通る)を
+/// import 時に先取りする。これが無いと、拡張子が `.cube` なだけの任意内容のファイルが
+/// 台帳に載り、export の上書きで任意の場所へ書き出す「ファイル複写」の経路になっていた
+/// (セキュリティ点検、DESIGN.md §9.14)。エラーは英語の理由文字列。
+pub fn validate_asset(bytes: &[u8]) -> std::result::Result<(), String> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| "the file is not valid UTF-8 text".to_string())?;
+    parse_cube(text).map(|_| ()).map_err(|e| match e {
+        AtxError::InvalidRecipe(message) => message,
+        other => other.to_string(),
+    })
+}
+
 /// .cube テキストをパースする。エラーは行番号付き。
 pub fn parse_cube(text: &str) -> Result<CubeLut> {
     let mut size: Option<(u32, bool)> = None; // (size, is_3d)

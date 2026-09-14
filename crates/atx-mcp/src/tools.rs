@@ -1019,6 +1019,28 @@ fn is_raster_image(mime_type: &str) -> bool {
     mime_type.starts_with("image/") && mime_type != SVG_MIME
 }
 
+/// パスの拡張子が `ext` か(大文字小文字を無視)。
+fn has_extension(path: &Path, ext: &str) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+}
+
+/// .cube / SVG として取り込もうとしたファイルの中身が不正なときの構造化エラー。
+fn invalid_asset(path: &Path, kind: &str, reason: &str) -> CallToolResult {
+    tool_error(
+        "invalid_asset",
+        format!(
+            "{} looks like {kind} asset but its content is invalid: {reason}",
+            path.display()
+        ),
+        serde_json::json!({
+            "path": path.to_string_lossy(),
+            "reason": reason,
+            "recovery": "check that the file really is the asset its extension says (a text .cube LUT or a plain .svg), or rename it if it is a raster image",
+        }),
+    )
+}
+
 /// ファイルが SVG ベクタアセットかどうかを判定する。
 ///
 /// 判定規則(どちらか一方を満たせば SVG とみなす):
@@ -1297,11 +1319,50 @@ impl AtxTools {
             ));
         }
 
-        let bytes = tri!(std::fs::read(&path), |e: std::io::Error| tool_error(
-            "io_error",
-            format!("failed to read {}: {e}", path.display()),
-            serde_json::Value::Null
-        ));
+        // 読む**前に**サイズを検査する(セキュリティ点検、DESIGN.md §9.14)。
+        // 以前は `fs::read` でファイル全体をメモリへ載せてから上限を見ていたので、
+        // 巨大なファイルを指すだけでメモリと I/O を使い切らせることができた。
+        // この段階では種類(画像 / .cube / SVG)がまだ決まらないので、どの種類でも
+        // 超えられない上限(全種類の上限の最大値)で先に切り、種類ごとの細かい上限は
+        // 従来どおり読んだ後に検査する。読み取り自体も `take` で上限 + 1 バイトに縛り、
+        // 検査とのあいだにファイルが伸びても上限以上は読まない。
+        let max_read = self.limits.max_bytes.max(MAX_CUBE_BYTES).max(MAX_SVG_BYTES);
+        let io_error = |e: std::io::Error| {
+            tool_error(
+                "io_error",
+                format!("failed to read {}: {e}", path.display()),
+                serde_json::Value::Null,
+            )
+        };
+        let too_large = |len: u64| {
+            tool_error(
+                "limit_exceeded",
+                format!(
+                    "{} is {len} bytes, over the {max_read} byte limit for imported files",
+                    path.display()
+                ),
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "byte_size": len,
+                    "max_bytes": max_read,
+                    "recovery": "import a smaller file (downscale or re-encode it outside the workspace first)",
+                }),
+            )
+        };
+        let declared_len = tri!(std::fs::metadata(&path), io_error).len();
+        if declared_len > max_read {
+            bail!(too_large(declared_len));
+        }
+        let bytes = {
+            use std::io::Read as _;
+            let file = tri!(std::fs::File::open(&path), io_error);
+            let mut bytes = Vec::with_capacity(declared_len as usize);
+            tri!(file.take(max_read + 1).read_to_end(&mut bytes), io_error);
+            bytes
+        };
+        if bytes.len() as u64 > max_read {
+            bail!(too_large(bytes.len() as u64));
+        }
 
         // 画像ではないアセット(v0.3: レシピから参照される .cube 3D LUT)は
         // 画像としての検査を行わず、寸法 0x0 の擬似 MIME で台帳に載せる。
@@ -1322,11 +1383,19 @@ impl AtxTools {
                 }),
             ));
         }
+        // 中身が本当に LUT かを検証する(セキュリティ点検、DESIGN.md §9.14)。
+        // 拡張子だけで任意内容のファイルを台帳に載せると、export の上書きと組み合わせて
+        // 「任意のファイルを任意の場所へ複写する」経路になる。
+        if is_cube {
+            if let Err(reason) = atx_core::validate_cube_asset(&bytes) {
+                bail!(invalid_asset(&path, "a .cube LUT", &reason));
+            }
+        }
         // ベクタアセット(v0.8: レシピから参照される SVG)も画像としては検査しない。
         // 寸法は SVG の**固有サイズ**を記録し、持たない SVG は 0x0 のままにする
         // (0x0 は「この SVG は自分では大きさを決められない」の記録でもあり、
         //  svg_overlay で width/height を書けというサインになる)。
-        let is_svg = !is_cube && looks_like_svg(&path, &bytes);
+        let mut is_svg = !is_cube && looks_like_svg(&path, &bytes);
         if is_svg && bytes.len() as u64 > MAX_SVG_BYTES {
             bail!(tool_error(
                 "limit_exceeded",
@@ -1343,10 +1412,23 @@ impl AtxTools {
                 }),
             ));
         }
+        // SVG も中身を検証する(.cube と同じ理由)。拡張子が `.svg` なら不正はエラー。
+        // 拡張子が無く先頭の `<svg` だけで SVG と推定したものは、解析できなければ
+        // 推定の誤り(例: XMP に `<svg` を含むラスタ画像)とみなして画像として扱い直す。
+        let mut svg_size = None;
+        if is_svg {
+            match atx_core::validate_svg_asset(&bytes) {
+                Ok(size) => svg_size = size,
+                Err(reason) if has_extension(&path, "svg") => {
+                    bail!(invalid_asset(&path, "an SVG", &reason));
+                }
+                Err(_) => is_svg = false,
+            }
+        }
         let (mime_type, width, height) = if is_cube {
             (CUBE_MIME.to_string(), 0, 0)
         } else if is_svg {
-            let (w, h) = atx_core::svg_intrinsic_size(&bytes).unwrap_or((0, 0));
+            let (w, h) = svg_size.unwrap_or((0, 0));
             (SVG_MIME.to_string(), w, h)
         } else {
             let info = tri!(atx_core::inspect_bytes(&bytes, &self.limits), atx_error);
@@ -2789,7 +2871,31 @@ impl AtxTools {
             );
         }
 
-        let exists = dest.exists();
+        // 書き出し先そのものがシンボリックリンクなら拒否する(セキュリティ点検、DESIGN.md §9.14)。
+        // リンク先が存在しない(宙ぶらりんの)リンクは `exists()` が false になり、
+        // 上のワークスペース内判定もリンク名の側で行われるので素通りしていた。
+        // その状態で書くとリンクを辿って objects/ 等にファイルが作られ、不変ストアが壊れる。
+        // リンク先を検査してから辿る方式は検査と書き込みの間に差し替えられうるので、
+        // 「リンクには書かない」と決めてしまう方が単純で強い。
+        let dest_meta = std::fs::symlink_metadata(&dest).ok();
+        if dest_meta
+            .as_ref()
+            .is_some_and(|m| m.file_type().is_symlink())
+        {
+            return tool_error(
+                "dest_is_symlink",
+                format!(
+                    "{} is a symbolic link; exporting through a link is not allowed",
+                    dest.display()
+                ),
+                serde_json::json!({
+                    "dest_path": dest.to_string_lossy(),
+                    "recovery": "pass the real file path you want to write (not a symbolic link), or remove the link first",
+                }),
+            );
+        }
+
+        let exists = dest_meta.is_some();
         if exists && !params.overwrite {
             return tool_error(
                 "dest_exists",
@@ -2824,7 +2930,7 @@ impl AtxTools {
         }
 
         let bytes = tri!(self.store.read_bytes(&params.revision_id), store_error);
-        tri!(std::fs::write(&dest, &bytes), |e: std::io::Error| {
+        tri!(write_export(&dest, &bytes, exists), |e: std::io::Error| {
             tool_error(
                 "io_error",
                 format!("failed to write {}: {e}", dest.display()),
@@ -3435,6 +3541,54 @@ fn real_prefix(path: &Path) -> PathBuf {
             return path.to_path_buf();
         }
     }
+}
+
+/// export の書き込み本体。**既存のリンクを辿らない**書き方に限定する
+/// (セキュリティ点検、DESIGN.md §9.14)。
+///
+/// - 新規作成(`replace == false`): `create_new`(O_CREAT|O_EXCL)で開く。
+///   その名前に何か(検査の後に置かれたシンボリックリンクを含む)があれば失敗し、辿らない
+/// - 上書き(`replace == true`): 同じディレクトリの一時ファイルへ書いてから `rename` で
+///   置き換える。`fs::write` は既存 inode をその場で切り詰めるので、書き出し先が
+///   objects/ のファイルへの**ハードリンク**だとストアの実体まで書き換わっていた。
+///   rename はディレクトリエントリを差し替えるだけなので、他の名前が指す実体は不変
+fn write_export(dest: &Path, bytes: &[u8], replace: bool) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let write_new = |path: &Path| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        let result = file.write_all(bytes).and_then(|()| file.flush());
+        if result.is_err() {
+            let _ = std::fs::remove_file(path);
+        }
+        result
+    };
+
+    if !replace {
+        return write_new(dest);
+    }
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp = parent.join(format!(
+        ".{name}.atx-export-{}-{nonce}-{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    write_new(&tmp)?;
+    std::fs::rename(&tmp, dest).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// 相対パスを cwd 基準の絶対パスにし、`.` / `..` を字句的に畳む。

@@ -9,8 +9,9 @@ on:
         description: "Existing tag to (re)build, e.g. v0.1.0"
         required: true
 
-permissions:
-  contents: write
+# 既定は権限なし。必要な権限はジョブごとに付ける(依存クレートの build.rs が
+# 走る build ジョブに write トークンを渡さないため)。
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,6 +20,8 @@ jobs:
   build:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -44,16 +47,22 @@ jobs:
             npm_platform: win32-x64
             need_nasm: true
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
-
+      # タグ名は式を run: に直接埋め込まず env 経由で受け、形式を検証してから使う
+      # (タグ名にはシェルのメタ文字を含められるため)。
       - name: Resolve version
         shell: bash
+        env:
+          TAG_IN: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          echo "TAG=$TAG" >> "$GITHUB_ENV"
-          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          set -euo pipefail
+          [[ "$TAG_IN" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::invalid tag: $TAG_IN"; exit 1; }
+          echo "TAG=$TAG_IN" >> "$GITHUB_ENV"
+          echo "VERSION=${TAG_IN#v}" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
 
       # ravif -> rav1e assembles its x86_64 SIMD kernels with nasm. aarch64 uses
       # gas through the `cc` crate and needs nothing extra.
@@ -76,14 +85,13 @@ jobs:
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools musl-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
+      # 配布バイナリはキャッシュを使わずクリーンビルドする(main の CI が書いた
+      # キャッシュをタグのビルドが復元できるため、汚染が配布物に入りうる)。
       - name: Build
         shell: bash
         run: cargo build --release --locked --bin atx-mcp --target ${{ matrix.target }}
@@ -113,7 +121,7 @@ jobs:
         run: Compress-Archive -Path "staging/$env:ARCHIVE_NAME" -DestinationPath "$env:ARCHIVE_NAME.zip"
 
       - name: Upload release archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: archive-${{ matrix.target }}
           path: |
@@ -123,7 +131,7 @@ jobs:
 
       # Raw binary, consumed by the npm packaging job.
       - name: Upload raw binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: npmbin-${{ matrix.npm_platform }}
           path: staging/${{ env.ARCHIVE_NAME }}/atx-mcp*
@@ -133,17 +141,24 @@ jobs:
     name: publish GitHub release
     needs: build
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write # build provenance attestation
+      attestations: write
     outputs:
       version: ${{ steps.meta.outputs.version }}
       tag: ${{ steps.meta.outputs.tag }}
     steps:
       - id: meta
+        env:
+          TAG_IN: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          [[ "$TAG_IN" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::invalid tag: $TAG_IN"; exit 1; }
+          echo "tag=$TAG_IN" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG_IN#v}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: archive-*
           path: artifacts
@@ -154,51 +169,72 @@ jobs:
         run: |
           set -euo pipefail
           ls -la
-          sha256sum * > SHA256SUMS
+          sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
 
-      - uses: softprops/action-gh-release@v2
+      # 成果物にビルド来歴の証明を付ける(`gh attestation verify <file> -R gridhra/atx-mcp`
+      # で、このワークフローが作ったものか検証できる)。
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: artifacts/*
+
+      # Immutable releases が有効なので、公開(draft 解除)した時点で成果物は変更できない。
+      # 下書きで作って全成果物を載せてから、最後に公開する。
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: ${{ steps.meta.outputs.tag }}
+          draft: true
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: artifacts/*
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
 
   npm:
     name: publish npm packages
     needs: release
     runs-on: ubuntu-24.04
+    # 配備対象を v* タグに限定し、承認者の承認を待つ Environment。
+    # npm の Trusted Publisher にも同じ Environment 名を登録する。
+    environment: npm-publish
     permissions:
       contents: read
       id-token: write # OIDC: trusted publishing + provenance
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ needs.release.outputs.tag }}
+          ref: refs/tags/${{ needs.release.outputs.tag }}
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
-      # Trusted publishing (OIDC) requires npm >= 11.5.1.
+      # Trusted publishing (OIDC) requires npm >= 11.5.1. id-token を持つジョブなので
+      # latest ではなく版を固定する。
       - name: Update npm for trusted publishing
-        run: npm install -g npm@latest && npm --version
+        run: npm install -g npm@11.19.1 && npm --version
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: npmbin-*
           path: npmbins
 
       - name: Assemble npm packages
-        run: node npm/scripts/build-packages.mjs --version "${{ needs.release.outputs.version }}" --bins npmbins
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: node npm/scripts/build-packages.mjs --version "$VERSION" --bins npmbins
 
       # Auth: npm trusted publishing via GitHub OIDC — no token, no secret.
       # Each package must have this repo + workflow registered as its
-      # Trusted Publisher on npmjs.com (see RELEASING.md). A package without
-      # that registration fails here; first-time packages are published
-      # manually via scripts/publish-npm-local.sh.
+      # Trusted Publisher on npmjs.com. A package without that registration
+      # fails here; first-time packages are published manually.
       - name: Publish
         env:
           VERSION: ${{ needs.release.outputs.version }}
