@@ -1336,3 +1336,27 @@ BT.709 輝度で 2 値化する。出力は RGB を 0 か 255 に置き換え、
 - **未検証**: eval t14 / t15 の実走(課金のためリリース前ゲートで実施)、
   Sauvola の `sqrt` 経路のクロスプラットフォーム決定論(CI の Linux アームで確認する)、
   実写の書類・レシート・ダークモード UI での見た目(合成フィクスチャのみ)
+
+### 9.13 outputSchema 最上位 `type: "object"` の修正(2026-09-14)
+
+**出来事**: Glama(MCP サーバの登録・評価サイト)の内省チェックは、サーバを
+mcp-proxy(公式 TypeScript SDK を使う stdio→HTTP 中継)越しに起動して tools/list を取る。
+v0.5.0 をこの経路に載せると tools/list 全体が zod 検証エラーで失敗した。
+公式 TypeScript SDK 1.30 の stdio クライアントを直接つないでも同じく失敗する。
+
+**原因**: MCP 仕様は Tool.outputSchema の最上位を `type: "object"` に固定している。
+§9.11 のバッチ対応で、`import_asset` / `apply_transform` / `explain_operation` の出力を
+単一/バッチ(explain は op/プリセット)を切り替える `#[serde(untagged)]` enum にした。
+schemars はこれを最上位 `anyOf` だけのスキーマにし、`type` を出さない。
+rmcp の `schema_for_output` もそのまま通すため、v0.4.0 以降この 3 ツールが仕様違反だった。
+Rust 側のテストは `output_schema.is_some()` しか見ておらず、検出できなかった。
+
+**修正**: `server.rs` の `object_output_schema::<T>()` で、最上位に `type` が無ければ
+`"object"` を足す(全 12 ツールをこの関数経由に統一)。どの分岐も object なので、
+受理する値も structuredContent の形も変わらない。レシピ canonical hash・ツール数にも影響なし。
+`flow.rs` の登録テストに「全ツールの outputSchema 最上位が `type: "object"`」を追加した
+(修正前に失敗することを確認済み)。
+
+**確認**: 修正版を mcp-proxy 6.4.3 越しに起動し、TypeScript SDK 1.30 のクライアント
+(structuredContent を outputSchema で検証する)から tools/list(12 件)と、
+3 ツールの単一/バッチ両形の tools/call が通ることを確認した。
