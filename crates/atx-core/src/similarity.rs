@@ -71,7 +71,7 @@ fn dhash_interleaved(buf: &[u8], channels: usize, width: u32, height: u32) -> u6
                     count += 1;
                 }
             }
-            cell[row as usize][col as usize] = if count == 0 { 0 } else { sum / count };
+            cell[row as usize][col as usize] = sum.checked_div(count).unwrap_or(0);
         }
     }
 
