@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use atx_mcp::tools::{
     AtxTools, CompareLayout, CompareRevisionsParams, DetectTiltParams, ExportAssetParams,
-    ImportAssetParams, ListAssetsParams, RenderPreviewParams, RevisionParams, TransformParams,
+    ImportAssetParams, InspectImageParams, ListAssetsParams, RenderPreviewParams, TransformParams,
     COMPARE_GAP_PX, PREVIEW_LONG_EDGE,
 };
 use base64::Engine as _;
@@ -101,9 +101,7 @@ fn full_flow_import_inspect_detect_preview_apply_export() {
     assert_eq!(reimported["revision"]["revision_id"], source_rev.as_str());
 
     // --- 2. inspect --------------------------------------------------------
-    let inspected = structured(&tools.inspect_image(&RevisionParams {
-        revision_id: source_rev.clone(),
-    }));
+    let inspected = structured(&tools.inspect_image(&InspectImageParams::new(source_rev.clone())));
     assert_eq!(inspected["info"]["width"], 1477);
     assert_eq!(inspected["info"]["height"], 1108);
     assert_eq!(inspected["info"]["mime_type"], "image/jpeg");
@@ -232,6 +230,40 @@ fn full_flow_import_inspect_detect_preview_apply_export() {
         "preview long edge must be <= {PREVIEW_LONG_EDGE}, got {pw}x{ph}"
     );
     assert!(PathBuf::from(preview["preview_path"].as_str().unwrap()).is_file());
+    // v0.6: インライン画像を読む概算コスト(画素数 / 750、切り上げ)。
+    // テキストサマリにも同じ数が載る(長辺を上げるか帯に分けるかの判断材料)。
+    let expected_tokens = (u64::from(pw) * u64::from(ph)).div_ceil(750);
+    assert_eq!(
+        preview["estimated_vision_tokens"].as_u64(),
+        Some(expected_tokens),
+        "{preview}"
+    );
+    assert!(
+        text(&preview_result).contains(&format!("(~{expected_tokens} vision tokens)")),
+        "{}",
+        text(&preview_result)
+    );
+    // 長辺を 1568 に上げると画素数が増え、概算トークンも増える。
+    let large = structured(&tools.render_preview(&RenderPreviewParams {
+        revision_id: source_rev.clone(),
+        recipe: Some(serde_json::from_value(recipe()).unwrap()),
+        preset: None,
+        overlay: None,
+        mask_revision_id: None,
+        long_edge: Some(1568),
+    }));
+    let (lw, lh) = (
+        large["width"].as_u64().unwrap(),
+        large["height"].as_u64().unwrap(),
+    );
+    assert_eq!(
+        large["estimated_vision_tokens"].as_u64(),
+        Some((lw * lh).div_ceil(750))
+    );
+    assert!(
+        large["estimated_vision_tokens"].as_u64().unwrap() > expected_tokens,
+        "a larger preview must cost more tokens"
+    );
     // inline image content block(base64 jpeg)が付いていること。
     let image = preview_result
         .content
@@ -314,8 +346,11 @@ fn full_flow_import_inspect_detect_preview_apply_export() {
     let out_dir = tempfile::tempdir().expect("out tempdir");
     let dest = out_dir.path().join("hero.webp");
     let exported = structured(&tools.export_asset(&ExportAssetParams {
-        revision_id: derived_rev.clone(),
-        dest_path: dest.to_string_lossy().into_owned(),
+        revision_id: Some(derived_rev.clone()),
+        revision_ids: None,
+        dest_path: Some(dest.to_string_lossy().into_owned()),
+        dest_dir: None,
+        filename_template: None,
         overwrite: false,
     }));
     assert_eq!(exported["overwritten"], Value::Bool(false));
@@ -328,8 +363,11 @@ fn full_flow_import_inspect_detect_preview_apply_export() {
 
     // 上書きなしの再 export は構造化エラー。
     let refused = tools.export_asset(&ExportAssetParams {
-        revision_id: derived_rev.clone(),
-        dest_path: dest.to_string_lossy().into_owned(),
+        revision_id: Some(derived_rev.clone()),
+        revision_ids: None,
+        dest_path: Some(dest.to_string_lossy().into_owned()),
+        dest_dir: None,
+        filename_template: None,
         overwrite: false,
     });
     let payload = error_payload(&refused);
@@ -341,8 +379,11 @@ fn full_flow_import_inspect_detect_preview_apply_export() {
 
     // overwrite=true なら通る。
     let overwritten = structured(&tools.export_asset(&ExportAssetParams {
-        revision_id: derived_rev,
-        dest_path: dest.to_string_lossy().into_owned(),
+        revision_id: Some(derived_rev),
+        revision_ids: None,
+        dest_path: Some(dest.to_string_lossy().into_owned()),
+        dest_dir: None,
+        filename_template: None,
         overwrite: true,
     }));
     assert_eq!(overwritten["overwritten"], Value::Bool(true));
@@ -371,8 +412,11 @@ fn export_into_the_workspace_store_is_refused() {
         let dest = tools.store().root().join(rel);
         let ledger_before = std::fs::read(tools.store().root().join("assets.jsonl")).ok();
         let refused = tools.export_asset(&ExportAssetParams {
-            revision_id: rev.clone(),
-            dest_path: dest.to_string_lossy().into_owned(),
+            revision_id: Some(rev.clone()),
+            revision_ids: None,
+            dest_path: Some(dest.to_string_lossy().into_owned()),
+            dest_dir: None,
+            filename_template: None,
             overwrite: true,
         });
         assert_eq!(
@@ -413,8 +457,11 @@ fn export_through_a_symlink_into_the_workspace_is_refused() {
 
     let dest = link.join("sneaky.jpg");
     let refused = tools.export_asset(&ExportAssetParams {
-        revision_id: rev,
-        dest_path: dest.to_string_lossy().into_owned(),
+        revision_id: Some(rev),
+        revision_ids: None,
+        dest_path: Some(dest.to_string_lossy().into_owned()),
+        dest_dir: None,
+        filename_template: None,
         overwrite: true,
     });
     assert_eq!(
@@ -431,9 +478,7 @@ fn errors_are_structured_and_actionable() {
     let tools = AtxTools::open(workspace.path()).expect("open workspace");
 
     // 存在しない revision
-    let missing = tools.inspect_image(&RevisionParams {
-        revision_id: "rev_nope".to_string(),
-    });
+    let missing = tools.inspect_image(&InspectImageParams::new("rev_nope"));
     assert_eq!(
         error_payload(&missing)["error"]["code"],
         "revision_not_found"
@@ -493,6 +538,7 @@ fn tool_registration_matches_the_design_contract() {
             "apply_transform",
             "compare_revisions",
             "detect_document",
+            "detect_text_blocks",
             "detect_tilt",
             "explain_operation",
             "export_asset",
@@ -542,6 +588,7 @@ fn tool_registration_matches_the_design_contract() {
             "inspect_image"
                 | "detect_tilt"
                 | "detect_document"
+                | "detect_text_blocks"
                 | "list_assets"
                 | "list_operations"
                 | "explain_operation"
@@ -549,7 +596,7 @@ fn tool_registration_matches_the_design_contract() {
         assert_eq!(ann.read_only_hint, Some(read_only), "{}", tool.name);
         match tool.name.as_ref() {
             "import_asset" | "apply_transform" | "render_preview" | "compare_revisions"
-            | "generate_mask" => {
+            | "generate_mask" | "detect_text_blocks" => {
                 assert_eq!(ann.destructive_hint, Some(false), "{}", tool.name);
                 assert_eq!(ann.idempotent_hint, Some(true), "{}", tool.name);
             }
@@ -589,6 +636,21 @@ fn tool_registration_matches_the_design_contract() {
     );
     assert!(instructions.contains("long_edge"));
     assert!(instructions.contains("Do NOT binarize"));
+    // v0.6: 帯分割の判断(detect_text_blocks → recommended_bands)が載っていること。
+    assert!(
+        instructions.contains("detect_text_blocks"),
+        "instructions must point at the text-block workflow"
+    );
+    assert!(instructions.contains("recommended_bands"));
+    // v0.6: 文字描画の契約(render_text でのみ描かれる)が載っていること。
+    assert!(
+        instructions.contains("render_text"),
+        "instructions must state the svg text-rendering contract"
+    );
+    assert!(
+        !instructions.contains("text is never rendered"),
+        "the old \"text is never rendered\" contract must be gone"
+    );
     // op を instructions 側で列挙しないこと(列挙は list_operations の役目)。
     assert!(
         !instructions.contains("auto_orient | rotate"),
@@ -596,9 +658,13 @@ fn tool_registration_matches_the_design_contract() {
     );
     // instructions は毎セッションの固定費なので予算を持つ。JSON 例は1つ(flat recipe)だけ。
     // v0.5(DESIGN §9.12)で「画像内の文字を読む」ワークフロー 3 行分だけ枠を広げた
-    // (4700 → 5600)。これ以上の追加は list_operations / explain_operation 側へ。
+    // (4700 → 5600)。v0.6 でプリセットマクロ(Presets 段落 + 文字読みの手順 2)と
+    // export の一括化(手順 6)の説明を足して 5600 → 6000(実測 5936 文字)。
+    // さらに v0.6 の配線(svg_overlay の render_text 契約、detect_text_blocks の
+    // ツール行と文字読み手順 3)で 6000 → 6700(実測 6551 文字)。
+    // これ以上の追加は list_operations / explain_operation 側へ。
     assert!(
-        instructions.len() < 5600,
+        instructions.len() < 6700,
         "instructions must stay within budget, got {} chars",
         instructions.len()
     );
@@ -1020,7 +1086,7 @@ fn tools_list_schema_size_keeps_the_recipe_opaque() {
     let tools = AtxTools::open(workspace.path()).expect("open workspace");
     let server = atx_mcp::AtxServer::new(std::sync::Arc::new(tools));
     let listed = server.router().list_all();
-    assert_eq!(listed.len(), 12);
+    assert_eq!(listed.len(), 13);
 
     let mut total = 0usize;
     for tool in &listed {
@@ -1072,8 +1138,11 @@ fn tools_list_schema_size_keeps_the_recipe_opaque() {
 
     assert!(
         total < legacy_apply,
-        "all 12 tool schemas together must now be smaller than a single recipe-typed one"
+        "all 13 tool schemas together must now be smaller than a single recipe-typed one"
     );
+    // 実測: v0.5.2 で 8,002 chars。v0.6 で export の一括化・compare の追加出力・
+    // detect_text_blocks(13 本目)の分を足して 10,300 chars(~2,575 tokens)。
+    // 上限 12,000 は据え置き(これを超える追加は語彙ツール側へ逃がす)。
     assert!(
         total < 12_000,
         "tools/list input schemas must stay small, got {total} chars"
@@ -1089,4 +1158,175 @@ fn schema_len(listed: &[rmcp::model::Tool], name: &str) -> usize {
     serde_json::to_string(&tool.input_schema)
         .expect("schema serializes")
         .len()
+}
+
+// ---------------------------------------------------------------------------
+// v0.6: 検証系の拡張(inspect の sharpness / perceptual_hash / EXIF 全量、
+//       compare の知覚ハッシュ距離 / SSIM)
+// ---------------------------------------------------------------------------
+
+/// `inspect_image` は鮮鋭度と知覚ハッシュを常に返し、EXIF 全量は
+/// `include_exif: true` のときだけ返すこと(既定出力は v0.5 と同じ形)。
+#[test]
+fn inspect_reports_sharpness_perceptual_hash_and_opt_in_exif() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let tools = AtxTools::open(workspace.path()).expect("open workspace");
+    let rev = structured(&tools.import_asset(&ImportAssetParams::single(
+        fixture().to_string_lossy().into_owned(),
+    )))["revision"]["revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let result = tools.inspect_image(&InspectImageParams::new(rev.clone()));
+    let out = structured(&result);
+    let body = text(&result);
+
+    // 鮮鋭度: 合成シーンはぼけていないので正の値を持つ。
+    let sharpness = out["info"]["stats"]["sharpness"]
+        .as_f64()
+        .expect("stats.sharpness must be present");
+    assert!(sharpness > 0.0, "got {sharpness}");
+    assert!(body.contains("sharpness:"), "{body}");
+
+    // 知覚ハッシュ: 16 桁の小文字 16 進。
+    let hash = out["info"]["perceptual_hash"]
+        .as_str()
+        .expect("perceptual_hash must be present")
+        .to_string();
+    assert_eq!(hash.len(), 16, "got {hash}");
+    assert!(
+        hash.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+        "got {hash}"
+    );
+    assert!(body.contains("perceptual_hash:"), "{body}");
+
+    // 既定では EXIF 全量を出さない(プライバシー)。
+    assert!(
+        out["info"].get("exif").is_none(),
+        "include_exif を指定していないのに全量が載っている: {}",
+        out["info"]
+    );
+
+    // include_exif: true で全量が載る。フィクスチャは EXIF 除去済みなので 0 件。
+    let with_exif = tools.inspect_image(&InspectImageParams::new(rev.clone()).with_exif());
+    let out2 = structured(&with_exif);
+    let entries = out2["info"]["exif"]
+        .as_array()
+        .expect("include_exif: true は必ず配列を返す(0 件でも null にしない)");
+    assert!(entries.is_empty(), "EXIF レスのフィクスチャは 0 件");
+    assert!(text(&with_exif).contains("exif: 0 field(s)"));
+
+    // 他のフィールドは include_exif で変わらないこと。
+    assert_eq!(out["info"]["width"], out2["info"]["width"]);
+    assert_eq!(
+        out["info"]["perceptual_hash"],
+        out2["info"]["perceptual_hash"]
+    );
+
+    // ぼかした派生は鮮鋭度が下がる(sharpness が向きを持つ量であることの固定)。
+    let blurred = structured(
+        &tools.apply_transform(&TransformParams {
+            revision_id: Some(rev),
+            revision_ids: None,
+            recipe: Some(
+                serde_json::from_value(serde_json::json!({
+                    "operations": [{"op": "blur", "sigma": 3.0}, {"op": "encode", "format": "png"}]
+                }))
+                .unwrap(),
+            ),
+            preset: None,
+        }),
+    )["revision"]["revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let blurred_sharpness = structured(&tools.inspect_image(&InspectImageParams::new(blurred)))
+        ["info"]["stats"]["sharpness"]
+        .as_f64()
+        .expect("sharpness");
+    assert!(
+        blurred_sharpness < sharpness,
+        "blur σ3 must lower sharpness: {blurred_sharpness} vs {sharpness}"
+    );
+}
+
+/// `compare_revisions` は全 layout で知覚ハッシュ距離を返し、
+/// `layout: "diff"` でだけ SSIM を返すこと。
+#[test]
+fn compare_reports_hash_distance_on_every_layout_and_ssim_only_on_diff() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let tools = AtxTools::open(workspace.path()).expect("open workspace");
+    let base = structured(&tools.import_asset(&ImportAssetParams::single(
+        fixture().to_string_lossy().into_owned(),
+    )))["revision"]["revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 明度だけを動かした派生(寸法は同じなので diff / SSIM が測れる)。
+    let brighter = structured(
+        &tools.apply_transform(&TransformParams {
+            revision_id: Some(base.clone()),
+            revision_ids: None,
+            recipe: Some(
+                serde_json::from_value(serde_json::json!({
+                    "operations": [
+                        {"op": "adjust", "brightness": 0.15},
+                        {"op": "encode", "format": "png"}
+                    ]
+                }))
+                .unwrap(),
+            ),
+            preset: None,
+        }),
+    )["revision"]["revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 同じ revision どうし: 距離 0。
+    let same = tools.compare_revisions(&CompareRevisionsParams {
+        revision_id_a: base.clone(),
+        revision_id_b: base.clone(),
+        layout: CompareLayout::SideBySide,
+    });
+    let out = structured(&same);
+    assert_eq!(out["perceptual_hash_distance"], 0);
+    assert!(
+        out.get("ssim").is_none(),
+        "SSIM は diff レイアウトだけ: {out}"
+    );
+    assert!(text(&same).contains("hash distance 0"), "{}", text(&same));
+
+    // 明度違い: 距離は小さい(同じ絵)が、SSIM は 1 未満になる。
+    let diff = tools.compare_revisions(&CompareRevisionsParams {
+        revision_id_a: base.clone(),
+        revision_id_b: brighter.clone(),
+        layout: CompareLayout::Diff,
+    });
+    let out = structured(&diff);
+    let distance = out["perceptual_hash_distance"].as_u64().expect("distance");
+    assert!(
+        distance <= 5,
+        "a brightness-only change must stay within 5 bits, got {distance}"
+    );
+    let ssim = out["ssim"].as_f64().expect("diff layout must report ssim");
+    assert!(
+        (0.0..1.0).contains(&ssim),
+        "a visible brightness change must score below 1.0, got {ssim}"
+    );
+    let body = text(&diff);
+    assert!(body.contains("SSIM "), "{body}");
+    assert!(body.contains("hash distance "), "{body}");
+
+    // stacked でも距離は載る(レイアウトと無関係な問いなので)。
+    let stacked = structured(&tools.compare_revisions(&CompareRevisionsParams {
+        revision_id_a: base,
+        revision_id_b: brighter,
+        layout: CompareLayout::Stacked,
+    }));
+    assert_eq!(stacked["perceptual_hash_distance"], distance);
+    assert!(stacked.get("ssim").is_none());
 }

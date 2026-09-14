@@ -125,6 +125,8 @@ Adobe の強さの一半は既存アセット(フィルタ・プリセット・L
 > 実際にタグ付けされたリリースバージョンと 1 対 1 対応しない。実際の出荷記録は:
 > 実タグ **v0.2.0** が本セクションの plan-v0.2 〜 plan-v0.8 の作業をまとめて含み、
 > 実タグ **v0.3.0** が op/プリセットのコンテンツ拡張(§9.10 参照)にあたる。
+> 実タグ **v0.5.0** が plan-v0.9(ドキュメント前処理、§9.12)、実タグ **v0.6.0** が plan-v0.10
+> (エージェント作業基盤、§9.15)にあたる。plan-v0.6(レイヤーグラフ前半)とは別物。
 > 実装として確定した内容の一次情報は常に `docs/DESIGN.md` §9 側を参照すること。
 
 ### v0.2 — 調整系の第一波 + 語彙参照ツール(Phase A 前半)
@@ -198,6 +200,20 @@ OCR エンジンは載せずに**読み手に渡す画素を決定論的に整�
 - 読み手は VLM を既定とし、**二値化は既定にしない**(VLM にはストローク欠けが逆効果)
 - eval: 合成ドキュメント写真・ダーク UI スクショのフィクスチャと t14 / t15 を追加
 - 含めない: OCR エンジン本体、ML 文字領域検出、専用 deskew op(detect_tilt で足りるか eval で判定)
+
+### v0.10 — エージェント作業基盤の拡充(2026-09-14 追加)
+
+v0.9 で広げた守備範囲(画像を材料に仕事をするエージェント一般)から見て、エージェントが毎回
+自前で埋めている手間を 7 項目まとめて引き受ける(詳細は DESIGN.md §9.15)。op 数 29 は不変。
+
+- プリセットマクロ `{"op":"preset","name":...}`(レシピ内でプリセットを合成。展開後にハッシュ)
+- `export_asset` の一括化(`revision_ids` + `dest_dir` + `filename_template`。import / apply と同型)
+- 読みやすさの数値化: `render_preview.estimated_vision_tokens`、`inspect_image.stats.sharpness`
+- `svg_overlay` の文字描画: `render_text`(オプトイン)+ 同梱 Roboto + フォントアセット参照 `font_revision_ids`
+- 検出系ツール `detect_text_blocks`(文字ブロック + 読み順 + 帯分割の `crop.rect` 提案)
+- 知覚ハッシュ(dHash)を inspect に、`perceptual_hash_distance` / `ssim` を compare に
+- `inspect_image.include_exif` で EXIF 全量(既定出力は不変、オプトイン)
+- 含めない: OCR エンジン、ML 文字検出、PDF 入力(決定論的ラスタライズの純 Rust 実装が未成熟。需要待ち)、CJK フォント同梱
 
 ### v0.8+ — 入出力の翼(Phase E、需要駆動)
 

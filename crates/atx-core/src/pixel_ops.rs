@@ -52,15 +52,46 @@ pub(crate) fn from_f32_image(img: &F32Image) -> LinearImage {
 ///
 /// v1 は `image::imageops` に委譲していたが、v2 の中間表現が f32 RGBA になったので
 /// 添字の並べ替えとして直接実装する(補間は挟まらないので厳密・可逆)。
+///
+/// 対応は EXIF 仕様の定義そのまま(すべて「正立させるために施す操作」):
+/// 2 = 左右反転 / 3 = 180° / 4 = 上下反転 / 5 = 左右反転 + 時計回り 270° /
+/// 6 = 時計回り 90° / 7 = 左右反転 + 時計回り 90° / 8 = 時計回り 270°。
+///
+/// **5 と 7 は互いに逆**である(5 は主対角線での転置、7 は反対角線での転置)。
+/// 以前はこの 2 つを取り違えていて、転置系の EXIF を持つ写真が鏡像で出ていた。
+/// テストが Orientation=6 しか触っていなかったため長く残った
+/// (`tests/engine.rs` の `exif_orientation_5_and_7_follow_the_spec` で固定した)。
 pub(crate) fn apply_orientation(img: LinearImage, orientation: u16) -> LinearImage {
     match orientation {
         2 => flip_horizontal(&img),
         3 => rotate180(&img),
         4 => flip_vertical(&img),
-        5 => rotate90(&flip_horizontal(&img)),
+        5 => rotate270(&flip_horizontal(&img)),
         6 => rotate90(&img),
-        7 => rotate270(&flip_horizontal(&img)),
+        7 => rotate90(&flip_horizontal(&img)),
         8 => rotate270(&img),
+        _ => img,
+    }
+}
+
+/// EXIF Orientation(1-8)を **8bit の `DynamicImage`** へ焼き込む。
+///
+/// [`apply_orientation`](f32 リニア表現用)と**同じ写像**であることを、合成の順序まで
+/// 同じ式で書くことで保証する(`image` 側の `rotate90` / `fliph` は
+/// `LinearImage` 版の `rotate90` / `flip_horizontal` と同じ定義)。
+///
+/// 用途は「レシピを適用しない読み取り系」: `inspect_bytes` の知覚ハッシュ /
+/// 鮮鋭度と、MCP 層の検出系ツール(detect_tilt 等)。どちらも
+/// `apply_recipe` がデコード直後に行う正規化と同じ向きで画素を見る必要がある。
+pub(crate) fn orient_dynamic(img: image::DynamicImage, orientation: u16) -> image::DynamicImage {
+    match orientation {
+        2 => img.fliph(),
+        3 => img.rotate180(),
+        4 => img.flipv(),
+        5 => img.fliph().rotate270(),
+        6 => img.rotate90(),
+        7 => img.fliph().rotate90(),
+        8 => img.rotate270(),
         _ => img,
     }
 }
@@ -145,12 +176,12 @@ pub(crate) fn orientation_affine(width: u32, height: u32, orientation: u16) -> A
         3 => Affine::linear(-1.0, 0.0, w, 0.0, -1.0, h),
         // flip_vertical
         4 => Affine::linear(1.0, 0.0, 0.0, 0.0, -1.0, h),
-        // rotate90(flip_horizontal) => (h - y, w - x)
-        5 => Affine::linear(0.0, -1.0, h, -1.0, 0.0, w),
+        // rotate270(flip_horizontal) => (y, x)(主対角線での転置)
+        5 => Affine::linear(0.0, 1.0, 0.0, 1.0, 0.0, 0.0),
         // rotate90 => (h - y, x)
         6 => Affine::linear(0.0, -1.0, h, 1.0, 0.0, 0.0),
-        // rotate270(flip_horizontal) => (y, x)(転置)
-        7 => Affine::linear(0.0, 1.0, 0.0, 1.0, 0.0, 0.0),
+        // rotate90(flip_horizontal) => (h - y, w - x)(反対角線での転置)
+        7 => Affine::linear(0.0, -1.0, h, -1.0, 0.0, w),
         // rotate270 => (y, w - x)
         8 => Affine::linear(0.0, 1.0, 0.0, -1.0, 0.0, w),
         _ => Affine::IDENTITY,

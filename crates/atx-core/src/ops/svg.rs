@@ -9,17 +9,34 @@
 //!
 //! # 決定論とフォント(この op の中核設計)
 //!
-//! `resvg` は **`default-features = false`** で依存している。既定で有効な
-//! `text` / `system-fonts` は **システムにインストールされたフォントを読みに行く**ため、
-//! 同じレシピ・同じ SVG が「実行したマシンによって違うバイト列を出す」ことになり、
-//! 本プロジェクトの横断規律(バイト同一の再現性)と正面から矛盾する。
-//! フォントは OS・バージョン・ユーザのインストール状況で変わり、
-//! ヒンティングやフォールバックの選択まで揺れるので、「空の fontdb を渡す」よりも
-//! **`text` 機能ごとビルドから外す**方が強い保証になる(fontdb がリンクすらされない)。
+//! `resvg` は `default-features = false` + `features = ["text"]` で依存している。
+//! 既定で有効な **`system-fonts` / `memmap-fonts` は付けない**: これらは
+//! システムにインストールされたフォントを読みに行くため、同じレシピ・同じ SVG が
+//! 「実行したマシンによって違うバイト列を出す」ことになり、本プロジェクトの横断規律
+//! (バイト同一の再現性)と正面から矛盾する。`text` 単独では usvg のフォント DB
+//! (`fontdb`)は**空**で、こちらが明示的に `load_font_data` したバイト列だけが使われる。
+//! 整形器は harfrust + skrifa(純 Rust、乱数も環境参照も無い)。
 //!
-//! 帰結として **`<text>` 要素は描画されない**。SVG のソースに `<text` が現れたら
-//! 実行時警告を出し、「テキストをパスへ変換せよ(= 決定論的な出力になる)」と伝える。
-//! これは制約ではなく契約である: パス化された文字は、どのマシンでも同じ画素になる。
+//! この上で、文字描画は **オプトイン**(`svg_overlay.render_text: true`)である:
+//!
+//! - `render_text: false`(既定): fontdb は空のまま。どの `font-family` も解決できず
+//!   **`<text>` 要素は描画されない**。SVG のソースに `<text` が現れたら実行時警告
+//!   [`TEXT_WARNING`] を出し、「テキストをパスへ変換せよ」と伝える。v0.8 からの挙動で、
+//!   既存レシピの出力バイト列は 1 ビットも動かない。
+//! - `render_text: true`: fontdb に**同梱書体**(`assets/fonts/Roboto-Regular.ttf`、
+//!   Apache-2.0。`include_bytes!` でバイナリに埋め込む)を入れ、続いて
+//!   `font_revision_ids` が指す font アセットを**指定順**に入れる。さらに
+//!   serif / sans-serif / monospace / cursive / fantasy の 5 つの総称ファミリと
+//!   `Options::font_family`(未知の `font-family` に対する既定)を**すべて同梱書体の
+//!   ファミリ名に固定**し、`languages` を `["en"]` に固定する。
+//!   したがってフォント選択は「同梱書体 + 明示的に渡されたアセット」の閉じた集合内で
+//!   決まり、ホスト環境は結果に一切入らない。
+//!
+//! グリフを持たない文字(例: 同梱 Roboto だけで日本語を描こうとした場合)は、
+//! 同梱書体の `.notdef`(いわゆる豆腐の □)として描かれる。依頼した文字は出ないのに
+//! 画素は埋まるので、出力からは気づけない。そこで描画の前に `<text>` 配下の
+//! **全子孫**テキストノードの文字を集め、DB 内の全フェイスの文字マップ
+//! (skrifa の `charmap`)と突き合わせ、欠落した文字の種類数を警告にする。
 //!
 //! ラスタライズ自体(tiny-skia)は f32 スカラ/固定小数の演算で乱数も反復も持たないので
 //! 決定論的である。`tests/svg_overlay.rs` の「2 回実行してバイト同一」がこれを固定する。
@@ -61,7 +78,28 @@ pub(crate) const TEXT_WARNING: &str =
     "svg contains text elements; text is not rendered (convert text to paths for \
      deterministic output)";
 
+/// 同梱書体: Roboto Regular(Apache-2.0、googlefonts/roboto v2.138)。
+///
+/// バイナリに埋め込む(`include_bytes!`)ので、実行環境にフォントが 1 本も
+/// 入っていなくても `render_text: true` は同じ結果を出す。告知は
+/// リポジトリ直下の `THIRD_PARTY_NOTICES.md` と `assets/fonts/LICENSE-Roboto.txt`。
+const BUNDLED_FONT: &[u8] = include_bytes!("../../assets/fonts/Roboto-Regular.ttf");
+
+/// 同梱書体のファミリ名が取れなかった場合の保険(通常は name テーブルから取る)。
+const BUNDLED_FONT_FALLBACK_FAMILY: &str = "Roboto";
+
+/// font アセット 1 本のバイト上限(32MiB)。CJK 書体(5〜20MB)を通せる幅。
+pub const MAX_FONT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// 1 つの `svg_overlay` に渡せる font アセットの本数上限。
+pub(crate) const MAX_FONT_ASSETS: usize = 4;
+
 /// `svg_overlay` の静的検証(入力バイト列に依存しない制約のみ)。
+///
+/// 引数は DSL のフィールドをそのまま平らに受ける(op ごとの validate の共通作法)。
+/// 専用の構造体を作ると recipe.rs の enum バリアントと二重定義になるので、
+/// clippy の引数個数上限はここでは緩める。
+#[allow(clippy::too_many_arguments)]
 pub fn validate(
     index: usize,
     svg_revision_id: &str,
@@ -70,7 +108,28 @@ pub fn validate(
     opacity: f64,
     width: Option<u32>,
     height: Option<u32>,
+    font_revision_ids: &[String],
 ) -> Result<()> {
+    if font_revision_ids.len() > MAX_FONT_ASSETS {
+        return Err(AtxError::InvalidRecipe(format!(
+            "operations[{index}] (svg_overlay): font_revision_ids may hold at most \
+             {MAX_FONT_ASSETS} entries, got {}",
+            font_revision_ids.len()
+        )));
+    }
+    for (k, id) in font_revision_ids.iter().enumerate() {
+        if id.is_empty() {
+            return Err(AtxError::InvalidRecipe(format!(
+                "operations[{index}] (svg_overlay): font_revision_ids[{k}] must not be empty"
+            )));
+        }
+        if !id.starts_with("rev_") {
+            return Err(AtxError::InvalidRecipe(format!(
+                "operations[{index}] (svg_overlay): font_revision_ids[{k}] must start with \
+                 \"rev_\", got {id:?}"
+            )));
+        }
+    }
     if svg_revision_id.is_empty() {
         return Err(AtxError::InvalidRecipe(format!(
             "operations[{index}] (svg_overlay): svg_revision_id must not be empty"
@@ -121,9 +180,9 @@ pub(crate) const EXTERNAL_IMAGE_WARNING: &str =
 
 /// 決定論のためのフォント無し・外部参照無し usvg オプション。
 ///
-/// `resvg` を `default-features = false` でビルドしているため
-/// `Options` に `fontdb` / `font_resolver` フィールドは**存在しない**
-/// (= システムフォントを読む経路がコンパイル時に消えている)。
+/// `Options::default()` のフォント DB は**空**(`system-fonts` を付けていないので
+/// システムフォントを読む経路がそもそもビルドに入っていない)。空 DB では
+/// どの `font-family` も解決できず `<text>` は描画されない = v0.8 からの既定の挙動。
 ///
 /// # `<image href>` の解決(セキュリティ点検で閉じた経路)
 ///
@@ -143,6 +202,215 @@ fn options() -> usvg::Options<'static> {
     let mut opt = usvg::Options::default();
     opt.image_href_resolver.resolve_string = Box::new(|_, _| None);
     opt
+}
+
+/// `render_text: true` のときに使うフォント群。
+///
+/// `extra` は `font_revision_ids` の**指定順**に並んだ font アセットのバイト列
+/// (engine が `AssetResolver` から読み、[`validate_font_asset`] を通したもの)。
+/// 同梱書体は常に先頭に入るので、ここには含まれない。
+/// バイト列は `Arc` で共有する(`fontdb` へ渡すときも複製しない)。
+#[derive(Debug, Default)]
+pub(crate) struct TextFonts {
+    pub extra: Vec<std::sync::Arc<Vec<u8>>>,
+}
+
+/// 同梱書体だけを載せた fontdb と、そのファミリ名。プロセスで 1 回だけ構築する。
+///
+/// 以前は op ごとに `Database::new()` + `load_font_data(BUNDLED_FONT.to_vec())` で、
+/// 349KB の Roboto を複製してから再パースしていた。`Database` の clone は
+/// `Source::Binary(Arc<..>)` の参照を増やすだけなので、バイト列はプロセス全体で 1 本、
+/// フェイスの解析も 1 回で済む。
+///
+/// 総称ファミリ 5 種をここで同梱書体に固定しておく(clone が引き継ぐ)。これにより
+/// SVG が `font-family="sans-serif"` と書いていても解決先は常に DB の中の書体になり、
+/// ホスト環境は結果に入らない。
+fn bundled_db() -> &'static (usvg::fontdb::Database, String) {
+    static BUNDLED: std::sync::OnceLock<(usvg::fontdb::Database, String)> =
+        std::sync::OnceLock::new();
+    BUNDLED.get_or_init(|| {
+        // 必ず**空の DB から**組み立てる(usvg の既定がいつか何かを読み込むように
+        // なっても「入っているのは同梱書体と渡されたアセットだけ」を保てるように)。
+        let mut db = usvg::fontdb::Database::new();
+        db.load_font_source(usvg::fontdb::Source::Binary(std::sync::Arc::new(
+            BUNDLED_FONT,
+        )));
+        // 同梱書体のファミリ名は fontdb 自身が name テーブルから読んだものを使う
+        // (usvg の family 照合はこの文字列で行われるため、自前の推測とずれない)。
+        let family = db
+            .faces()
+            .next()
+            .and_then(|f| f.families.first().map(|(name, _)| name.clone()))
+            .unwrap_or_else(|| BUNDLED_FONT_FALLBACK_FAMILY.to_string());
+        db.set_serif_family(family.clone());
+        db.set_sans_serif_family(family.clone());
+        db.set_monospace_family(family.clone());
+        db.set_cursive_family(family.clone());
+        db.set_fantasy_family(family.clone());
+        (db, family)
+    })
+}
+
+/// 文字描画用の usvg オプション。[`options`] に「満たした fontdb」を足したもの。
+///
+/// 総称ファミリ 5 種と `font_family`(未知の family に対する既定)を全部
+/// **同梱書体のファミリ名**に固定する。これにより SVG が
+/// `font-family="Nonexistent"` や `font-family="sans-serif"` と書いていても、
+/// 解決先は常に「DB の中にある書体」になり、ホスト環境は結果に入らない。
+fn text_options(fonts: &TextFonts) -> usvg::Options<'static> {
+    let mut opt = options();
+    let (bundled, bundled_family) = bundled_db();
+    let db = opt.fontdb_mut();
+    // 同梱書体入りの DB を clone して、渡された font アセットを**指定順**に足す。
+    // clone も load_font_source も Arc の参照を増やすだけで、バイト列は複製しない。
+    *db = bundled.clone();
+    for bytes in &fonts.extra {
+        db.load_font_source(usvg::fontdb::Source::Binary(bytes.clone()));
+    }
+    opt.font_family = bundled_family.clone();
+    // 言語依存の整形(ロケール別グリフ選択)を固定する。
+    opt.languages = vec!["en".to_string()];
+    opt
+}
+
+/// `<text>` 要素の中の文字のうち、DB のどのフェイスにもグリフが無いものの**種類数**。
+///
+/// グリフの無い文字は、同梱書体の `.notdef`(いわゆる豆腐の □)として描かれる
+/// = 依頼した文字は出ないが、画素からはそれが分からない。だから描画の**前に**自分で
+/// 数えて呼び出し元へ伝える。判定は skrifa の `charmap`(= usvg の整形器 harfrust が
+/// 使うのと同じパーサ)。空白類は欠落しても見た目に出ないので数えない。
+///
+/// 走査対象は `<text>` 配下の**全子孫**テキストノード。`<tspan>` だけでなく
+/// `<textPath>` / `<a>` / `<tref>` に包まれた文字も描かれるので、直接の子だけを見ると
+/// CJK が豆腐になっても警告が 0 件になる。
+fn missing_glyph_chars(doc: &usvg::roxmltree::Document, db: &usvg::fontdb::Database) -> usize {
+    // 種類数だけを返すので集合で持つ(`Vec::contains` は総文字数 × 種類数かかる)。
+    // `BTreeSet` なので反復順も決定論的。
+    let mut chars: std::collections::BTreeSet<char> = std::collections::BTreeSet::new();
+    for text_element in doc
+        .descendants()
+        .filter(|n| n.is_element() && n.has_tag_name("text"))
+    {
+        for node in text_element.descendants().filter(|n| n.is_text()) {
+            chars.extend(
+                node.text()
+                    .unwrap_or("")
+                    .chars()
+                    .filter(|c| !c.is_whitespace()),
+            );
+        }
+    }
+    if chars.is_empty() {
+        return 0;
+    }
+    // フェイスごとに「まだ見つかっていない文字」を消していく。
+    // 反復順は `faces()`(挿入順の Vec)なので決定論的。
+    let ids: Vec<_> = db.faces().map(|f| f.id).collect();
+    for id in ids {
+        if chars.is_empty() {
+            break;
+        }
+        db.with_face_data(id, |data, index| {
+            if let Ok(font) = skrifa::FontRef::from_index(data, index) {
+                let charmap = skrifa::MetadataProvider::charmap(&font);
+                chars.retain(|ch| charmap.map(*ch).is_none());
+            }
+        });
+    }
+    chars.len()
+}
+
+/// グリフ欠落の警告文(文言はテストで固定する)。
+fn missing_glyph_warning(n: usize) -> String {
+    format!(
+        "svg text uses {n} character(s) with no glyph in the loaded fonts \
+         (import a font asset and pass font_revision_ids)"
+    )
+}
+
+/// font アセットの検証結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontAssetInfo {
+    /// SVG の `font-family` に書ける名前(fontdb が name テーブルから読んだもの。
+    /// 1 ファイルに複数フェイスがある場合は全フェイス分、重複を除いて挿入順)。
+    pub families: Vec<String>,
+    /// 先頭フェイスのグリフ数(`maxp.numGlyphs`)。
+    /// [`validate_font_asset`] が 0 を拒否した後の値なので必ず 1 以上。
+    pub glyph_count: u16,
+}
+
+/// font アセットとして取り込んでよいバイト列かを検証する。
+///
+/// `import_asset`(MCP 層)と `svg_overlay` の実行時(engine)の**両方**が通す入口。
+/// 受け入れる形式は単一フェイスの TrueType / OpenType のみ:
+///
+/// - 先頭 4 バイトが `00 01 00 00`(TrueType)/ `OTTO`(CFF アウトライン)/ `true`(旧 Mac)
+/// - skrifa(usvg の整形器と同じパーサ)で解析でき、`maxp` と name テーブルがある
+/// - `maxp.numGlyphs` が 1 以上(グリフを持たないフォントは 1 文字も描けないので、
+///   渡されても「全部豆腐」になるだけ。理由が見える位置で弾く)
+/// - `ttcf`(フォントコレクション)は**拒否**する: 「どのフェイスを使うか」が
+///   レシピに表せず決定論的に指せないため。1 フェイスを取り出して渡してもらう
+///
+/// エラーは英語の平文(MCP 層がそのまま利用者に見せる。`validate_svg_asset` /
+/// `validate_cube_asset` と同じ規約)。
+pub fn validate_font_asset(bytes: &[u8]) -> std::result::Result<FontAssetInfo, String> {
+    if bytes.len() as u64 > MAX_FONT_BYTES {
+        return Err(format!(
+            "the font is {} bytes, over the {MAX_FONT_BYTES} byte limit for a font asset",
+            bytes.len()
+        ));
+    }
+    let magic = bytes.get(..4).ok_or(
+        "the file is too short to be a font (expected a TrueType or OpenType header)".to_string(),
+    )?;
+    if magic == b"ttcf" {
+        return Err(
+            "this is a TrueType/OpenType collection (.ttc); font collections are not supported; \
+             extract one face and import that single font file"
+                .to_string(),
+        );
+    }
+    if !matches!(magic, [0x00, 0x01, 0x00, 0x00] | b"OTTO" | b"true") {
+        return Err(
+            "the file does not start with a TrueType or OpenType signature (expected \
+             00 01 00 00, \"OTTO\" or \"true\"); .woff / .woff2 are not supported"
+                .to_string(),
+        );
+    }
+    let font =
+        skrifa::FontRef::new(bytes).map_err(|e| format!("the font is not parseable: {e}"))?;
+    let glyph_count = skrifa::raw::TableProvider::maxp(&font)
+        .map_err(|e| format!("the font has no usable maxp table: {e}"))?
+        .num_glyphs();
+    if glyph_count == 0 {
+        return Err(
+            "the font declares no glyphs (maxp.numGlyphs is 0), so it cannot draw any character"
+                .to_string(),
+        );
+    }
+
+    // family 名は fontdb に読ませる(usvg の family 照合と同じ文字列になる)。
+    let mut db = usvg::fontdb::Database::new();
+    db.load_font_data(bytes.to_vec());
+    let mut families: Vec<String> = Vec::new();
+    for face in db.faces() {
+        for (name, _) in &face.families {
+            if !families.contains(name) {
+                families.push(name.clone());
+            }
+        }
+    }
+    if families.is_empty() {
+        return Err(
+            "the font has no family name in its name table, so it cannot be referenced from a \
+             font-family in the SVG"
+                .to_string(),
+        );
+    }
+    Ok(FontAssetInfo {
+        families,
+        glyph_count,
+    })
 }
 
 /// ルート配下に「外部参照の `<image>`」(href が `data:` 以外)があるか。
@@ -242,18 +510,23 @@ pub(crate) struct Raster {
 
 /// SVG を目標寸法へラスタライズする。
 ///
+/// `text` が `None`(= `render_text: false`)ならフォント DB は空で `<text>` は
+/// 描画されない。`Some` なら同梱書体 + 渡された font アセットで文字を描く
+/// (モジュール冒頭の「決定論とフォント」を参照)。
+///
 /// 失敗は呼び出し側(engine)が `AtxError::Operation` へ包む前提の平文メッセージで返す。
 pub(crate) fn rasterize(
     bytes: &[u8],
     width: Option<u32>,
     height: Option<u32>,
+    text: Option<&TextFonts>,
 ) -> std::result::Result<Raster, String> {
-    let text = source_text(bytes).ok_or_else(|| {
+    let text_source = source_text(bytes).ok_or_else(|| {
         "the referenced asset is not valid UTF-8 XML; svg_overlay needs a plain (non-gzipped) \
          .svg file"
             .to_string()
     })?;
-    let doc = usvg::roxmltree::Document::parse(text)
+    let doc = usvg::roxmltree::Document::parse(text_source)
         .map_err(|e| format!("the referenced asset is not parseable XML: {e}"))?;
     let root = doc.root_element();
     if !root.has_tag_name("svg") {
@@ -263,7 +536,35 @@ pub(crate) fn rasterize(
         ));
     }
     let intrinsic = has_intrinsic_size(&root);
-    let tree = usvg::Tree::from_xmltree(&doc, &options())
+    // `<text>` が 1 つも無い SVG では fontdb を組まない(描く文字が無いので出力は同じ)。
+    let has_text_element = doc
+        .descendants()
+        .any(|n| n.is_element() && n.has_tag_name("text"));
+    let opt = match text {
+        Some(fonts) if has_text_element => text_options(fonts),
+        _ => options(),
+    };
+    let mut warnings = Vec::new();
+    match text {
+        // 文字描画あり: グリフ被覆を描画前に数える
+        // (欠落した文字は .notdef の □ になるので、画素からは気づけない)。
+        Some(_) if has_text_element => {
+            let missing = missing_glyph_chars(&doc, &opt.fontdb);
+            if missing > 0 {
+                warnings.push(missing_glyph_warning(missing));
+            }
+        }
+        Some(_) => {}
+        // 文字描画なし: フォントを一切読まないので `<text>` は描画されない
+        // (モジュール冒頭の設計note)。判定は素朴な文字列走査で十分
+        // (誤検出しても警告が 1 本増えるだけ)。
+        None => {
+            if text_source.contains("<text") {
+                warnings.push(TEXT_WARNING.to_string());
+            }
+        }
+    }
+    let tree = usvg::Tree::from_xmltree(&doc, &opt)
         .map_err(|e| format!("the referenced asset is not a renderable SVG: {e}"))?;
 
     // 目標寸法。固有サイズが無い SVG は usvg の既定 100x100 に落ちるので、
@@ -304,12 +605,6 @@ pub(crate) fn rasterize(
         ));
     }
 
-    let mut warnings = Vec::new();
-    // フォントを一切読まないので `<text>` は描画されない(モジュール冒頭の設計note)。
-    // 判定は素朴な文字列走査で十分(誤検出しても警告が 1 本増えるだけ)。
-    if text.contains("<text") {
-        warnings.push(TEXT_WARNING.to_string());
-    }
     if has_external_image(&doc) {
         warnings.push(EXTERNAL_IMAGE_WARNING.to_string());
     }
@@ -404,34 +699,34 @@ mod tests {
     fn percent_size_without_viewbox_has_no_intrinsic_size() {
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%"><rect width="10" height="10"/></svg>"#;
         assert_eq!(intrinsic_size(svg.as_bytes()), None);
-        let err = rasterize(svg.as_bytes(), None, None).unwrap_err();
+        let err = rasterize(svg.as_bytes(), None, None, None).unwrap_err();
         assert!(err.contains("no intrinsic size"), "{err}");
         // 両方指定すれば通る。
-        assert!(rasterize(svg.as_bytes(), Some(4), Some(4)).is_ok());
+        assert!(rasterize(svg.as_bytes(), Some(4), Some(4), None).is_ok());
     }
 
     #[test]
     fn not_svg_and_not_xml_are_distinct_errors() {
         assert!(intrinsic_size(b"\x89PNG\r\n").is_none());
-        let err = rasterize(b"not xml at all", None, None).unwrap_err();
+        let err = rasterize(b"not xml at all", None, None, None).unwrap_err();
         assert!(err.contains("not parseable XML"), "{err}");
-        let err = rasterize(b"<html><body/></html>", None, None).unwrap_err();
+        let err = rasterize(b"<html><body/></html>", None, None, None).unwrap_err();
         assert!(err.contains("not <svg>"), "{err}");
     }
 
     /// 幅だけ指定すると縦横比が保たれる(8x4 → 幅 16 なら高さ 8)。
     #[test]
     fn width_only_preserves_the_aspect_ratio() {
-        let r = rasterize(BADGE.as_bytes(), Some(16), None).unwrap();
+        let r = rasterize(BADGE.as_bytes(), Some(16), None, None).unwrap();
         assert_eq!(r.img.dimensions(), (16, 8));
-        let r = rasterize(BADGE.as_bytes(), None, Some(8)).unwrap();
+        let r = rasterize(BADGE.as_bytes(), None, Some(8), None).unwrap();
         assert_eq!(r.img.dimensions(), (16, 8));
     }
 
     /// 不透明な赤い矩形はストレートアルファで厳密に (1, 0, 0, 1) になる。
     #[test]
     fn opaque_fill_unpremultiplies_exactly() {
-        let r = rasterize(BADGE.as_bytes(), None, None).unwrap();
+        let r = rasterize(BADGE.as_bytes(), None, None, None).unwrap();
         assert_eq!(r.img.dimensions(), (8, 4));
         assert_eq!(r.img.get(4, 2), [1.0, 0.0, 0.0, 1.0]);
         assert!(r.warnings.is_empty());
@@ -440,20 +735,20 @@ mod tests {
     #[test]
     fn text_elements_raise_a_warning() {
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="4"><text x="0" y="3">hi</text></svg>"#;
-        let r = rasterize(svg.as_bytes(), None, None).unwrap();
+        let r = rasterize(svg.as_bytes(), None, None, None).unwrap();
         assert_eq!(r.warnings, vec![TEXT_WARNING.to_string()]);
     }
 
     #[test]
     fn validate_matrix() {
-        assert!(validate(0, "rev_x", 0, 0, 1.0, None, None).is_ok());
-        assert!(validate(0, "", 0, 0, 1.0, None, None).is_err());
-        assert!(validate(0, "nope", 0, 0, 1.0, None, None).is_err());
-        assert!(validate(0, "rev_x", 0, 0, 1.5, None, None).is_err());
-        assert!(validate(0, "rev_x", 0, 0, f64::NAN, None, None).is_err());
-        assert!(validate(0, "rev_x", 0, 0, 1.0, Some(0), None).is_err());
-        assert!(validate(0, "rev_x", 0, 0, 1.0, None, Some(0)).is_err());
-        assert!(validate(0, "rev_x", 0, 0, 1.0, Some(MAX_RASTER_EDGE + 1), None).is_err());
+        assert!(validate(0, "rev_x", 0, 0, 1.0, None, None, &[]).is_ok());
+        assert!(validate(0, "", 0, 0, 1.0, None, None, &[]).is_err());
+        assert!(validate(0, "nope", 0, 0, 1.0, None, None, &[]).is_err());
+        assert!(validate(0, "rev_x", 0, 0, 1.5, None, None, &[]).is_err());
+        assert!(validate(0, "rev_x", 0, 0, f64::NAN, None, None, &[]).is_err());
+        assert!(validate(0, "rev_x", 0, 0, 1.0, Some(0), None, &[]).is_err());
+        assert!(validate(0, "rev_x", 0, 0, 1.0, None, Some(0), &[]).is_err());
+        assert!(validate(0, "rev_x", 0, 0, 1.0, Some(MAX_RASTER_EDGE + 1), None, &[]).is_err());
     }
 
     /// 回帰: 青天井の `x` / `y` は validate で弾く。
@@ -469,12 +764,12 @@ mod tests {
             (MAX_OFFSET + 1, 0),
             (0, -MAX_OFFSET - 1),
         ] {
-            let err = validate(0, "rev_x", x, y, 1.0, None, None)
+            let err = validate(0, "rev_x", x, y, 1.0, None, None, &[])
                 .expect_err("out-of-range offset must be rejected");
             assert!(err.to_string().contains("svg_overlay"), "{err}");
         }
         // 上限ちょうどは通る(画像の外へ大きく逃がす配置は仕様の範囲内)。
-        assert!(validate(0, "rev_x", -MAX_OFFSET, MAX_OFFSET, 1.0, None, None).is_ok());
+        assert!(validate(0, "rev_x", -MAX_OFFSET, MAX_OFFSET, 1.0, None, None, &[]).is_ok());
     }
 
     /// 回帰: 上限いっぱいの負オフセットでも桁あふれせず、全部クリップされるだけ。

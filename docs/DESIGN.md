@@ -920,6 +920,12 @@ ROADMAP の Phase E(入出力の翼)から「resvg 焼き込み」を先に取�
 
 #### 決定論とフォント(このリリースの中核判断)
 
+> **2026-09-14 追記(§9.15)**: 本節の「`text` 機能ごとビルドから外す」判断は v0.6.0 で改められた。
+> 現在は usvg の `text` 機能を有効にし(`system-fonts` は無効のまま)、**空の fontdb に同梱 Roboto と
+> フォントアセットだけを載せる**ことで決定論を保っている。`render_text` 既定 false のため本節の挙動は
+> 既定では変わらない。以下は v0.8 時点の判断の記録。
+
+
 `resvg` を **`default-features = false`** で入れた。既定で有効な
 `text` / `system-fonts` は **システムにインストールされたフォントを読みに行く**。
 フォントは OS・バージョン・ユーザのインストール状況で変わり、フォールバックの
@@ -1469,3 +1475,198 @@ import で呼ぶ。不正なら新しいエラーコード `invalid_asset`(英�
 **テスト**: `garbage_cube_file_is_rejected`、`garbage_svg_file_is_rejected`、
 `xml_that_is_not_svg_is_rejected`(修正前はいずれも取り込めてしまい失敗することを確認)、
 `valid_cube_and_svg_fixtures_still_import`(既存の合成フィクスチャ 4 件)。
+
+### 9.15 エージェント作業基盤の拡充(2026-09-14)
+
+#### 動機
+
+v0.5.0 の OCR 前処理(§9.12)で、本サーバの読み手は「メディア制作者の代わりに動くエージェント」から
+「画像を材料に仕事をするエージェント一般」へ広がった。その目線で全 12 ツール・29 op を見直すと、
+不足は画像処理の語彙ではなく**エージェントが毎回自前で埋めている手間**だった。本節は 7 項目を
+1 リリース(0.6.0)にまとめる。op 数 29 は変えず、ツール追加は検出系 1 本(`detect_text_blocks`)のみ。
+
+不変の原則: 決定論、原本不変、既存レシピの canonical hash 不変(新フィールドは default + skip_serializing_if)、
+既存ゴールデン(特に `golden_svg_overlay_pipeline_sha256`)のバイト不変。
+
+| # | 項目 | 分類 | 触る面 |
+|---|---|---|---|
+| 1 | プリセットマクロ `{"op":"preset","name":...}` | 語彙の圧縮 | MCP 層(展開後に core へ) |
+| 2 | export_asset の一括化 | 既存ツールのバッチ対応 | MCP 層 |
+| 3 | 読みやすさの数値化(`stats.sharpness`、`estimated_vision_tokens`) | 検証系の拡張 | core + MCP |
+| 4 | svg_overlay の文字描画(`render_text`、`font_revision_ids`、フォントアセット) | op 拡張 | core + MCP |
+| 5 | `detect_text_blocks`(文字ブロック検出 + 帯分割提案) | 検出系ツール追加 | geometry + MCP |
+| 6 | 知覚ハッシュ(dHash)+ SSIM | 検証系の拡張 | core + MCP |
+| 7 | EXIF 全量取得(`inspect_image.include_exif`) | 検証系の拡張(オプトイン) | core + MCP |
+
+#### 1. プリセットマクロ
+
+レシピ内に `{"op":"preset","name":"ocr_document"}` と書くと、MCP 層がプリセットの operations を
+その場に展開してから core へ渡す(`operations[]` と `layers[*].operations[]` の両方)。
+canonical hash は**展開後**のレシピに対して計算されるので、「preset 名で呼ぶ」「マクロで書く」「手で展開する」
+の 3 通りは同一 revision に落ちる(§9.10「プリセットは糖衣」の規約を保つ)。
+`preset` は core の DSL には入れない(`Operation` に増やさない。29 op の件数固定テストもそのまま)。
+
+規則: `layers` を持つプリセットは展開不可(`preset_not_inlinable`。top-level `preset` を使うよう recovery)。
+`name` 欠落は `preset_macro_missing_name`。展開後に core の validate が失敗した場合、メッセージ末尾に
+`(expanded from preset "<name>")` を付けて展開元を教える。プリセット JSON 自体にマクロは書かない
+(ユニットテストで固定。入れ子展開を持たないため)。`explain_operation "preset"` はマクロの説明を返す。
+
+生まれた出来事: §9.12 のサーバ instructions は「perspective → trim → ocr_document の中身を展開して書け」
+とエージェントに教えていた。プリセットの価値(1 語で済む)を自分で壊していた。
+
+#### 2. export_asset の一括化
+
+import(`paths`)/ apply(`revision_ids`)と同型のバッチを export にも与える。
+`revision_ids`(1..=64)+ `dest_dir` + `filename_template`(既定 `"{revision_id}.{ext}"`。
+プレースホルダ `{revision_id}` / `{index}`(1 始まり、件数の桁でゼロ埋め)/ `{ext}` / `{stem}`(系譜の根の import 元ファイル名))。
+各件は単数経路を関数化した `export_one` を通るので、§9.14 の検査(workspace 内拒否・symlink 拒否・
+create_new・temp+rename)がそのまま効く。テンプレート展開後の重複は書き込み前に全体エラー(`filename_collision`)。
+返却は `ExportResult` untagged enum(単数形は完全互換)。
+
+#### 3. 読みやすさの数値化
+
+- `render_preview` に `estimated_vision_tokens = ceil(width × height / 750)`。Anthropic の視覚モデルの目安式で、
+  他ホストでは異なることをフィールド doc に明記する。エージェントが「このプレビューは何トークンか」を事前に知れる
+- `inspect_image.stats.sharpness`: BT.709 輝度を長辺 ≤1024 に Triangle 縮小 → 3×3 ラプラシアン(整数)→ 分散(整数演算)。
+  絶対値ではなく「同一被写体の別撮影との比較」に使う指標であることを doc に書く
+- 「推定文字高さ」は 5 の `detect_text_blocks` に載せる(inspect は文字の存在を仮定できない)
+
+#### 4. svg_overlay の文字描画
+
+§9.9 で `<text>` を描かなかった理由は「システムフォントはマシンごとに違う」だった。
+解は「フォントを入力の一部にする」こと。
+
+- Cargo: resvg / usvg の feature `text` のみ有効(`system-fonts` / `memmap-fonts` は無効のまま)。
+  usvg 0.48 は `text` 単独で**空の fontdb**を持ち、`load_font_data` で埋めた書体だけを使う。ホスト由来の入力はゼロ
+- 同梱フォント: Roboto Regular(Apache-2.0 版、静的 TTF、`include_bytes!`)。告知は `THIRD_PARTY_NOTICES.md`
+- `render_text: bool`(既定 false)。**既定では従来どおり描かない**ので、既存レシピはハッシュも出力バイトも不変。
+  engine_version の世代分離は不要
+- `font_revision_ids: Vec<String>`(≤4): フォントを `import_asset` でアセット化(`font/ttf` / `font/otf`、
+  `validate_font_asset` で検査、`.ttc` は拒否、上限 32MiB)し、revision id で参照する。LUT(§9.4)・SVG(§9.9)・
+  マスク(§9.6)と同じ「レシピ → アセット参照」パターン。日本語などの CJK はこの経路で扱う(同梱しない。5MB 超)
+- 総称ファミリ(serif / sans-serif / monospace / cursive / fantasy)と `Options.font_family` は同梱書体に固定、
+  `languages = ["en"]` 固定。グリフの無い文字は描かれず、件数を警告で返す
+- 決定論ゲート: 新ゴールデン `golden_svg_text_sha256` を CI の macOS arm64 / Linux x86_64 両アームで一致させる
+  (シェーパ harfrust + skrifa は純 Rust)
+
+#### 5. detect_text_blocks
+
+「文字がどこにあるか」を ML なしで返す検出系ツール。§9.12 の帯分割は等間隔で切るしかなかった。
+
+- 輝度化 + 長辺 ≤1536 → Otsu 二値化(インク = 少数派)→ 水平 run-length smearing(白ギャップ ≤ 長辺 1%)→
+  連結成分(8 近傍)→ 面積フィルタ → 縦方向マージ(x 範囲が重なり、縦ギャップ < 1.5 × 中央値行高)→ 読み順ソート
+- 出力: `blocks[]`(rect 原寸座標、line_count、median_line_height_px、ink_ratio)、`text_like_area_ratio`、
+  `median_line_height_px`、`legibility { line_height_at_1568_px, recommended_bands[] }`。
+  `recommended_bands` は「長辺 1568 で行高 ≥ 16px」になる横帯を段落境界に揃えて切った `crop.rect` の列で、
+  そのまま `render_preview` に貼れる。ブロックなしは `no_text_like_regions`
+
+#### 6. 知覚ハッシュと SSIM
+
+- dHash: 輝度を 9×8 に面積平均(整数)→ 隣接差の符号で 64 bit。`inspect_image` が常時 `perceptual_hash`(hex)を返す
+- `compare_revisions` に `perceptual_hash_distance`(0..64、全 layout)と `ssim`(layout="diff"、同寸法)。
+  SSIM は 8×8 一様窓 + 積分画像、K1=0.01 / K2=0.03 / L=255、1e-4 量子化
+- 用途: バッチの近似重複検出(距離 ≤ 5 は同一画像の再エンコード/リサイズ)、UI スクショの回帰比較
+
+#### 7. EXIF 全量取得
+
+`inspect_image` の既定出力(10 タグの要約 + orientation + has_gps)は変えない。`include_exif: true` のときだけ
+`info.exif[]`(ifd / tag / value)を返す。値は 256 文字で切り詰め、MakerNote と 1KiB 超のバイナリは `<N bytes>`、
+件数上限 512。GPS を含む全量が既定で流れないのは §9.1 のプライバシー方針(has_gps で先に警告)と同じ理由。
+
+#### 実装体制
+
+Opus 4 本を worktree 並列(A1 core 計測 / A2 core 文字描画 / A3 geometry 文字ブロック / A4 MCP マクロ + export 一括)→
+統合後に MCP 配線 1 本(A1〜A3 の inspect / compare / detect_text_blocks / import フォント / vocab / README)→
+司令塔が docs・セルフレビュー・eval 実走(t16 / t17)・版更新。
+
+#### 実装時差分(Phase A、2026-09-14)
+
+- **同梱フォントは 349KB**(見積り 170KB は hinted 版の値。採用したのは googlefonts/roboto v2.138 の
+  unhinted 版 `Roboto-Regular.ttf`、sha256 `f3edb805...e624c6`、Apache-2.0)。告知は THIRD_PARTY_NOTICES.md
+- **フォント検査は ttf-parser ではなく skrifa**: ttf-parser は RUSTSEC-2026-0192(unmaintained)で
+  `cargo deny` の `unmaintained = "workspace"` に当たるため。skrifa は usvg のシェーパが使う同じパーサ。
+  新規依存(fontdb / harfrust / skrifa / read-fonts / font-types / unicode-bidi / -script / -vo / slotmap / tinyvec)は
+  すべて既存の許可ライセンス内で、deny.toml の allow は増やしていない
+- **欠落グリフは tofu(□)で描かれる**(usvg は空白にしない)。したがって core が返す警告
+  `... N character(s) with no glyph in the loaded fonts ...` が唯一の機械可読な信号。テストで固定
+- `render_text: false` のまま `font_revision_ids` を渡すと「無視した」旨の警告を返す(黙って捨てない)
+- **Otsu による文字ブロック検出には「文字らしさ」フィルタ 3 本が要った**: 成分高さ ≤ 作業画像高さの 10%、
+  横 > 縦(横書き前提。**縦書きは非対応**)、ブロック内の行高合計 ≥ ブロック高の 25%。無いと建物写真の
+  `text_like_area_ratio` が 0.45(誤検出)、ありで 0.081。縦マージ閾値は「1.5 × 中央値行高」と
+  「隣接行ギャップ中央値 × 1.5」の大きいほう(行送りが行高の 3 倍ある合成書類で 1 行ずつ割れたため)
+- `median_line_height_px` はインクの高さ(バー高 17px)であり行送り(51px)ではない。帯は文字のある縦範囲だけを覆う
+- **sharpness の Triangle 縮小は debug ビルドで 3 秒かかる**(release では inspect 全体 35ms)。
+  既存テストの時間上限を 2 → 10 秒に緩めた。整数ボックス平均に替えれば debug でも速く f32 を排除できる。要検討
+- `read_exif_all` の IFD 名に `other` を追加(kamadak-exif の `Context` が `#[non_exhaustive]`)
+- **プリセットマクロの layers 内キーは `ops`**(`Layer` の serde 名。`operations` ではない)。
+  既存 `locate_recipe_error` が `layer.get("operations")` を見ておりレイヤー内の位置特定が効いていない疑い → 要修正(別件)
+- 同梱プリセット 34 本に layers 持ちが無いため、`preset_not_inlinable` はユニットテストで固定
+- `filename_template` の未知プレースホルダは拒否(literal 扱いにしない)。eval の `expect_export` は 1 件しか
+  書けず画像フィクスチャも 1 枚なので、t17 は「1 枚から 3 領域を切り出し → 一括 export」の形にした
+- 実測: instructions 5,936 字(予算 5,600 → 6,000)、tools/list inputSchema 総量 9,337 字(export_asset が +900 字)
+- 固定した新ゴールデン(CI 両アームでの一致が証明): `golden_svg_text_sha256 = 6d0efb55...9c885`、
+  dHash scene `22e7ada66da08040` / document `8ca68e96868a8e80`、SSIM(scene vs blur σ2)`0.771`
+
+#### 実装時差分(Phase B / C、2026-09-14)
+
+- **sharpness の縮小を Triangle 補間から整数ボックス平均へ変更**(司令塔判断)。debug ビルドで 1 回 3 秒かかり、
+  inspect を多用する atx-mcp のテストと CI を遅くしていた。整数 `k = ceil(長辺/1024)` の k×k 平均で f32 を排除。
+  同じ理由の時間上限テスト(2 → 10 秒)は不要になったが上限は残す
+- **レイヤー内エラーの位置特定が効いていなかった不具合を修正**: `locate_recipe_error` が `layer.get("operations")`
+  を見ていたが `Layer` の serde 名は `ops`。位置表記も `layers[j].ops[k]` に統一(ユニットテストで固定)
+- `inspect_image` の引数型 `RevisionParams` を `InspectImageParams { revision_id, include_exif }` に置換
+  (serde default により `{"revision_id"}` だけの呼び出しは互換)
+- `explain_operation` の例は「Operation として deserialize できる純 JSON」しか置けない(ユニットテスト)ため、
+  コールアウト例の説明は warnings 側に置いた
+- フォントの `.ttc` はシグネチャでは嗅ぎ分けず、拡張子経由で `validate_font_asset` の「collections are not supported」に到達させる
+- 実測(最終): instructions 6,551 字(予算 6,000 → 6,700)、tools/list inputSchema 総量 10,300 字(予算 12,000 内)、
+  list_operations 本文 10,533 字(予算 10,500 → 10,700)。ツール 13 本、read-only 7 本
+- **stdio smoke(release ビルド)**: 13 ツール列挙、Roboto import(`families [Roboto]`)、コールアウト SVG の
+  `render_text` で数字・英数字が描画され「日本」は □ 2 文字 + 警告、`detect_document → trim → {"op":"preset"}` の
+  マクロ入りレシピが 804×922 を生成、`detect_text_blocks` が見出し + 段落 2 の 3 ブロック(行高 14px、1568 換算 24px、帯 1 本)、
+  `export_asset` 一括 `{index}_{stem}.{ext}` で `1_document_photo.jpg` / `2_document_photo.jpg`、
+  `compare_revisions` の hash 距離 32(補正前後は別画像と判定。SSIM は diff 以外なので None)
+- eval(release ビルド、2026-09-14): t16(見出し切り出し)8 ターン合格、t17(3 領域 → 一括 export)10 ターン合格、
+  t09(プリセット)5 ターン合格、t14(書類補正)は**初回 11 ターンで上限 10 に当たり失敗**。台帳の採点は合格しており、
+  読解手順に `detect_text_blocks` の 1 手が増えた分だけ長くなった(望ましい挙動)。上限を 14 に上げて再走し 13 ターンで合格。
+  4 本で約 1.4 ドル
+
+#### セルフレビュー(code-review high、8 観点 → 確認 16 件)への対応
+
+すべて「失敗テスト → 修正 → 通過」で直し、既存ゴールデンは 1 つも変えていない。
+
+**正しさ**
+- dHash(と sharpness)を **EXIF orientation 正規化後**の画素で計算する。修正前は Orientation=6 の原本と
+  「encode のみ」の派生で hash 距離 29 が出ていた(orientation を焼き込む apply_recipe と不一致)。
+  core に `pixel_ops::orient_dynamic` を追加し `inspect_bytes_with` が計測前に通す
+- プリセットマクロのエラー注釈がメッセージ文字列を `strip_prefix("layers[")` で解析していて死んでいた
+  (実際の前置きは "invalid recipe: ")。`layers[1].ops` 内のユーザー自身の op のエラーが無関係なプリセットに
+  帰属されていた。位置表記 4 形式を文中検索で取り出す実装に置換
+- `detect_text_blocks` の矩形が 1px 膨張(包含端を排他端に写した後さらに +1)。厳密一致テストで固定
+- `recommended_bands` が 16 本で打ち切っても警告を出さず、行位置を `max_blocks` 切り捨て後のブロックからしか
+  集めていなかった。全ブロックから集め、覆いきれないときは
+  `recommended_bands cover only the first N px of M px of text; re-run ... on a crop of the remainder` を返す
+- 欠落グリフ検査が `<text>` / `<tspan>` の直接の子しか見ておらず、`<textPath>` / `<a>` 内の CJK が
+  警告ゼロで □ になっていた。`<text>` 配下の全子孫を走査
+- MCP 層に複製されていた `ext_for_mime` に font 系が無く、フォント revision の export が `.bin` になっていた。
+  atx-store の実装を唯一のものにした
+- SSIM 経路のフル解像度 clone + RGBA 変換を `gray_from_rgb8(as_raw())` に置換(100MP 比較で ~1.4GB の一時確保を削減)
+
+**効率**
+- orientation だけが要る 4 ツール(detect_tilt / detect_document / detect_text_blocks / generate_mask)が
+  `inspect_bytes` で stats + sharpness + dHash を計算して捨てていた。limits 検査つきの
+  `atx_core::decode_oriented(bytes, limits)` を追加し 1 行に置換(MCP 層の重複 `apply_orientation` は削除)
+- 同梱フォントの fontdb を `OnceLock` で 1 回だけ構築、ユーザーフォントは `Source::Binary(Arc)` で共有。
+  `<text>` の無い SVG では DB を組まない。欠落グリフの重複除去は `BTreeSet`
+- `validate_font_asset` がグリフ数 0 のフォントを拒否(未使用だった `glyph_count` の用途)
+- 一括 export の `{stem}` 解決は必要なときだけ、台帳走査は 1 回
+
+**残した点**: ユーザーフォントは validate(import 時)と描画で計 2 回パースする。解消には「検証済み DB を
+engine から rasterize へ渡す」構造変更が要る。需要が出たら行う。
+
+**別件で見つかった不具合: EXIF Orientation 5 と 7 の取り違え**。`apply_orientation` と `orientation_affine` が
+5(mirror + rotate 270 CW)と 7(mirror + rotate 90 CW)を逆に実装していた(内部では一貫していたが仕様と逆。
+MCP 層の重複ヘルパは仕様どおりで、`detect_*` の座標系と `apply_transform` の座標系が 5/7 で食い違っていた)。
+これは v0.6.0 で修正する。Orientation 5/7 の入力に対する出力バイトが変わる唯一の挙動変更で、
+既存テスト・ゴールデンは 6 しか触っていないため影響しない。engine_version は据え置く
+(仕様違反の是正であり、正しい出力を新世代として分離する価値がないため)。

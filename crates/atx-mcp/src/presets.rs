@@ -230,6 +230,39 @@ mod tests {
         }
     }
 
+    /// プリセット JSON の中にプリセットマクロ(`{"op":"preset","name":...}`)を書かないこと。
+    ///
+    /// マクロ(`tools::expand_preset_macros`)はユーザのレシピを1段だけ展開する。
+    /// プリセット側にもマクロがあると入れ子の展開が必要になり、
+    /// 「展開元プリセット名を添えたエラー」の対応表も壊れる。
+    /// そもそも `TransformRecipe` に `preset` op は無いので JSON のパースが
+    /// 失敗する(= ビルド時に気づく)が、意図としてここで固定しておく。
+    #[test]
+    fn no_preset_contains_a_preset_macro() {
+        for (name, json) in PRESET_FILES {
+            let value: serde_json::Value =
+                serde_json::from_str(json).unwrap_or_else(|e| panic!("preset {name}: {e}"));
+            assert!(
+                !contains_preset_op(&value),
+                "preset {name} must not use the {{\"op\":\"preset\"}} macro (macros are expanded one level only)"
+            );
+        }
+    }
+
+    /// JSON のどこかに `{"op": "preset"}` があるか。
+    fn contains_preset_op(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.get("op").and_then(|v| v.as_str()) == Some("preset") {
+                    return true;
+                }
+                map.values().any(contains_preset_op)
+            }
+            serde_json::Value::Array(items) => items.iter().any(contains_preset_op),
+            _ => false,
+        }
+    }
+
     #[test]
     fn unknown_preset_is_reported() {
         assert!(matches!(resolve("nope"), Err(PresetError::Unknown)));

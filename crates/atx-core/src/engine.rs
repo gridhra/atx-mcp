@@ -49,12 +49,41 @@ pub struct ImageInfo {
     pub exif_summary: std::collections::BTreeMap<String, String>,
     /// 輝度ヒストグラム統計(黒点 / 白点 / 中央値 / チャンネル平均)。
     ///
-    /// **決定論的なサブサンプル**上で計算する(`crate::stats` 参照)。
-    /// 262144 画素(512x512 相当)以下の画像は全画素を使うため厳密値、
-    /// それより大きい画像はグリッド間引き(x, y とも k 刻み)による近似値。
+    /// ヒストグラムとチャンネル平均は**決定論的なグリッド間引き**の上で計算する
+    /// (`crate::stats` 参照。262144 画素以下は全画素なので厳密値)。`sharpness` だけは
+    /// 間引かず全画素を輝度化し、長辺 1024 へ縮小してから測る(隣接差分が要るため)。
     /// メタデータは読めたが画素デコードに失敗した場合は `None`(inspect 自体は成功させる)。
     pub stats: Option<crate::stats::ImageStats>,
+    /// Perceptual hash (dHash) as 16 lowercase hex digits, or null when the pixels
+    /// could not be decoded. Compare two hashes bit by bit: a Hamming distance of
+    /// 5 or less usually means the same picture re-encoded or resized.
+    pub perceptual_hash: Option<String>,
+    /// Every EXIF field found in the input, one entry per field. Present only when
+    /// the caller explicitly asks for it, because the full dump can include GPS
+    /// coordinates and other personal data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exif: Option<Vec<ExifEntry>>,
 }
+
+/// One EXIF field, rendered as text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct ExifEntry {
+    /// Which IFD the field came from: primary, exif, gps, interop or thumbnail.
+    pub ifd: String,
+    /// Tag name, or `Tag(0x____)` when the tag is not in the standard set.
+    pub tag: String,
+    /// Formatted value including its unit. Long values are cut to 256 characters
+    /// followed by `...`; maker notes and binary blobs over 1 KiB read `<N bytes>`.
+    pub value: String,
+}
+
+/// EXIF 全量取得の上限。
+///
+/// 件数はレンズ補正テーブル等を大量に持つ機種でも MCP 応答が膨らまない範囲に、
+/// 値の長さは「人間が読んで意味があるが 1 フィールドで応答を占有しない」範囲に取った。
+const EXIF_MAX_ENTRIES: usize = 512;
+const EXIF_MAX_VALUE_CHARS: usize = 256;
+const EXIF_MAX_BINARY_BYTES: usize = 1024;
 
 /// 変換結果。
 #[derive(Debug, Clone)]
@@ -81,12 +110,45 @@ struct ExifInfo {
 /// メタデータ(寸法 / EXIF / ICC)はこの段階だけで確定するため、
 /// 上限を超える入力はフルデコード前に弾かれる = デコード爆弾に対して安全。
 ///
-/// 寸法と limits の検査を通った後、`stats`(輝度ヒストグラム統計)のためだけに
-/// **limits 検査済み経路**でもう一度だけ画素をデコードする。統計は決定論的な
-/// グリッド間引き(`crate::stats`)の上で計算するので、画素数が増えてもサンプル数は
-/// 262144 で頭打ちになる。デコードに失敗した場合は `stats = None` とし、
+/// 寸法と limits の検査を通った後、画素の計測(`stats` と `perceptual_hash`)のために
+/// **limits 検査済み経路**でもう一度だけ画素をデコードし、EXIF Orientation を焼く。
+///
+/// 計測のコストは 2 種類に分かれる:
+/// - ヒストグラムとチャンネル平均はグリッド間引き(`crate::stats`)の上で計算するので、
+///   画素数が増えてもサンプル数は 262144 で頭打ちになる
+/// - `sharpness` と `perceptual_hash`(dHash)は**全画素を 1 回走る**
+///   (前者は輝度化 + 長辺 1024 への整数ボックス縮小、後者は 9x8 セルの面積平均)。
+///   どちらも隣接画素や全域の平均が必要で、間引いた標本では計算できない
+///
+/// デコードに失敗した場合は `stats` / `perceptual_hash` を `None` とし、
 /// inspect 自体は成功させる(メタデータだけでも返せる方が呼び出し側に有用なため)。
 pub fn inspect_bytes(bytes: &[u8], limits: &Limits) -> Result<ImageInfo> {
+    inspect_bytes_with(bytes, limits, false)
+}
+
+/// limits を当てて画素をデコードし、EXIF Orientation を焼き込んで返す。
+///
+/// 「向きだけ合わせて自分で解析したい」読み取り系(MCP 層の `detect_tilt` /
+/// `detect_document` / `detect_text_blocks` / `generate_mask`)のための入口。
+/// [`inspect_bytes`] を呼ぶと、捨てるだけの `stats` / `sharpness` / dHash のために
+/// 全画素を数回走ってしまうので、計測を一切しないこちらを使う。
+///
+/// 検査順序は [`inspect_bytes`] と同じ「バイトサイズ → フォーマット判定 → 寸法」で、
+/// 上限超過はフルデコード前に弾かれる(デコード爆弾に対して安全)。向きの写像は
+/// `apply_recipe` がデコード直後に行う正規化と**同一**なので、ここで得た画素座標は
+/// `apply_transform` の最初の op が見る座標系と一致する。
+pub fn decode_oriented(bytes: &[u8], limits: &Limits) -> Result<DynamicImage> {
+    let orientation = read_exif(bytes).orientation.unwrap_or(1);
+    let image = decode_checked(bytes, limits)?;
+    Ok(pixel_ops::orient_dynamic(image, orientation))
+}
+
+/// [`inspect_bytes`] と同じ検査をしつつ、`include_exif` が true のときだけ
+/// `ImageInfo::exif` に EXIF 全量([`read_exif_all`])を載せる。
+///
+/// 既定を false に寄せているのはプライバシーのため: GPS 座標を含む全フィールドは
+/// 呼び出し側が明示的に要求したときにだけ返す(`exif_summary` と `has_gps` は従来どおり常時)。
+pub fn inspect_bytes_with(bytes: &[u8], limits: &Limits, include_exif: bool) -> Result<ImageInfo> {
     check_byte_limit(bytes, limits)?;
 
     let reader = build_reader(bytes, limits)?;
@@ -104,17 +166,42 @@ pub fn inspect_bytes(bytes: &[u8], limits: &Limits) -> Result<ImageInfo> {
     let (oriented_width, oriented_height) =
         pixel_ops::oriented_dimensions(width, height, orientation);
 
-    // 統計は EXIF orientation 正規化**前**の画素で計算する。分位点も平均も画素の並べ替えに
-    // 不変なので、間引きグリッドの当たり位置以外に違いは出ない(回転を焼く分の時間を払わない)。
-    let stats = decode_checked(bytes, limits).ok().and_then(|decoded| {
-        // RGB8 / RGBA8 はデコード結果をそのまま走査する(JPEG/PNG の大半がここ)。
-        // それ以外(16bit, グレースケール, パレット等)だけ RGBA8 へ 1 回変換する。
-        match &decoded {
-            DynamicImage::ImageRgb8(img) => crate::stats::from_rgb8(img.as_raw(), width, height),
-            DynamicImage::ImageRgba8(img) => crate::stats::from_rgba8(img.as_raw(), width, height),
-            other => crate::stats::from_rgba8(other.to_rgba8().as_raw(), width, height),
+    // 画素の計測は **EXIF orientation 正規化後**の画素で行う。
+    //
+    // 知覚ハッシュ(dHash)と鮮鋭度は画素の並べ替えに不変ではないので、ここを
+    // 正規化前でやると「Orientation=6 の原本」と「それを encode しただけの派生」の
+    // ハッシュ距離が 30 近くまで開く(`apply_recipe` は必ず orientation を焼くため)。
+    // 正規化は `pixel_ops::orient_dynamic` = `apply_recipe` と同じ写像。
+    // orientation が 1 / 未知のときは無変換なので、追加のコピーも発生しない。
+    let decoded = decode_checked(bytes, limits)
+        .ok()
+        .map(|img| pixel_ops::orient_dynamic(img, orientation));
+    let (stats, perceptual_hash) = match decoded.as_ref() {
+        None => (None, None),
+        Some(decoded) => {
+            let (ow, oh) = (oriented_width, oriented_height);
+            // RGB8 / RGBA8 はデコード結果をそのまま走査する(JPEG/PNG の大半がここ)。
+            // それ以外(16bit, グレースケール, パレット等)だけ RGBA8 へ 1 回変換する。
+            let (stats, hash) = match decoded {
+                DynamicImage::ImageRgb8(img) => (
+                    crate::stats::from_rgb8(img.as_raw(), ow, oh),
+                    crate::similarity::dhash_rgb8(img.as_raw(), ow, oh),
+                ),
+                DynamicImage::ImageRgba8(img) => (
+                    crate::stats::from_rgba8(img.as_raw(), ow, oh),
+                    crate::similarity::dhash_rgba8(img.as_raw(), ow, oh),
+                ),
+                other => {
+                    let rgba = other.to_rgba8();
+                    (
+                        crate::stats::from_rgba8(rgba.as_raw(), ow, oh),
+                        crate::similarity::dhash_rgba8(rgba.as_raw(), ow, oh),
+                    )
+                }
+            };
+            (stats, Some(crate::similarity::dhash_hex(hash)))
         }
-    });
+    };
 
     Ok(ImageInfo {
         width,
@@ -131,6 +218,12 @@ pub fn inspect_bytes(bytes: &[u8], limits: &Limits) -> Result<ImageInfo> {
         has_gps: exif.has_gps,
         exif_summary: exif.summary,
         stats,
+        perceptual_hash,
+        exif: if include_exif {
+            Some(read_exif_all(bytes))
+        } else {
+            None
+        },
     })
 }
 
@@ -927,13 +1020,44 @@ impl OpRunner<'_> {
                     height,
                     opacity,
                     blend_mode,
+                    render_text,
+                    font_revision_ids,
                 } => {
                     let svg_bytes = self
                         .assets
                         .read_revision(svg_revision_id)
                         .map_err(|e| fail(e.to_string()))?;
-                    let raster =
-                        crate::ops::svg::rasterize(&svg_bytes, *width, *height).map_err(fail)?;
+                    // font アセットは svg_revision_id と同じ経路で読み、
+                    // `validate_font_asset` を通してから渡す(画像や .cube を font として
+                    // 渡した場合に「アセット種別違い」を op 位置つきで返すため)。
+                    // バイト列は `Arc` に包んで持つ(fontdb へ渡すときも複製しない)。
+                    let mut font_bytes: Vec<std::sync::Arc<Vec<u8>>> = Vec::new();
+                    if *render_text {
+                        for (k, id) in font_revision_ids.iter().enumerate() {
+                            let bytes = self
+                                .assets
+                                .read_revision(id)
+                                .map_err(|e| fail(e.to_string()))?;
+                            crate::ops::svg::validate_font_asset(&bytes).map_err(|why| {
+                                fail(format!("font_revision_ids[{k}] {id} is not a font: {why}"))
+                            })?;
+                            font_bytes.push(std::sync::Arc::new(bytes));
+                        }
+                    }
+                    let fonts = crate::ops::svg::TextFonts { extra: font_bytes };
+                    let raster = crate::ops::svg::rasterize(
+                        &svg_bytes,
+                        *width,
+                        *height,
+                        render_text.then_some(&fonts),
+                    )
+                    .map_err(fail)?;
+                    if !*render_text && !font_revision_ids.is_empty() {
+                        st.warnings.push(format!(
+                            "operations[{index}] (svg_overlay): font_revision_ids are ignored \
+                             because render_text is false"
+                        ));
+                    }
                     // ラスタは sRGB 符号値・ストレートアルファなので、
                     // 合成もその空間で行う(`layers` と同じ判断。DESIGN.md §9.7)。
                     ensure_space(&mut st.img, &mut st.space, Space::Srgb);
@@ -1229,6 +1353,103 @@ fn build_reader<'a>(bytes: &'a [u8], limits: &Limits) -> Result<ImageReader<Curs
     Ok(reader)
 }
 
+/// EXIF の全フィールドをテキストとして列挙する。EXIF が無い/壊れている場合は空 Vec。
+///
+/// 規則(MCP 応答が膨らまないための切り詰めを含む):
+///
+/// - IFD 名は `primary` / `exif` / `gps` / `interop` / `thumbnail`
+///   (kamadak-exif の `Context` と `In` の組み合わせから決める。それ以外は `other`)
+/// - タグ名は kamadak-exif の `Tag` の Display。標準集合に無いタグは `Tag(0x____)`
+///   (Display は未知タグに Rust の Debug 形式を出すので、ここで 16 進表記へ置き換える)
+/// - 値は `display_value().with_unit()`。ただし
+///   - MakerNote は常に `<N bytes>`(機種依存のバイナリで、テキスト化しても読めない)
+///   - Byte / Undefined で 1KiB を超えるものは `<N bytes>`
+///   - それ以外で 256 **文字**を超えるものは 256 文字 + `...`(バイト境界ではなく
+///     文字境界で切るので UTF-8 が壊れない)
+/// - 件数は 512 で打ち切る
+pub fn read_exif_all(bytes: &[u8]) -> Vec<ExifEntry> {
+    let mut cursor = Cursor::new(bytes);
+    let Ok(exif) = exif::Reader::new().read_from_container(&mut cursor) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for field in exif.fields() {
+        if out.len() >= EXIF_MAX_ENTRIES {
+            break;
+        }
+        out.push(ExifEntry {
+            ifd: exif_ifd_name(field).to_string(),
+            tag: exif_tag_name(field.tag),
+            value: exif_value_text(field, &exif),
+        });
+    }
+    out
+}
+
+/// フィールドが属する IFD の名前。
+fn exif_ifd_name(field: &exif::Field) -> &'static str {
+    match field.tag.context() {
+        exif::Context::Tiff => {
+            if field.ifd_num == exif::In::THUMBNAIL {
+                "thumbnail"
+            } else {
+                "primary"
+            }
+        }
+        exif::Context::Exif => "exif",
+        exif::Context::Gps => "gps",
+        exif::Context::Interop => "interop",
+        _ => "other",
+    }
+}
+
+/// タグ名。標準集合に無いものは `Tag(0x____)`。
+fn exif_tag_name(tag: exif::Tag) -> String {
+    if tag.description().is_some() {
+        tag.to_string()
+    } else {
+        format!("Tag(0x{:04x})", tag.number())
+    }
+}
+
+/// 値のテキスト化 + 切り詰め。
+fn exif_value_text(field: &exif::Field, exif: &exif::Exif) -> String {
+    if let Some(placeholder) = exif_binary_placeholder(field) {
+        return placeholder;
+    }
+    truncate_exif_value(field.display_value().with_unit(exif).to_string())
+}
+
+/// テキスト化せずに `<N bytes>` で置き換えるべきフィールドかを判定する。
+///
+/// 対象は (1) MakerNote(機種依存のバイナリで、テキスト化しても読めない)、
+/// (2) Byte / Undefined 型で 1KiB を超えるもの(サムネイル等のバイナリ塊)。
+fn exif_binary_placeholder(field: &exif::Field) -> Option<String> {
+    let binary_len = match &field.value {
+        exif::Value::Byte(v) => Some(v.len()),
+        exif::Value::Undefined(v, _) => Some(v.len()),
+        _ => None,
+    };
+    if field.tag == exif::Tag::MakerNote {
+        return Some(format!("<{} bytes>", binary_len.unwrap_or(0)));
+    }
+    match binary_len {
+        Some(n) if n > EXIF_MAX_BINARY_BYTES => Some(format!("<{n} bytes>")),
+        _ => None,
+    }
+}
+
+/// 256 **文字**を超えるテキストを 256 文字 + `...` に切り詰める。
+/// バイト境界ではなく文字境界で切るので UTF-8 が壊れない。
+fn truncate_exif_value(text: String) -> String {
+    if text.chars().count() <= EXIF_MAX_VALUE_CHARS {
+        return text;
+    }
+    let cut: String = text.chars().take(EXIF_MAX_VALUE_CHARS).collect();
+    format!("{cut}...")
+}
+
 /// kamadak-exif で EXIF を読む。EXIF が無い/壊れている場合は空の結果を返す。
 fn read_exif(bytes: &[u8]) -> ExifInfo {
     let mut info = ExifInfo {
@@ -1285,4 +1506,115 @@ fn read_exif(bytes: &[u8]) -> ExifInfo {
             .insert("orientation".to_string(), o.to_string());
     }
     info
+}
+
+/// EXIF 全量取得の私有ヘルパのテスト。
+/// (`Exif` は外から組み立てられないので、`read_exif_all` を通した検証は
+/// `tests/similarity.rs` の手組み APP1 で行う。ここはその手前の規則だけを固定する。)
+#[cfg(test)]
+mod exif_all_tests {
+    use super::*;
+
+    fn field(tag: exif::Tag, value: exif::Value) -> exif::Field {
+        exif::Field {
+            tag,
+            ifd_num: exif::In::PRIMARY,
+            value,
+        }
+    }
+
+    #[test]
+    fn known_tags_use_their_name() {
+        assert_eq!(
+            exif_tag_name(exif::Tag::DateTimeOriginal),
+            "DateTimeOriginal"
+        );
+        assert_eq!(exif_tag_name(exif::Tag::GPSLatitude), "GPSLatitude");
+    }
+
+    /// 標準集合に無いタグは `Tag(0x____)`(kamadak の Display は Rust の Debug 形式を出す)。
+    #[test]
+    fn unknown_tags_fall_back_to_hex() {
+        let unknown = exif::Tag(exif::Context::Tiff, 0xfe07);
+        assert_eq!(exif_tag_name(unknown), "Tag(0xfe07)");
+    }
+
+    #[test]
+    fn ifd_name_covers_every_context() {
+        let mut thumbnail = field(exif::Tag::ImageWidth, exif::Value::Long(vec![1]));
+        thumbnail.ifd_num = exif::In::THUMBNAIL;
+        assert_eq!(exif_ifd_name(&thumbnail), "thumbnail");
+        assert_eq!(
+            exif_ifd_name(&field(exif::Tag::ImageWidth, exif::Value::Long(vec![1]))),
+            "primary"
+        );
+        assert_eq!(
+            exif_ifd_name(&field(
+                exif::Tag::DateTimeOriginal,
+                exif::Value::Ascii(vec![b"x".to_vec()])
+            )),
+            "exif"
+        );
+        assert_eq!(
+            exif_ifd_name(&field(
+                exif::Tag::GPSLatitudeRef,
+                exif::Value::Ascii(vec![b"N".to_vec()])
+            )),
+            "gps"
+        );
+        assert_eq!(
+            exif_ifd_name(&field(
+                exif::Tag::InteroperabilityIndex,
+                exif::Value::Ascii(vec![b"R98".to_vec()])
+            )),
+            "interop"
+        );
+    }
+
+    /// MakerNote は短くてもテキスト化しない(機種依存のバイナリなので)。
+    #[test]
+    fn maker_note_is_always_replaced_by_its_length() {
+        let f = field(
+            exif::Tag::MakerNote,
+            exif::Value::Undefined(vec![0u8; 7], 0),
+        );
+        assert_eq!(exif_binary_placeholder(&f).as_deref(), Some("<7 bytes>"));
+    }
+
+    /// 1KiB を超える Byte / Undefined は長さだけにする。ちょうど 1KiB は通す。
+    #[test]
+    fn large_binary_values_are_replaced() {
+        let over = field(
+            exif::Tag::ImageWidth,
+            exif::Value::Undefined(vec![0u8; 1025], 0),
+        );
+        assert_eq!(
+            exif_binary_placeholder(&over).as_deref(),
+            Some("<1025 bytes>")
+        );
+
+        let exactly = field(exif::Tag::ImageWidth, exif::Value::Byte(vec![0u8; 1024]));
+        assert_eq!(exif_binary_placeholder(&exactly), None);
+
+        // 数値型は長さに関係なくテキスト化する(そもそもバイナリ塊ではない)。
+        let longs = field(exif::Tag::ImageWidth, exif::Value::Long(vec![1; 4096]));
+        assert_eq!(exif_binary_placeholder(&longs), None);
+    }
+
+    #[test]
+    fn truncation_keeps_256_chars_and_adds_ellipsis() {
+        let short = "a".repeat(256);
+        assert_eq!(truncate_exif_value(short.clone()), short);
+
+        let long = "a".repeat(257);
+        let cut = truncate_exif_value(long);
+        assert_eq!(cut.chars().count(), 259);
+        assert!(cut.ends_with("..."));
+
+        // マルチバイト文字でもバイト境界で割らない。
+        let japanese = "あ".repeat(300);
+        let cut = truncate_exif_value(japanese);
+        assert_eq!(cut.chars().count(), 259);
+        assert!(cut.starts_with("あ"));
+    }
 }

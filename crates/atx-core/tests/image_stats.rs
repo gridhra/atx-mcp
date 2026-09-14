@@ -135,9 +135,15 @@ fn fixture_gains_stats_without_changing_existing_fields() {
     let t = std::time::Instant::now();
     let info = inspect_bytes(FIXTURE, &Limits::default()).unwrap();
     let elapsed = t.elapsed();
+    // 上限 3 秒の根拠: inspect は sharpness と dHash のために全画素を数回走る
+    // (輝度化 → 長辺 1024 への**整数ボックス平均**縮小 → ラプラシアン分散、および
+    // 9x8 セルの面積平均)。縮小は整数演算だけなので、かつて Triangle 補間で
+    // 単独 3 秒かかっていた区間は debug ビルドでも桁違いに短くなった。
+    // release ビルドでの実測は inspect 全体で 35ms 前後(1477x1108 JPEG)。
+    // ここで押さえたいのは「inspect が桁違いに遅くなる変更が入っていないこと」。
     assert!(
-        elapsed < std::time::Duration::from_secs(2),
-        "inspect は debug ビルドでも 2 秒未満であること: {elapsed:?}"
+        elapsed < std::time::Duration::from_secs(3),
+        "inspect は debug ビルドでも 3 秒未満であること: {elapsed:?}"
     );
 
     // 既存フィールド(engine.rs の inspect テストと同じ期待値)。
@@ -175,7 +181,58 @@ fn stats_serialize_with_snake_case_names() {
         "mean_r",
         "mean_g",
         "mean_b",
+        "sharpness",
     ] {
         assert!(s[key].is_number(), "missing stats.{key}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// sharpness(3x3 ラプラシアン応答の分散)
+// ---------------------------------------------------------------------------
+
+const DOCUMENT: &[u8] = include_bytes!("../../../tests/fixtures/synthetic_document.png");
+
+/// ぼかすとエッジが消えるので鮮鋭度は必ず下がる。
+///
+/// これが sharpness の意味のある使い方(絶対値ではなく「同じ絵の別バージョン
+/// どうしの比較」)なので、テストもその形で固定する。
+#[test]
+fn blur_lowers_sharpness() {
+    let sharp = inspect_bytes(DOCUMENT, &Limits::default())
+        .unwrap()
+        .stats
+        .unwrap()
+        .sharpness;
+
+    let recipe: atx_core::recipe::TransformRecipe =
+        serde_json::from_str(r#"{"operations":[{"op":"blur","sigma":3}]}"#).unwrap();
+    let blurred = atx_core::apply_recipe(DOCUMENT, &recipe, &Limits::default()).unwrap();
+    let soft = inspect_bytes(&blurred.bytes, &Limits::default())
+        .unwrap()
+        .stats
+        .unwrap()
+        .sharpness;
+
+    assert!(
+        sharp > soft,
+        "blur sigma 3 で鮮鋭度が下がること: sharp={sharp} soft={soft}"
+    );
+    assert!(sharp > 0.0);
+}
+
+/// 同一バイト列 → 同一 sharpness(f64 のビット単位で一致)。
+#[test]
+fn sharpness_is_deterministic() {
+    let a = inspect_bytes(DOCUMENT, &Limits::default()).unwrap();
+    let b = inspect_bytes(DOCUMENT, &Limits::default()).unwrap();
+    let (a, b) = (a.stats.unwrap().sharpness, b.stats.unwrap().sharpness);
+    assert_eq!(a.to_bits(), b.to_bits());
+}
+
+/// 一様画像にはエッジが無いので厳密に 0。
+#[test]
+fn uniform_image_has_zero_sharpness() {
+    let img = RgbaImage::from_pixel(80, 60, Rgba([200, 190, 180, 255]));
+    assert_eq!(stats_of(&img).sharpness, 0.0);
 }

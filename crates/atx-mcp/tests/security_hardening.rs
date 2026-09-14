@@ -205,11 +205,9 @@ fn dangling_symlink_into_the_workspace_is_refused() {
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
     for overwrite in [false, true] {
-        let payload = error_payload(&tools.export_asset(&ExportAssetParams {
-            revision_id: rev.clone(),
-            dest_path: link.to_string_lossy().into_owned(),
-            overwrite,
-        }));
+        let mut params = ExportAssetParams::single(rev.clone(), link.to_string_lossy());
+        params.overwrite = overwrite;
+        let payload = error_payload(&tools.export_asset(&params));
         assert_eq!(payload["error"]["code"], "dest_is_symlink", "{payload}");
         assert!(
             std::fs::symlink_metadata(&target).is_err(),
@@ -240,11 +238,9 @@ fn overwrite_through_a_hardlink_does_not_touch_the_store() {
     let dest = out.path().join("linked.jpg");
     std::fs::hard_link(&object, &dest).unwrap();
 
-    structured(&tools.export_asset(&ExportAssetParams {
-        revision_id: revision_id(&badge),
-        dest_path: dest.to_string_lossy().into_owned(),
-        overwrite: true,
-    }));
+    structured(&tools.export_asset(
+        &ExportAssetParams::single(revision_id(&badge), dest.to_string_lossy()).with_overwrite(),
+    ));
     assert!(
         std::fs::read(&object).unwrap() == original,
         "the stored object must stay byte-identical"
@@ -267,11 +263,9 @@ fn plain_export_and_overwrite_still_work_without_leftovers() {
     let out = tempfile::tempdir().unwrap();
     let dest = out.path().join("out.jpg");
     for overwrite in [false, true] {
-        let exported = structured(&tools.export_asset(&ExportAssetParams {
-            revision_id: rev.clone(),
-            dest_path: dest.to_string_lossy().into_owned(),
-            overwrite,
-        }));
+        let mut params = ExportAssetParams::single(rev.clone(), dest.to_string_lossy());
+        params.overwrite = overwrite;
+        let exported = structured(&tools.export_asset(&params));
         assert_eq!(exported["overwritten"], Value::Bool(overwrite));
     }
     let entries: Vec<_> = std::fs::read_dir(out.path()).unwrap().collect();

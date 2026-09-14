@@ -11,7 +11,7 @@ CI には組み込まない(§下記コスト注意)。
 ## ⚠️ コスト注意
 
 `evals/run.sh` を(`--dry-run` なしで)実行すると、タスクごとに実際の Claude API トークンを消費する。
-15 タスク × 数ターンの実行になるので、CI やプッシュ毎の自動実行には絶対に使わないこと。
+17 タスク × 数ターンの実行になるので、CI やプッシュ毎の自動実行には絶対に使わないこと。
 リリース候補を切る前に手動で1回まわす、という運用を想定している。
 
 ## 前提
@@ -27,7 +27,7 @@ which claude                        # Claude Code CLI が PATH にあること
 # 1. まずコマンド列挙だけ確認する(トークン消費なし)
 evals/run.sh --dry-run
 
-# 2. 全15タスクを実行する(課金される)
+# 2. 全17タスクを実行する(課金される)
 evals/run.sh
 
 # 3. 1タスクだけ実行する(デバッグ用、courseの絞り込み)
@@ -95,7 +95,7 @@ python3 evals/score.py --selftest
 
 ## タスク一覧(evals/tasks/*.json)
 
-実運用フィードバック(docs/DESIGN.md §9)と ROADMAP の Agent UX 規律に由来する15本:
+実運用フィードバック(docs/DESIGN.md §9)と ROADMAP の Agent UX 規律に由来する17本:
 
 | id | 検証する挙動 |
 |---|---|
@@ -114,6 +114,8 @@ python3 evals/score.py --selftest
 | `t13_svg_watermark` | `.svg` バッジを `import_asset` してから `svg_overlay` で右下に焼き込む(ベクタアセットの取り込み→参照フロー) |
 | `t14_document_rectify_readable` | 斜めから撮った書類の写真を `detect_document` → `perspective` で正対させ、`ocr_document` 相当(`color_matrix` / `auto_levels` のいずれか)で読みやすく整える(DESIGN §9.12) |
 | `t15_dark_screenshot_trim` | ダークモードのスクリーンショットの一様な余白を `trim` で落とす(縮小前に余白を捨てて 1 グリフあたりの画素数を稼ぐ。DESIGN §9.12) |
+| `t16_document_headline_crop` | 正対済みの書類から「見出しだけ」を切り出す。`detect_text_blocks`(文字らしいブロックを読み順に返す検出ツール)でブロックの矩形を取り、`crop` の `rect` にその座標を入れられるか — 座標を目分量で書くのではなく検出結果から取る振る舞いを見る(DESIGN §9.15) |
+| `t17_batch_export` | 複数 revision を1回で書き出す(`export_asset` の `revision_ids` + `dest_dir`)。1枚の写真から3か所を切り出し、3枚とも `web_optimize` で仕上げ、`{{TASK_DIR}}/export` へ `1.webp` / `2.webp` / `3.webp` としてまとめて書き出させる |
 
 各タスクの `input_fixture` は基本的に共通で `tests/fixtures/synthetic_scene.jpg`
 (完全合成・決定論的に再生成可能なフィクスチャ。docs/DESIGN.md §9.2 参照)。
@@ -130,6 +132,9 @@ python3 evals/score.py --selftest
   生成器が既知 quad と `detect_document` の結果を突き合わせ、頂点誤差 ≤ 長辺 1% を自己検証する)
 - `t15_dark_screenshot_trim`: `evals/fixtures/dark_ui_screenshot.png`
   (暗い UI + 完全に一様な余白。`trim` の期待値が定義できる)
+- `t16_document_headline_crop`: `evals/fixtures/document_photo_rectified.png`
+  (`document_photo.jpg` と同じ合成書類を歪みなしで描いたもの。見出し帯と本文段落の
+  位置が既知なので、切り出した矩形が見出しに沿っているかを人が目視で確認できる)
 
 ## タスクの追加方法
 
@@ -150,6 +155,15 @@ python3 evals/score.py --selftest
 - `t09_preset_use` はビルトインプリセット(`presets/` + `apply_transform` の `preset` 引数)を
   前提にしている。プリセット機構は実装済みで、`presets/` には 30 本のプリセットが
   同梱されている(docs/DESIGN.md §9.10)。このタスクは通常どおり green であることを期待する。
+- `t17_batch_export`(一括書き出し)は、ハーネスの制約から「3 枚の別画像を取り込む」形には
+  できていない: `input_fixture` は1タスク1枚しか渡せず、`setup.seed_files` はテキストしか
+  置けない(= 画像フィクスチャを実行ディレクトリへ配ることができない)。そのため
+  「1枚から3か所を切り出して3 revision を作り、それを一括で書き出す」形にしてある。
+  `expect_export` も `dest_path` 1件しか書けないため、3枚のうち `1.webp` だけを
+  `must_exist_matching_ledger`(= 台帳のどれかと sha256 が一致)で検証し、
+  残り2枚は `expect_revision.min_matches: 3`(webp の派生 revision が3件)で間接的に見ている。
+  一括書き出しの網羅的な検証(件数上限・ファイル名衝突・部分失敗・`dest_dir` の
+  ワークスペース内/シンボリックリンク拒否)は `crates/atx-mcp/tests/batch.rs` 側にある。
 - 採点は台帳(`assets.jsonl`)ベースが基本。往復数・トークン消費量は `transcript.json` に
   残るが、`run.sh` の集計 JSON では現状 `claude_exit_code` のみを記録している。
   ターン数の詳細比較が要る場合は `transcript.json` を直接見ること。

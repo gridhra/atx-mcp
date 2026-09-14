@@ -44,7 +44,7 @@
 
 8. **書類を読む(OCR 前処理)**
    > 「このレシートの写真、読み取って」「このスライドに何て書いてある?」
-   `detect_document` が用紙・画面の四角形を見つけて `perspective` にそのまま貼れる quad を返し、`ocr_document` プリセット(グレースケール → 自動レベル → 軽いシャープ)と `trim` が画素の予算を文字に集中させ、`render_preview` の `long_edge:1568` がモデルに読める大きさの画像を渡す。OCR エンジンは同梱しない: 読むのはモデル、atx は画素を読みやすく・再現可能にするだけ。外部 OCR エンジン向けには `threshold`(Otsu / Sauvola)と `ocr_binarize` がある。
+   `detect_document` が用紙・画面の四角形を見つけて `perspective` にそのまま貼れる quad を返し、`ocr_document` プリセット(グレースケール → 自動レベル → 軽いシャープ)と `trim` が画素の予算を文字に集中させ、`render_preview` の `long_edge:1568` がモデルに読める大きさの画像を渡す。OCR エンジンは同梱しない: 読むのはモデル、atx は画素を読みやすく・再現可能にするだけ。`detect_text_blocks` は、その後の判断を決める問い「この文字は縮小に耐えるのか、どこで切るのか」に答える: 文字らしいブロックを読み順に返し、そのまま貼れる `crop` の帯も返す。外部 OCR エンジン向けには `threshold`(Otsu / Sauvola)と `ocr_binarize` がある。
 
 9. **検証と説明責任**
    > 「この画像、加工前後を並べて見せて」
@@ -123,22 +123,23 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 
 `--workspace`(env: `ATX_WORKSPACE`)はアセットストアのディレクトリ。存在しなければ作成される。
 
-## ツール(12)
+## ツール(13)
 
 | ツール | 役割 |
 |---|---|
 | `list_operations` | レシピ語彙の軽量カタログ。全 op を1行説明 + パラメータの型/値域ヒント付きで返し、末尾にビルトインプリセット名も載せる。`category:"geometry"\|"color"\|"filter"\|"output"` で絞り込み可(read-only) |
 | `explain_operation` | 1つの op の完全なリファレンス。パラメータ表(型・値域・必須/既定値・意味)、そのまま貼れる JSON 例、落とし穴を返す。ビルトインプリセット名も受け取れ、その全 op 列を返す。未知の名前には有効な op 名とプリセット名を分けて返す(read-only) |
 | `import_asset` | ローカル画像をワークスペースへ取り込み(sha256 冪等)。1件なら `path`、最大 64 件の一括なら `paths`(1件の失敗でバッチは止まらない)。取り込んだバイト列が既にこのワークスペースのレシピ出力だった場合は `already_derived_from` で警告 |
-| `inspect_image` | 寸法・EXIF・ICC・GPS 有無などの検査(read-only) |
+| `inspect_image` | 寸法・EXIF 要約・ICC・GPS 有無・輝度統計に加え、`sharpness`(ラプラシアンの分散。絶対値ではなく相対指標なので、同じ被写体の「良く撮れた1枚」と比べる)と `perceptual_hash`(dHash、16 桁 16 進。「さっきの画像と同じものか」の判定用)を返す。`include_exif:true` なら EXIF 全フィールドを `{ifd, tag, value}` で返す(GPS 座標や氏名を含みうるので既定では返さない)(read-only) |
 | `detect_tilt` | Canny+Hough(粗)+ 投影プロファイル(0.1° 未満の細分)による傾き角推定。水平族/垂直族の推定も返す。スコア曲線は `include_score_curve:true` のときだけ返る。confidence 低なら「補正しない」を返す(read-only) |
 | `detect_document` | Canny + 輪郭抽出で支配的な四角形(用紙・画面・ホワイトボード・看板)を検出し、`perspective` にそのまま貼れる `quad`(tl, tr, br, bl)と `confidence`・`area_ratio`・`output_size_hint`・貼り付け用 `suggested_operation` を返す。見つからないときは推測せず `quad:null` と理由(`no_quad_found` / `already_rectified` / `low_confidence`)を返す(read-only) |
+| `detect_text_blocks` | Otsu 二値化 + 水平方向の run-length smearing + 連結成分で「文字らしいブロック」(見出し・段落・表・キャプション)を読み順に検出し、各ブロックの `line_count` / `median_line_height_px` / `ink_ratio` を返す。`legibility.line_height_at_1568_px` は長辺 1568 に縮めたときの行高(~16px を下回ると読めなくなる)で、`legibility.recommended_bands` はその条件を満たすように画像を横帯へ割ったもの — 各要素はそのまま `render_preview` の前に貼れる `crop` op(read-only) |
 | `generate_mask` | 決定論的なグレースケールマスク(`linear_gradient` / `radial_gradient` / `luminosity_range` / `color_range`)を、参照画像と同寸法の PNG revision として生成する。op の `mask` フィールドから参照して使う(冪等) |
-| `render_preview` | レシピ(または `preset`)を低解像度(既定は長辺 ≤768、`long_edge` 256..1568 で視覚モデルが文字を読める大きさまで拡大可)で適用、インライン画像付きで返却。`overlay:"grid"\|"thirds"\|"horizon"` で構図確認用のガイド線を、`overlay:"mask"`(+ `mask_revision_id`)でマスクの被覆を重ねられる(プレビューのみに描画、本適用には影響しない) |
+| `render_preview` | レシピ(または `preset`)を低解像度(既定は長辺 ≤768、`long_edge` 256..1568 で視覚モデルが文字を読める大きさまで拡大可)で適用、インライン画像付きで返却。`overlay:"grid"\|"thirds"\|"horizon"` で構図確認用のガイド線を、`overlay:"mask"`(+ `mask_revision_id`)でマスクの被覆を重ねられる(プレビューのみに描画、本適用には影響しない)。返す画像の概算 vision トークン数(`width*height/750`)を `estimated_vision_tokens` として併記する |
 | `apply_transform` | レシピ(または `preset`)を高解像度適用し新 revision を発行(同一レシピ→同一 revision)。1件なら `revision_id`、同じレシピを最大 64 件へまとめて当てるなら `revision_ids` |
-| `compare_revisions` | 2つの revision を長辺 ≤640 に縮小し、`layout:"side_by_side"\|"stacked"` で1枚に並べてインライン画像で返却(A/B・before/after の視覚比較用)。`layout:"diff"` なら1枚の画素差分ヒートマップ + `mean_abs_diff`/`max_abs_diff`/`changed_pixel_ratio` の統計を返す(寸法が完全一致している必要あり) |
+| `compare_revisions` | 2つの revision を長辺 ≤640 に縮小し、`layout:"side_by_side"\|"stacked"` で1枚に並べてインライン画像で返却(A/B・before/after の視覚比較用)。`layout:"diff"` なら1枚の画素差分ヒートマップ + `mean_abs_diff`/`max_abs_diff`/`changed_pixel_ratio` と `ssim`(構造的類似度)を返す(寸法が完全一致している必要あり)。どの layout でも 2 枚の dHash のハミング距離 `perceptual_hash_distance` を返す(≤5 なら同じ絵の再エンコード/リサイズ、≥20 なら別の絵) |
 | `list_assets` | revision 台帳の参照(read-only) |
-| `export_asset` | revision を指定パスへ書き出し(既存ファイルは `overwrite:true` 明示時のみ上書き) |
+| `export_asset` | revision をワークスペース外へ書き出す。1件なら `revision_id` + `dest_path`、最大 64 件の一括なら `revision_ids` + `dest_dir`(ファイル名は `filename_template`、既定 `"{revision_id}.{ext}"`。`{index}` / `{stem}` も使える)。既存ファイルは `overwrite:true` 明示時のみ上書きし、ワークスペース内やシンボリックリンク越しには決して書かない |
 
 ## レシピ例
 
@@ -204,10 +205,28 @@ op 一覧はツールのスキーマにあえて埋め込んでいない。最�
 指定しない限り構造化エラーになる。合成式とブレンドモード 16 種は
 [レイヤー](#レイヤー)と完全に同じものを使う。
 
-> **テキストは描画されない。** 決定論のため、atx はシステムフォントを一切読まない
-> (インストールされているフォントはマシンごとに違い、バイト単位の再現性を壊すため)。
-> `<text>` を含む SVG は図形だけが描かれて警告が出る。**取り込む前にベクタエディタで
-> テキストをパス(アウトライン)へ変換すること**。そうすればどのマシンでも同じ画素になる。
+#### SVG 内のテキスト
+
+atx はシステムフォントを一切読まない(インストールされているフォントはマシンごとに違い、
+バイト単位の再現性を壊すため)。そのため `<text>` は、明示的に要求したときだけ描かれる:
+
+```json
+{ "op": "svg_overlay", "svg_revision_id": "rev_...", "x": 120, "y": 80,
+  "width": 48, "render_text": true, "font_revision_ids": ["rev_..."] }
+```
+
+- `render_text` の既定は `false`。このときは従来と完全に同じ挙動(図形は描かれ、
+  グリフは描かれず、警告が出る)。ベクタエディタでテキストをパス(アウトライン)へ
+  変換しておく方法も従来どおり有効で、そちらはフォントを一切必要としない。
+- `render_text:true` では**同梱の Roboto Regular 1 書体**(バイナリに埋め込み)と、
+  `font_revision_ids` で渡したフォント(最大 4 件)だけで描画する。それ以外は
+  何も読まないので、どのマシンでも同じ画素になる。
+- フォントは LUT や SVG と同じ**アセット**である: `.ttf` / `.otf` を `import_asset`
+  すると、サマリが `font-family` に書ける family 名を返す。
+  **日本語(CJK)はフォントの import が必須** — Roboto に CJK グリフは無く、
+  読み込んだどのフォントにも無い文字は □ で描かれ、件数が警告に出る。
+  フォント revision はアセットであって画像ではないので、`inspect_image` は
+  意図的に構造化エラーを返す。
 
 ### マスク(部分適用)
 
@@ -288,6 +307,12 @@ op 一覧はツールのスキーマにあえて埋め込んでいない。最�
 
 ## プリセット
 
+プリセットはレシピの**中に** op 1つとして埋め込むこともできる —
+`{"op": "preset", "name": "ocr_document"}` — ので、名前付きの処理と自分の op を組み合わせられる。
+マクロは何かが動く前にその場で展開されるため、プリセットの op を手で書き出したレシピと
+ハッシュが完全に一致する(`layers` を持つプリセットは展開できず、構造化エラーになる)。
+規則は `explain_operation {"operation":"preset"}` で引ける。
+
 `apply_transform` / `render_preview` は `recipe`(生の DSL)と
 `preset`([`presets/`](presets) 同梱の名前付きレシピ)のどちらか一方を受ける(排他・どちらか必須):
 
@@ -359,5 +384,8 @@ ATX 見出しとは関係ない。
 ## ライセンス
 
 MIT。[LICENSE](LICENSE) を参照。
+
+バイナリに同梱している crate 以外の素材(同梱フォント Roboto Regular)の出典と
+ライセンスは [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) に記載している。
 
 atx-mcp が役に立ったら [コーヒーをおごって](https://buymeacoffee.com/gridhra) もらえると励みになります ☕

@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use atx_mcp::tools::{AtxTools, ImportAssetParams, RevisionParams, TransformParams, CUBE_MIME};
+use atx_mcp::tools::{AtxTools, ImportAssetParams, InspectImageParams, TransformParams, CUBE_MIME};
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::Value;
 
@@ -108,9 +108,7 @@ fn inspect_image_rejects_a_cube_revision_with_a_structured_error() {
         .unwrap()
         .to_string();
 
-    let result = tools.inspect_image(&RevisionParams {
-        revision_id: rev.clone(),
-    });
+    let result = tools.inspect_image(&InspectImageParams::new(rev.clone()));
     let payload = error_payload(&result);
     assert_eq!(payload["error"]["code"], "not_an_image");
     assert_eq!(payload["error"]["details"]["mime_type"], CUBE_MIME);

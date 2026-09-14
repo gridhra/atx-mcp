@@ -1,0 +1,14 @@
+{
+  "id": "t16_document_headline_crop",
+  "prompt": "この書類、見出しの部分だけ切り出して。",
+  "input_fixture": "evals/fixtures/document_photo_rectified.png",
+  "success_criteria": {
+    "expect_revision": {
+      "recipe_contains_ops": [
+        {"op": "crop", "fields_present": ["rect"]}
+      ],
+      "min_matches": 1
+    }
+  },
+  "max_turns": 10
+}
