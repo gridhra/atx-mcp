@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/gridhra/atx-mcp"
@@ -27,13 +27,26 @@ kamadak-exif = "0.6"
 jpeg-encoder = "0.7"
 webp = "0.3"
 ravif = "0.13"
-# SVG のラスタライズ(v0.8 `svg_overlay`)。
-# **default-features = false は決定論のための必須設定**: 既定の
-# `text` / `system-fonts` はマシンごとに違うシステムフォントを読みに行くため、
-# 同じレシピが環境によって別のバイト列を出す。無効化すると usvg に fontdb 自体が
-# 存在せず、`<text>` は「フォント解決不能」ではなく**そもそも描かれない**
-# (DESIGN.md §9.9)。svgz / raster-images も外して純 Rust・依存最小に保つ。
-resvg = { version = "0.48.1", default-features = false }
+# SVG のラスタライズ(v0.8 `svg_overlay`、v0.10 で文字描画を追加)。
+# **features は決定論のために手で選ぶ**:
+#   - `text`(有効): usvg にテキスト整形(harfrust + skrifa、純 Rust)を入れる。
+#     この feature 単独ではフォント DB は**空**で、`Options.fontdb` へ明示的に
+#     `load_font_data` したバイト列しか使われない。atx は同梱の Roboto-Regular
+#     (`crates/atx-core/assets/fonts/`、`include_bytes!`)と、ユーザーが
+#     `import_asset` した font アセットのみを入れるので、ホスト環境は結果に一切入らない
+#     (DESIGN.md §9.9)。`svg_overlay.render_text: true` のときだけ DB を満たす。
+#   - `system-fonts` / `memmap-fonts`(**付けない**): マシンごとに違う
+#     インストール済みフォントを読みに行くため、同じレシピが環境によって
+#     別のバイト列を出す。決定論(バイト同一の再現性)と正面から矛盾する。
+#   - `svgz` / `raster-images`(付けない): 純 Rust・依存最小・外部参照ゼロを保つ。
+resvg = { version = "0.48.1", default-features = false, features = ["text"] }
+# フォント(font アセット)の検証とグリフ被覆の事前確認。usvg の整形器
+# (harfrust)が内部で使っているのと**同じ**パーサなので、依存を増やさずに
+# 「usvg が読めるか」を import 時に先取りできる。ttf-parser ではなく skrifa を
+# 選ぶ理由: ttf-parser はメンテ終了が宣言されており(RUSTSEC-2026-0192)、
+# cargo-deny の unmaintained ゲート(workspace 直接依存のみ対象)に触れる。
+# skrifa はその勧告自身が挙げる後継。
+skrifa = "0.44"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

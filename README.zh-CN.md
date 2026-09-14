@@ -45,7 +45,7 @@
 
 8. **读取文档(OCR 预处理)**
    > "帮我读一下这张收据照片。" / "这张幻灯片上写了什么?"
-   `detect_document` 找到纸张或屏幕的四边形并返回可直接粘贴到 `perspective` 的 quad,`ocr_document` 预设(灰度 → 自动色阶 → 轻微锐化)与 `trim` 把像素预算集中到文字上,`render_preview` 的 `long_edge:1568` 则把模型真正能读清的图像交给它。不内置 OCR 引擎:阅读由模型完成,atx 只负责让像素清晰可读且可复现。面向外部 OCR 引擎另有 `threshold`(Otsu / Sauvola)与 `ocr_binarize`。
+   `detect_document` 找到纸张或屏幕的四边形并返回可直接粘贴到 `perspective` 的 quad,`ocr_document` 预设(灰度 → 自动色阶 → 轻微锐化)与 `trim` 把像素预算集中到文字上,`render_preview` 的 `long_edge:1568` 则把模型真正能读清的图像交给它。不内置 OCR 引擎:阅读由模型完成,atx 只负责让像素清晰可读且可复现。`detect_text_blocks` 回答了决定后续做法的那个问题——"这些文字能不能扛过缩小?该在哪里切?"——它按阅读顺序返回像文字的块,并给出可直接粘贴的 `crop` 条带。面向外部 OCR 引擎另有 `threshold`(Otsu / Sauvola)与 `ocr_binarize`。
 
 9. **核验与可追责**
    > "把这张图修改前后并排给我看看。"
@@ -124,22 +124,23 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 
 `--workspace`(环境变量:`ATX_WORKSPACE`)是资产存储所在的目录,若不存在会自动创建。
 
-## 工具(12 个)
+## 工具(13 个)
 
 | 工具 | 作用 |
 |---|---|
 | `list_operations` | 配方词汇的精简目录:列出全部操作(op)及其一行说明和参数的类型/取值范围提示,并在末尾附上内置预设名称。可用 `category:"geometry"\|"color"\|"filter"\|"output"` 筛选(只读) |
 | `explain_operation` | 单个操作的完整参考:参数表(类型、取值范围、必填/默认值、语义)、可直接粘贴的 JSON 示例以及注意事项。也接受内置预设名称,并返回该预设的完整操作列表。名称无效时会分组返回全部有效操作名与预设名(只读) |
 | `import_asset` | 将本地图片导入工作区(基于 sha256,幂等)。单个文件用 `path`,批量(最多 64 个)用 `paths`(单个文件失败不会中断整批)。若导入的字节已是本工作区某个配方的输出,会通过 `already_derived_from` 发出提醒 |
-| `inspect_image` | 检查尺寸、EXIF、ICC 配置文件、是否含 GPS 信息等(只读) |
+| `inspect_image` | 检查尺寸、EXIF 摘要、ICC 配置文件、是否含 GPS 信息、亮度统计,并返回 `sharpness`(拉普拉斯响应的方差;它是相对指标,应与同一被摄体拍得好的那张比较)和 `perceptual_hash`(dHash,16 位十六进制,用于判断"是不是同一张图")。`include_exif:true` 时还会以 `{ifd, tag, value}` 返回全部 EXIF 字段——默认不返回,因为完整转储可能含 GPS 坐标与人名(只读) |
 | `detect_tilt` | 通过 Canny+Hough(粗定位)加投影轮廓法(精细化到 0.1° 以内)估算倾斜角度,同时返回水平/垂直族的估计值;完整评分曲线需通过 `include_score_curve:true` 显式开启。置信度低时返回"不进行校正"(只读) |
 | `detect_document` | 通过 Canny + 轮廓提取找到主导四边形(纸张、屏幕、白板、标牌),返回可直接用于 `perspective` 的 `quad`(tl, tr, br, bl)以及 `confidence`、`area_ratio`、`output_size_hint` 和可直接粘贴的 `suggested_operation`。找不到时不猜测,返回 `quad:null` 及原因(`no_quad_found` / `already_rectified` / `low_confidence`)(只读) |
+| `detect_text_blocks` | 用 Otsu 二值化 + 水平 run-length smearing + 连通域找出"像文字的块"(标题、段落、表格、图注),按阅读顺序返回,每块附 `line_count` / `median_line_height_px` / `ink_ratio`。`legibility.line_height_at_1568_px` 表示把整图缩到长边 1568 后的行高(低于约 16px 通常就读不清了),`legibility.recommended_bands` 则把图像切成满足该条件的横向条带——每一项本身就是可粘贴到 `render_preview` 之前的 `crop` 操作(只读) |
 | `generate_mask` | 确定性地生成灰度蒙版(`linear_gradient` / `radial_gradient` / `luminosity_range` / `color_range`),存为与参考图像同尺寸的 PNG 修订版本,供操作的 `mask` 字段引用(幂等) |
-| `render_preview` | 以低分辨率(默认长边 ≤768,可用 `long_edge` 256..1568 放大到视觉模型能读清文字的尺寸)应用配方(或 `preset` 预设)并以内联图像返回。可通过 `overlay:"grid"\|"thirds"\|"horizon"` 叠加构图参考线,或通过 `overlay:"mask"`(配合 `mask_revision_id`)叠加蒙版覆盖范围(仅绘制在预览图上,不影响实际变换) |
+| `render_preview` | 以低分辨率(默认长边 ≤768,可用 `long_edge` 256..1568 放大到视觉模型能读清文字的尺寸)应用配方(或 `preset` 预设)并以内联图像返回。可通过 `overlay:"grid"\|"thirds"\|"horizon"` 叠加构图参考线,或通过 `overlay:"mask"`(配合 `mask_revision_id`)叠加蒙版覆盖范围(仅绘制在预览图上,不影响实际变换)。同时以 `estimated_vision_tokens` 给出所返回图像的粗略视觉 token 预算(`width*height/750`) |
 | `apply_transform` | 以完整分辨率应用配方(或 `preset` 预设)并生成新的修订版本(同一配方 → 同一修订版本)。单张用 `revision_id`,把同一配方批量应用到最多 64 个修订版本用 `revision_ids` |
-| `compare_revisions` | 将两个修订版本缩放到长边 ≤640,通过 `layout:"side_by_side"\|"stacked"` 拼接为一张内联图像返回(用于 A/B 或前后对比的可视化);`layout:"diff"` 则返回单张像素差异热力图,并附带 `mean_abs_diff`/`max_abs_diff`/`changed_pixel_ratio` 统计值(要求两者尺寸完全一致) |
+| `compare_revisions` | 将两个修订版本缩放到长边 ≤640,通过 `layout:"side_by_side"\|"stacked"` 拼接为一张内联图像返回(用于 A/B 或前后对比的可视化);`layout:"diff"` 则返回单张像素差异热力图,并附带 `mean_abs_diff`/`max_abs_diff`/`changed_pixel_ratio` 与 `ssim`(结构相似度)(要求两者尺寸完全一致)。任何 layout 都会返回两者 dHash 的汉明距离 `perceptual_hash_distance`(≤5 通常意味着同一张图被重新编码或缩放,≥20 则是两张不同的图) |
 | `list_assets` | 查阅修订版本台账(只读) |
-| `export_asset` | 将修订版本导出到指定路径(仅在显式设置 `overwrite:true` 时才会覆盖已存在的文件) |
+| `export_asset` | 把修订版本导出到工作区之外:单个用 `revision_id` + `dest_path`,一次最多 64 个用 `revision_ids` + `dest_dir`(文件名由 `filename_template` 决定,默认 `"{revision_id}.{ext}"`,还可用 `{index}` / `{stem}`)。仅在显式设置 `overwrite:true` 时才会覆盖已存在的文件,并且绝不写入工作区内部或经由符号链接写出 |
 
 ## 配方示例
 
@@ -201,10 +202,27 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 两个都给则拉伸到精确尺寸——没有固有尺寸的 SVG,若不同时给出两者会返回结构化错误。
 合成公式与 16 种 `blend_mode` 与[图层](#图层)完全一致。
 
-> **文本永远不会被渲染。** 为保证确定性,atx 不加载任何系统字体(各机器安装的
-> 字体不同,会破坏逐字节可复现性)。含 `<text>` 的 SVG 只渲染图形、不渲染字形,
-> 并返回一条警告。**请在导入前于矢量编辑器中把文本转换为路径(轮廓)**,
-> 这样在任何机器上得到的像素都完全相同。
+#### SVG 中的文本
+
+atx 不加载任何系统字体(各机器安装的字体不同,会破坏逐字节可复现性)。因此
+`<text>` 只有在你明确要求时才会被渲染:
+
+```json
+{ "op": "svg_overlay", "svg_revision_id": "rev_...", "x": 120, "y": 80,
+  "width": 48, "render_text": true, "font_revision_ids": ["rev_..."] }
+```
+
+- `render_text` 默认为 `false`,此时行为与以往完全相同(渲染图形、不渲染字形,
+  并返回一条警告)。在矢量编辑器中把文本转换为路径(轮廓)同样依旧可行,
+  而且完全不需要字体。
+- `render_text:true` 只用**随包内嵌的一款字体 Roboto Regular**(编进可执行文件)
+  以及你通过 `font_revision_ids` 传入的字体(最多 4 个)来绘制。除此之外什么都不加载,
+  所以在任何机器上得到的像素都完全相同。
+- 字体和 LUT、SVG 一样是**资产**:用 `import_asset` 导入 `.ttf` / `.otf`,
+  摘要会给出可写进 `font-family` 的 family 名称。
+  **中文等 CJK 文本必须导入字体** —— Roboto 没有 CJK 字形,已加载字体中都缺失的
+  字符会被画成方框并在警告中计数。字体修订版本是资产而不是图像,
+  因此 `inspect_image` 会有意返回结构化错误。
 
 ### 蒙版(局部调整)
 
@@ -282,6 +300,11 @@ claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /pat
 
 ## 预设
 
+预设也可以作为一个操作内联**写在配方里** —— `{"op": "preset", "name": "ocr_document"}` ——
+从而把具名处理与你自己的操作组合起来。该宏会在任何处理开始前就地展开,
+因此其哈希与手工把预设的操作逐条写出来完全一致(带 `layers` 的预设无法内联,
+会返回结构化错误)。规则可用 `explain_operation {"operation":"preset"}` 查询。
+
 `apply_transform` 与 `render_preview` 接受 `recipe`(原始 DSL)或
 `preset`(随包提供的具名配方,见 [`presets/`](presets))之一(二者互斥,且必须有其一):
 
@@ -353,5 +376,8 @@ crate 结构:`atx-core`(配方与变换引擎)/ `atx-geometry`(倾斜检测)/
 ## 许可证
 
 MIT。详见 [LICENSE](LICENSE)。
+
+随可执行文件一同分发的非 crate 素材(内嵌字体 Roboto Regular)的来源与许可证
+记录在 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 如果 atx-mcp 帮你节省了时间,欢迎 [请我喝杯咖啡](https://buymeacoffee.com/gridhra) ☕

@@ -817,13 +817,28 @@ pub const OPERATIONS: &[OpDoc] = &[
                 requirement: "default: normal",
                 semantics: "The same 16 W3C blend modes as layers: normal | multiply | screen | overlay | darken | lighten | color_dodge | color_burn | hard_light | soft_light | difference | exclusion | hue | saturation | color | luminosity. Compositing uses the identical W3C formula, so a watermark behaves exactly as it would as a layer.",
             },
+            ParamDoc {
+                name: "render_text",
+                type_hint: "bool",
+                requirement: "default: false",
+                semantics: "Whether <text> elements are drawn. false (the default) skips them exactly as every version before this one did, so existing recipes keep their hash and their output bytes. true loads the bundled Roboto Regular plus any fonts named in font_revision_ids, and nothing else - no system fonts, so the result is the same on every machine.",
+            },
+            ParamDoc {
+                name: "font_revision_ids",
+                type_hint: "[\"rev_...\"] up to 4",
+                requirement: "default: []",
+                semantics: "Revision ids of font assets (.ttf/.otf) already imported into THIS workspace, searched after the bundled Roboto. import_asset reports each font's family names; use one of those names verbatim in the SVG's font-family. Ignored when render_text is false.",
+            },
         ],
         examples: &[
             r#"{"op": "svg_overlay", "svg_revision_id": "rev_01J000000000000000000000", "x": 24, "y": 24}"#,
             r#"{"op": "svg_overlay", "svg_revision_id": "rev_01J000000000000000000000", "x": -40, "y": 900, "width": 320, "opacity": 0.25, "blend_mode": "screen"}"#,
+            // 番号付きコールアウト(円 + 数字テキストの SVG)。文字を描くので render_text が要る。
+            r#"{"op": "svg_overlay", "svg_revision_id": "rev_01J000000000000000000000", "x": 120, "y": 80, "width": 48, "render_text": true, "font_revision_ids": []}"#,
         ],
         warnings: &[
-            "TEXT IS NOT RENDERED. atx never loads system fonts, because the installed fonts differ from machine to machine and would break byte-for-byte reproducibility. An SVG containing <text> renders its shapes but not its glyphs, and reports a warning. Convert text to paths (outlines) in your vector editor before importing.",
+            "Text is drawn only with render_text:true, using the bundled Roboto plus any font_revision_ids; characters missing from every loaded font render as boxes and are counted in a warning - import a font asset (.ttf/.otf) for CJK. With render_text:false (the default) an SVG's <text> renders its shapes but not its glyphs and reports a warning, so convert text to paths if you would rather not depend on a font at all. System fonts are never loaded either way, because the installed fonts differ from machine to machine and would break byte-for-byte reproducibility.",
+            "The third example is a numbered callout: an SVG holding a <circle> plus <text font-family=\"Roboto\">1</text>, stamped with render_text:true so the digit is drawn. Keep font-family to a name that import_asset reported (or \"Roboto\" for the bundled face); an unknown family falls back to the bundled one.",
             "The SVG must be in the workspace: import_asset the .svg file FIRST, then reference the revision_id it returns. A recipe pointing at an unknown id fails with a structured error before any pixel work happens.",
             "Each of width/height is limited to 1..=32768, and the rasterized overlay may not exceed 100,000,000 pixels in total (width * height) - a bigger request is a structured error at run time, not a silent downscale.",
             "An SVG with no intrinsic size (no viewBox and no absolute width/height on the root <svg>) is a structured error unless you give BOTH width and height - the engine will not silently fall back to a default size. import_asset reports the intrinsic size (0x0 means it has none).",

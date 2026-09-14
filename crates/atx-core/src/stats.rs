@@ -15,6 +15,12 @@
 //! - **アルファ**: 無視する(格納されている RGB 符号値をそのまま使う)。プリマルチプライド
 //!   でない透明画素の RGB も統計に入る。
 //! - **サブサンプル**: 下記参照。
+//! - **鮮鋭度(sharpness)**: 上記のヒストグラム系とは別経路。全画素の BT.709 輝度 u8 を
+//!   長辺 1024 以下へ整数ボックス平均で縮小し、3×3 ラプラシアン(整数カーネル)の応答の**分散**を
+//!   整数演算で求める。間引きグリッドではなく縮小画像を使うのは、間引きだと隣接画素が
+//!   飛んでしまいラプラシアンが意味を失うため。
+use image::GrayImage;
+
 pub const BINS: usize = 256;
 
 /// BT.709 輝度係数(sRGB 符号値ベース。`ops::auto_levels` と同一)。
@@ -44,6 +50,128 @@ pub struct ImageStats {
     pub mean_r: f64,
     pub mean_g: f64,
     pub mean_b: f64,
+    /// Variance of the 3x3 Laplacian response over the BT.709 luma, downscaled to a
+    /// long edge of at most 1024 px (higher = crisper edges; rounded to 1 decimal).
+    /// Scene-dependent, so treat it as a relative measure: for documents, below ~30
+    /// usually means motion blur or defocus; compare against a known-good capture
+    /// rather than an absolute.
+    pub sharpness: f64,
+}
+
+/// 鮮鋭度計算で使う縮小後の長辺(px)。
+pub const SHARPNESS_LONG_EDGE: u32 = 1024;
+
+/// BT.709 輝度(sRGB 符号値 → u8)。係数を 1/10000 の固定小数で持ち、
+/// 丸めは half-up(+5000 して切り捨て)。浮動小数を一切使わないので
+/// プラットフォーム差が入る余地がない。
+///
+/// `crate::similarity` の知覚ハッシュ / SSIM も同じ輝度定義を共有する。
+#[inline]
+pub fn luma_u8(r: u8, g: u8, b: u8) -> u8 {
+    let v = 2126 * u32::from(r) + 7152 * u32::from(g) + 722 * u32::from(b) + 5000;
+    (v / 10000) as u8
+}
+
+/// インターリーブ配置の 8bit バッファから BT.709 輝度のグレースケール画像を作る。
+///
+/// `sharpness`(このモジュール)と SSIM 用のグレー化(`crate::similarity` の
+/// `gray_from_rgb8` / `gray_from_rgba8`)が共有する唯一の実装。
+pub(crate) fn gray_from_interleaved(
+    buf: &[u8],
+    channels: usize,
+    width: u32,
+    height: u32,
+) -> Option<GrayImage> {
+    let expected = u64::from(width) * u64::from(height) * channels as u64;
+    if width == 0 || height == 0 || buf.len() as u64 != expected {
+        return None;
+    }
+    let out: Vec<u8> = buf
+        .chunks_exact(channels)
+        .map(|px| luma_u8(px[0], px[1], px[2]))
+        .collect();
+    GrayImage::from_raw(width, height, out)
+}
+
+/// 長辺が `long_edge` 以下になるよう**整数ボックス平均**で縮小する。
+///
+/// 縮小率は整数 `k = ceil(長辺 / long_edge)` に固定し、k×k ブロック(端は実在画素数)の
+/// 平均を取る。整数演算のみで f32 の補間を通らないため、決定論が自明で、
+/// 最適化なしの debug ビルドでも速い(Triangle 補間は 1477×1108 → 1024 で 3 秒かかっていた)。
+pub(crate) fn downscale_gray(gray: &GrayImage, long_edge: u32) -> std::borrow::Cow<'_, GrayImage> {
+    let (w, h) = (gray.width(), gray.height());
+    let long = w.max(h);
+    if long <= long_edge || long == 0 || long_edge == 0 {
+        return std::borrow::Cow::Borrowed(gray);
+    }
+    let k = long.div_ceil(long_edge);
+    let nw = w.div_ceil(k).max(1);
+    let nh = h.div_ceil(k).max(1);
+    let src = gray.as_raw();
+    let mut out = Vec::with_capacity((nw * nh) as usize);
+    for by in 0..nh {
+        let y0 = by * k;
+        let y1 = (y0 + k).min(h);
+        for bx in 0..nw {
+            let x0 = bx * k;
+            let x1 = (x0 + k).min(w);
+            let mut sum: u64 = 0;
+            for y in y0..y1 {
+                let row = (y * w) as usize;
+                for x in x0..x1 {
+                    sum += u64::from(src[row + x as usize]);
+                }
+            }
+            let count = u64::from(y1 - y0) * u64::from(x1 - x0);
+            // 四捨五入(整数)。count ≥ 1 は保証される。
+            out.push(((sum + count / 2) / count) as u8);
+        }
+    }
+    std::borrow::Cow::Owned(GrayImage::from_raw(nw, nh, out).expect("box downscale dimensions"))
+}
+
+/// グレースケール画像の鮮鋭度(3×3 ラプラシアン応答の分散、小数1桁丸め)。
+///
+/// 長辺 1024 以下へ整数ボックス平均で縮小してから計算するので、同じ被写体を別解像度で
+/// 撮った画像どうしを比べやすい。3×3 未満の画像は 0.0。
+pub fn sharpness_gray(gray: &GrayImage) -> f64 {
+    laplacian_variance(&downscale_gray(gray, SHARPNESS_LONG_EDGE))
+}
+
+/// 3×3 ラプラシアン(カーネル `[0,1,0, 1,-4,1, 0,1,0]`)応答の分散。
+///
+/// 応答は i32(範囲 ±1020)、総和は i64、平方和は i128 で厳密に積む。
+/// 分散は `(n*Σl² - (Σl)²) / n²` を整数で作ってから 1 回だけ f64 へ落とすので、
+/// 走査順に依存する浮動小数の再結合誤差が発生しない。境界 1 画素は除外する。
+fn laplacian_variance(gray: &GrayImage) -> f64 {
+    let (w, h) = gray.dimensions();
+    if w < 3 || h < 3 {
+        return 0.0;
+    }
+    let buf = gray.as_raw();
+    let stride = w as usize;
+    let mut sum: i64 = 0;
+    let mut sum_sq: i128 = 0;
+    let mut n: u64 = 0;
+    for y in 1..(h as usize - 1) {
+        let row = y * stride;
+        for x in 1..(w as usize - 1) {
+            let c = i32::from(buf[row + x]);
+            let up = i32::from(buf[row - stride + x]);
+            let down = i32::from(buf[row + stride + x]);
+            let left = i32::from(buf[row + x - 1]);
+            let right = i32::from(buf[row + x + 1]);
+            let l = up + left - 4 * c + right + down;
+            sum += i64::from(l);
+            sum_sq += i128::from(l) * i128::from(l);
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return 0.0;
+    }
+    let numerator = i128::from(n) * sum_sq - i128::from(sum) * i128::from(sum);
+    round1(numerator as f64 / (n as f64 * n as f64))
 }
 
 /// グリッド間引きの刻み幅。`k = ceil(sqrt(w*h / TARGET_SAMPLES))`(最低 1)。
@@ -176,6 +304,11 @@ fn from_interleaved(buf: &[u8], channels: usize, width: u32, height: u32) -> Opt
     }
     let n = count as f64;
 
+    // 鮮鋭度は間引きではなく縮小画像で測る(隣接画素が要るため)。
+    let sharpness = gray_from_interleaved(buf, channels, width, height)
+        .map(|gray| sharpness_gray(&gray))
+        .unwrap_or(0.0);
+
     Some(ImageStats {
         luma_p0_2: round1(percentile(&hist, count, 0.2)),
         luma_p1: round1(percentile(&hist, count, 1.0)),
@@ -185,6 +318,7 @@ fn from_interleaved(buf: &[u8], channels: usize, width: u32, height: u32) -> Opt
         mean_r: round1(sum_r as f64 / n),
         mean_g: round1(sum_g as f64 / n),
         mean_b: round1(sum_b as f64 / n),
+        sharpness,
     })
 }
 
@@ -229,6 +363,41 @@ mod tests {
         assert_eq!(s.luma_p50, 128.0);
         assert_eq!(s.luma_p99_8, 128.0);
         assert_eq!(s.mean_r, 128.0);
+    }
+
+    #[test]
+    fn flat_gray_has_zero_sharpness() {
+        let rgba = [128u8, 128, 128, 255].repeat(64 * 64);
+        assert_eq!(from_rgba8(&rgba, 64, 64).unwrap().sharpness, 0.0);
+    }
+
+    /// 1 画素おきの白黒縦縞は最大級のラプラシアン応答を出す(縮小が要らない 64x64)。
+    #[test]
+    fn stripes_have_large_sharpness() {
+        let mut rgba = Vec::new();
+        for _ in 0..64 {
+            for x in 0..64 {
+                let v = if x % 2 == 0 { 0u8 } else { 255 };
+                rgba.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let s = from_rgba8(&rgba, 64, 64).unwrap();
+        assert!(s.sharpness > 10_000.0, "{}", s.sharpness);
+    }
+
+    #[test]
+    fn luma_u8_matches_bt709_endpoints() {
+        assert_eq!(luma_u8(0, 0, 0), 0);
+        assert_eq!(luma_u8(255, 255, 255), 255);
+        assert_eq!(luma_u8(255, 0, 0), 54); // 0.2126*255 = 54.213
+        assert_eq!(luma_u8(0, 255, 0), 182); // 0.7152*255 = 182.376
+        assert_eq!(luma_u8(0, 0, 255), 18); // 0.0722*255 = 18.411
+    }
+
+    #[test]
+    fn sharpness_is_zero_for_tiny_images() {
+        let rgba = [10u8, 20, 30, 255].repeat(4);
+        assert_eq!(from_rgba8(&rgba, 2, 2).unwrap().sharpness, 0.0);
     }
 
     #[test]

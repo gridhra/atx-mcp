@@ -1180,3 +1180,128 @@ fn golden_full_pipeline_sha256() {
         "884ea169e1027cf26d9140f6d2f7543904b2ca344667640f87820f528eaa175d"
     );
 }
+
+// ---------------------------------------------------------------------------
+// EXIF Orientation 5 / 7(転置系)
+// ---------------------------------------------------------------------------
+//
+// EXIF 仕様の定義は
+//   5 = 左右反転してから時計回り 270°(= 主対角線での転置)
+//   7 = 左右反転してから時計回り 90°(= 反対角線での転置)
+// で、5 と 7 は互いに逆である。以前の実装は両者を取り違えていた
+// (5 に `rotate90(flip_horizontal(..))` を、7 に `rotate270(flip_horizontal(..))` を
+// 当てていた = 仕様の 7 と 5)。Orientation=6 しかテストが無かったので気づけなかった。
+
+/// 赤(左)・青(右)の 2x1 画像。向きの写像を 1 画素単位で見分けるための最小の的。
+fn red_then_blue_2x1() -> RgbaImage {
+    let mut img = RgbaImage::new(2, 1);
+    img.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+    img.put_pixel(1, 0, Rgba([0, 0, 255, 255]));
+    img
+}
+
+/// 赤みが勝っているか(JPEG 経由なので色は厳密一致しない)。
+fn is_reddish(px: &Rgba<u8>) -> bool {
+    px.0[0] as i32 > px.0[2] as i32 + 60
+}
+
+/// 青みが勝っているか。
+fn is_bluish(px: &Rgba<u8>) -> bool {
+    px.0[2] as i32 > px.0[0] as i32 + 60
+}
+
+/// Orientation=5 は転置(赤が上)、Orientation=7 は反対角線での転置(青が上)。
+///
+/// 導出: 2x1 の画素 (x,y) は
+/// 5 では出力の (X,Y) = (y, x)、7 では (X,Y) = (h-1-y, w-1-x) に来る。
+/// よって 5 は赤 (0,0) → (0,0) = 上、7 は赤 (0,0) → (0,1) = 下。
+#[test]
+fn exif_orientation_5_and_7_follow_the_spec() {
+    for (orientation, top_is_red) in [(5u16, true), (7, false)] {
+        let input = jpeg_with_orientation(&red_then_blue_2x1(), orientation);
+
+        let info = inspect_bytes(&input, &Limits::default()).unwrap();
+        assert_eq!(info.exif_orientation, Some(orientation));
+        // どちらも 90 度系なので実効寸法は入れ替わる。
+        assert_eq!((info.oriented_width, info.oriented_height), (1, 2));
+
+        let out = apply_recipe(
+            &input,
+            &recipe(r#"{"operations":[{"op":"encode","format":"png"}]}"#),
+            &Limits::default(),
+        )
+        .unwrap();
+        assert_eq!((out.width, out.height), (1, 2));
+
+        let img = decode(&out.bytes);
+        let top = *img.get_pixel(0, 0);
+        let bottom = *img.get_pixel(0, 1);
+        if top_is_red {
+            assert!(
+                is_reddish(&top) && is_bluish(&bottom),
+                "orientation={orientation} は転置なので上が赤: top={top:?} bottom={bottom:?}"
+            );
+        } else {
+            assert!(
+                is_bluish(&top) && is_reddish(&bottom),
+                "orientation={orientation} は反対角線の転置なので上が青: top={top:?} bottom={bottom:?}"
+            );
+        }
+    }
+}
+
+/// Orientation=5 / 7 でも SOURCE 座標のクロップが同じ画素を切り出す。
+///
+/// 向きの写像(画素の並べ替え)と `orientation_affine`(座標の写像)は必ず
+/// 同じ定義でなければならない。ここでは**入力の左端の縦帯**を SOURCE 座標で切り、
+/// それが出力のどこに、どの順序で並ぶかを固定する:
+/// 5 は `X = y` なので帯の上半分(赤)が出力の**左**へ、
+/// 7 は `X = h - 1 - y` なので上半分が出力の**右**へ来る。
+#[test]
+fn source_space_crop_follows_orientation_five_and_seven() {
+    // 200x120。左端の 20px 幅の帯だけ、上半分を赤・下半分を青に塗る。
+    let src = RgbaImage::from_fn(200, 120, |x, y| {
+        if x < 20 {
+            if y < 60 {
+                Rgba([230, 20, 20, 255])
+            } else {
+                Rgba([20, 20, 230, 255])
+            }
+        } else {
+            Rgba([128, 128, 128, 255])
+        }
+    });
+
+    for (orientation, left_is_red) in [(5u16, true), (7, false)] {
+        let input = jpeg_with_orientation(&src, orientation);
+        let out = apply_recipe(
+            &input,
+            &recipe(
+                r#"{"operations":[
+                    {"op":"crop","rect":{"x":0,"y":0,"width":20,"height":120},
+                     "coordinate_space":"source"},
+                    {"op":"encode","format":"png"}
+                ]}"#,
+            ),
+            &Limits::default(),
+        )
+        .unwrap();
+        // 90 度系なので、縦 120 x 横 20 の帯は横 120 x 縦 20 になる。
+        assert_eq!((out.width, out.height), (120, 20));
+
+        let img = decode(&out.bytes);
+        let left = *img.get_pixel(30, 10);
+        let right = *img.get_pixel(90, 10);
+        if left_is_red {
+            assert!(
+                is_reddish(&left) && is_bluish(&right),
+                "orientation={orientation}: left={left:?} right={right:?}"
+            );
+        } else {
+            assert!(
+                is_bluish(&left) && is_reddish(&right),
+                "orientation={orientation}: left={left:?} right={right:?}"
+            );
+        }
+    }
+}

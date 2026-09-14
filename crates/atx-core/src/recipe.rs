@@ -329,6 +329,21 @@ pub enum Operation {
         /// ブレンドモード(`layers` と同じ 16 種)。既定 `normal`。
         #[serde(default)]
         blend_mode: BlendMode,
+        /// true で SVG の `<text>` を実際に描画する(既定 false = 従来どおり描かない)。
+        ///
+        /// 既定値は canonical JSON に**現れない**(`skip_serializing_if`)ので、
+        /// v0.8 以来の既存レシピの hash と出力バイト列は変わらない。
+        /// 描画に使う書体は「同梱の Roboto Regular + `font_revision_ids`」だけで、
+        /// システムフォントは一切読まない(ops/svg.rs の設計note)。
+        #[serde(default, skip_serializing_if = "is_false")]
+        render_text: bool,
+        /// 文字描画に追加で使う font アセットの revision id("rev_...")。最大 4 本。
+        ///
+        /// 指定順に fontdb へ積むので、同じ family 名が衝突した場合は先に入った方
+        /// (= 同梱書体 → 先に書いた id)が勝つ。空(既定)なら同梱書体のみ。
+        /// `render_text: false` のときは使われない。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        font_revision_ids: Vec<String>,
     },
     /// 水平/垂直反転。
     Flip { direction: FlipDirection },
@@ -1161,6 +1176,7 @@ fn validate_operations(operations: &[Operation]) -> crate::Result<()> {
                 opacity,
                 width,
                 height,
+                font_revision_ids,
                 ..
             } => crate::ops::svg::validate(
                 index,
@@ -1170,6 +1186,7 @@ fn validate_operations(operations: &[Operation]) -> crate::Result<()> {
                 *opacity,
                 *width,
                 *height,
+                font_revision_ids,
             )?,
             Operation::Flip { .. } => {}
             Operation::Vignette {

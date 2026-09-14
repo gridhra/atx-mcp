@@ -455,8 +455,10 @@ fn the_catalog_shows_what_each_preset_actually_does() {
     );
     // DESIGN.md §9.12 で op 2 本(trim / threshold)と ocr_* プリセット 4 本が
     // 増えた分だけ上限を広げている(1 行あたり ~170 chars × 6 行)。
+    // v0.6 で svg_overlay に render_text / font_revision_ids の 2 行が加わり
+    // 10_500 → 10_700 へ(実測 10,533 chars)。
     assert!(
-        body.len() < 10_500,
+        body.len() < 10_700,
         "the catalog must stay compact, got {} chars",
         body.len()
     );
@@ -501,8 +503,11 @@ fn re_importing_an_exported_derivative_warns_about_double_processing() {
         .unwrap()
         .join(format!("atx-double-apply-{}.png", std::process::id()));
     let exported = structured(&tools.export_asset(&ExportAssetParams {
-        revision_id: derived_rev.clone(),
-        dest_path: dest.to_string_lossy().into_owned(),
+        revision_id: Some(derived_rev.clone()),
+        revision_ids: None,
+        dest_path: Some(dest.to_string_lossy().into_owned()),
+        dest_dir: None,
+        filename_template: None,
         overwrite: true,
     }));
     let exported_path = exported["path"].as_str().unwrap().to_string();
@@ -558,8 +563,11 @@ fn double_apply_detection_works_per_file_in_a_batch() {
     let outside = workspace.path().parent().unwrap();
     let dest = outside.join(format!("atx-batch-double-{}.png", std::process::id()));
     structured(&tools.export_asset(&ExportAssetParams {
-        revision_id: derived_rev.clone(),
-        dest_path: dest.to_string_lossy().into_owned(),
+        revision_id: Some(derived_rev.clone()),
+        revision_ids: None,
+        dest_path: Some(dest.to_string_lossy().into_owned()),
+        dest_dir: None,
+        filename_template: None,
         overwrite: true,
     }));
     let fresh = copies(workspace.path(), 1).remove(0);
@@ -587,4 +595,373 @@ fn double_apply_detection_works_per_file_in_a_batch() {
         summary.contains("already the output of a recipe"),
         "the batch summary must surface the double-apply warning: {summary}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// export_asset の一括化(v0.6)
+//
+// 単数形(revision_id + dest_path)は従来どおり(flow.rs / security_hardening.rs 側)。
+// ここでは複数形(revision_ids + dest_dir + filename_template)を確かめる。
+// 各件は単数形と同じ検査(DESIGN.md §9.14)を通ることが前提なので、
+// ワークスペース内・シンボリックリンク・一時ファイルの残骸も見る。
+// ---------------------------------------------------------------------------
+
+/// n 枚を取り込んで revision_id を入力順に返す。
+fn imported_revisions(dir: &std::path::Path, tools: &AtxTools, n: usize) -> Vec<String> {
+    let paths = copies(dir, n);
+    let out = structured(&tools.import_asset(&ImportAssetParams::batch(paths)));
+    out["imported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["revision"]["revision_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// 3 件を1回で書き出す。既定テンプレートは `{revision_id}.{ext}`。
+#[test]
+fn batch_export_writes_every_revision_into_one_directory() {
+    let (workspace, tools) = tools();
+    let revisions = imported_revisions(workspace.path(), &tools, 3);
+    let out_dir = tempfile::tempdir().unwrap();
+
+    let result = tools.export_asset(&ExportAssetParams::batch(
+        revisions.clone(),
+        out_dir.path().to_string_lossy(),
+    ));
+    let out = structured(&result);
+
+    assert_eq!(out["count"], 3, "{out}");
+    assert_eq!(out["filename_template"], "{revision_id}.{ext}");
+    assert!(out["failed"].as_array().unwrap().is_empty());
+    let exported = out["exported"].as_array().unwrap();
+    assert_eq!(exported.len(), 3);
+    for (entry, revision_id) in exported.iter().zip(&revisions) {
+        assert_eq!(entry["revision_id"], revision_id.as_str());
+        assert_eq!(entry["overwritten"], Value::Bool(false));
+        let path = std::path::PathBuf::from(entry["path"].as_str().unwrap());
+        assert_eq!(path.parent().unwrap(), out_dir.path());
+        assert_eq!(
+            path.file_name().unwrap(),
+            format!("{revision_id}.jpg").as_str()
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            entry["byte_size"].as_u64().unwrap()
+        );
+    }
+    // 書き出し先に余計なファイル(.tmp の残骸)を残さない。
+    assert_eq!(std::fs::read_dir(out_dir.path()).unwrap().count(), 3);
+
+    let summary = text(&result);
+    assert!(summary.contains("Exported 3 of 3"), "{summary}");
+}
+
+/// 65 件は書き込みを始める前に拒否する(import / apply と同じ上限)。
+#[test]
+fn batch_export_refuses_more_than_64_entries() {
+    let (_ws, tools) = tools();
+    let out_dir = tempfile::tempdir().unwrap();
+    let many: Vec<String> = (0..65).map(|i| format!("rev_{i}")).collect();
+
+    let payload = error_payload(&tools.export_asset(&ExportAssetParams::batch(
+        many,
+        out_dir.path().to_string_lossy(),
+    )));
+    assert_eq!(payload["error"]["code"], "invalid_batch_size");
+    assert_eq!(payload["error"]["details"]["max"], 64);
+    assert_eq!(std::fs::read_dir(out_dir.path()).unwrap().count(), 0);
+}
+
+/// 展開後のファイル名が重複するテンプレートは、1バイトも書く前に全体エラー。
+#[test]
+fn a_colliding_filename_template_writes_nothing() {
+    let (workspace, tools) = tools();
+    let revisions = imported_revisions(workspace.path(), &tools, 3);
+    let out_dir = tempfile::tempdir().unwrap();
+
+    let payload = error_payload(
+        &tools.export_asset(
+            &ExportAssetParams::batch(revisions, out_dir.path().to_string_lossy())
+                .with_filename_template("same.jpg"),
+        ),
+    );
+    assert_eq!(payload["error"]["code"], "filename_collision");
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("same.jpg"),
+        "{payload}"
+    );
+    assert_eq!(
+        payload["error"]["details"]["duplicates"][0]["file_name"],
+        "same.jpg"
+    );
+    assert_eq!(
+        std::fs::read_dir(out_dir.path()).unwrap().count(),
+        0,
+        "nothing may be written when names collide"
+    );
+}
+
+/// パス区切りや `..` を含むテンプレートは `dest_dir` の外へ書けてしまうので拒否する。
+#[test]
+fn a_filename_template_that_escapes_the_directory_is_refused() {
+    let (workspace, tools) = tools();
+    let revisions = imported_revisions(workspace.path(), &tools, 1);
+    let out_dir = tempfile::tempdir().unwrap();
+
+    for template in [
+        "../{revision_id}.{ext}",
+        "sub/{revision_id}.{ext}",
+        "{nope}",
+    ] {
+        let payload = error_payload(
+            &tools.export_asset(
+                &ExportAssetParams::batch(revisions.clone(), out_dir.path().to_string_lossy())
+                    .with_filename_template(template),
+            ),
+        );
+        assert_eq!(
+            payload["error"]["code"], "invalid_filename_template",
+            "{template}: {payload}"
+        );
+    }
+    assert_eq!(std::fs::read_dir(out_dir.path()).unwrap().count(), 0);
+}
+
+/// 存在しない revision を混ぜても、他の件は書き出される(1件の失敗で止めない)。
+#[test]
+fn batch_export_keeps_going_after_a_missing_revision() {
+    let (workspace, tools) = tools();
+    let mut revisions = imported_revisions(workspace.path(), &tools, 2);
+    revisions.insert(1, "rev_DOES_NOT_EXIST".to_string());
+    let out_dir = tempfile::tempdir().unwrap();
+
+    let result = tools.export_asset(&ExportAssetParams::batch(
+        revisions.clone(),
+        out_dir.path().to_string_lossy(),
+    ));
+    let out = structured(&result);
+
+    assert_eq!(out["count"], 2, "{out}");
+    let failed = out["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["path"], "rev_DOES_NOT_EXIST");
+    assert_eq!(failed[0]["error"]["code"], "revision_not_found");
+    let summary = text(&result);
+    assert!(summary.contains("Exported 2 of 3"), "{summary}");
+    assert!(summary.contains("revision_not_found"), "{summary}");
+    assert_eq!(std::fs::read_dir(out_dir.path()).unwrap().count(), 2);
+
+    // 全件が失敗したときだけツール全体のエラーになる。
+    let payload = error_payload(&tools.export_asset(&ExportAssetParams::batch(
+        vec!["rev_NOPE_1", "rev_NOPE_2"],
+        out_dir.path().to_string_lossy(),
+    )));
+    assert_eq!(payload["error"]["code"], "export_failed");
+    assert_eq!(
+        payload["error"]["details"]["failed"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+/// 2回目の一括書き出しは `overwrite` を明示しない限り全件失敗し、明示すれば全件置き換える。
+#[test]
+fn batch_export_needs_overwrite_to_replace_existing_files() {
+    let (workspace, tools) = tools();
+    let revisions = imported_revisions(workspace.path(), &tools, 2);
+    let out_dir = tempfile::tempdir().unwrap();
+    let params = ExportAssetParams::batch(revisions.clone(), out_dir.path().to_string_lossy());
+    structured(&tools.export_asset(&params));
+
+    let payload = error_payload(&tools.export_asset(&params));
+    assert_eq!(payload["error"]["code"], "export_failed");
+    assert_eq!(
+        payload["error"]["details"]["failed"][0]["error"]["code"],
+        "dest_exists"
+    );
+
+    let out = structured(&tools.export_asset(&params.clone().with_overwrite()));
+    assert_eq!(out["count"], 2);
+    for entry in out["exported"].as_array().unwrap() {
+        assert_eq!(entry["overwritten"], Value::Bool(true));
+    }
+    // temp + rename で置き換えるので、一時ファイルは残らない。
+    assert_eq!(std::fs::read_dir(out_dir.path()).unwrap().count(), 2);
+}
+
+/// ワークスペース内への一括書き出しは、ディレクトリの時点で拒否する。
+#[test]
+fn a_dest_dir_inside_the_workspace_is_refused() {
+    let (workspace, tools) = tools();
+    let revisions = imported_revisions(workspace.path(), &tools, 1);
+
+    for dir in [
+        workspace.path().to_path_buf(),
+        workspace.path().join("objects"),
+    ] {
+        let payload = error_payload(&tools.export_asset(&ExportAssetParams::batch(
+            revisions.clone(),
+            dir.to_string_lossy(),
+        )));
+        assert_eq!(
+            payload["error"]["code"], "dest_inside_workspace",
+            "{dir:?}: {payload}"
+        );
+    }
+}
+
+/// `dest_dir` がシンボリックリンクなら拒否する(リンクを辿って書かない)。
+#[cfg(unix)]
+#[test]
+fn a_symlinked_dest_dir_is_refused() {
+    let (workspace, tools) = tools();
+    let revisions = imported_revisions(workspace.path(), &tools, 1);
+    let out = tempfile::tempdir().unwrap();
+    let real = out.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = out.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let payload = error_payload(
+        &tools.export_asset(&ExportAssetParams::batch(revisions, link.to_string_lossy())),
+    );
+    assert_eq!(payload["error"]["code"], "dest_is_symlink", "{payload}");
+    assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+}
+
+/// 存在しない / ディレクトリでない `dest_dir` はそれぞれ別の code で返る。
+#[test]
+fn a_dest_dir_must_exist_and_be_a_directory() {
+    let (workspace, tools) = tools();
+    let revisions = imported_revisions(workspace.path(), &tools, 1);
+    let out = tempfile::tempdir().unwrap();
+
+    let missing = error_payload(&tools.export_asset(&ExportAssetParams::batch(
+        revisions.clone(),
+        out.path().join("nope").to_string_lossy(),
+    )));
+    assert_eq!(missing["error"]["code"], "dest_dir_missing");
+
+    let file = out.path().join("a_file.txt");
+    std::fs::write(&file, b"x").unwrap();
+    let not_a_dir = error_payload(
+        &tools.export_asset(&ExportAssetParams::batch(revisions, file.to_string_lossy())),
+    );
+    assert_eq!(not_a_dir["error"]["code"], "dest_dir_not_a_directory");
+    assert_eq!(std::fs::read(&file).unwrap(), b"x");
+}
+
+/// `{index}` は件数の桁でゼロ埋めされ、`{stem}` は系譜の根の取り込み元ファイル名になる。
+#[test]
+fn index_is_zero_padded_and_stem_follows_the_lineage() {
+    let (workspace, tools) = tools();
+    let revisions = imported_revisions(workspace.path(), &tools, 10);
+    let out_dir = tempfile::tempdir().unwrap();
+
+    let out = structured(
+        &tools.export_asset(
+            &ExportAssetParams::batch(revisions.clone(), out_dir.path().to_string_lossy())
+                .with_filename_template("{index}-{stem}.{ext}"),
+        ),
+    );
+    let names: Vec<String> = out["exported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            std::path::PathBuf::from(e["path"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    // copies() は copy_0.jpg .. copy_9.jpg を作る。10 件なので index は 2 桁。
+    assert_eq!(names[0], "01-copy_0.jpg");
+    assert_eq!(names[9], "10-copy_9.jpg");
+
+    // 派生 revision の {stem} も、取り込み元のファイル名のまま(系譜の根を辿る)。
+    let derived = structured(&tools.apply_transform(&TransformParams {
+        revision_id: Some(revisions[0].clone()),
+        revision_ids: None,
+        recipe: Some(recipe(serde_json::json!({
+            "operations": [{"op": "resize", "width": 200, "fit": "contain"},
+                           {"op": "encode", "format": "png"}]
+        }))),
+        preset: None,
+    }));
+    let derived_rev = derived["revision"]["revision_id"].as_str().unwrap();
+    let out = structured(
+        &tools.export_asset(
+            &ExportAssetParams::batch(vec![derived_rev], out_dir.path().to_string_lossy())
+                .with_filename_template("{stem}.{ext}"),
+        ),
+    );
+    let path = out["exported"][0]["path"].as_str().unwrap();
+    assert!(
+        path.ends_with("copy_0.png"),
+        "the stem comes from the import at the root of the lineage, the extension from the MIME type: {path}"
+    );
+}
+
+/// 単数形と複数形の引数は混ぜられない。
+#[test]
+fn the_single_and_batch_export_forms_are_mutually_exclusive() {
+    let (workspace, tools) = tools();
+    let revisions = imported_revisions(workspace.path(), &tools, 1);
+    let out_dir = tempfile::tempdir().unwrap();
+
+    let both = error_payload(&tools.export_asset(&ExportAssetParams {
+        revision_id: Some(revisions[0].clone()),
+        revision_ids: Some(revisions.clone()),
+        dest_path: Some(out_dir.path().join("x.jpg").to_string_lossy().into_owned()),
+        dest_dir: None,
+        filename_template: None,
+        overwrite: false,
+    }));
+    assert_eq!(
+        both["error"]["code"],
+        "revision_id_and_revision_ids_conflict"
+    );
+
+    let neither = error_payload(&tools.export_asset(&ExportAssetParams {
+        revision_id: None,
+        revision_ids: None,
+        dest_path: Some(out_dir.path().join("x.jpg").to_string_lossy().into_owned()),
+        dest_dir: None,
+        filename_template: None,
+        overwrite: false,
+    }));
+    assert_eq!(
+        neither["error"]["code"],
+        "revision_id_or_revision_ids_required"
+    );
+
+    // 単数形に dest_dir、複数形に dest_path は取り違えなので教える。
+    let single_with_dir = error_payload(&tools.export_asset(&ExportAssetParams {
+        revision_id: Some(revisions[0].clone()),
+        revision_ids: None,
+        dest_path: None,
+        dest_dir: Some(out_dir.path().to_string_lossy().into_owned()),
+        filename_template: None,
+        overwrite: false,
+    }));
+    assert_eq!(single_with_dir["error"]["code"], "export_params_mismatch");
+
+    let batch_with_path = error_payload(&tools.export_asset(&ExportAssetParams {
+        revision_id: None,
+        revision_ids: Some(revisions),
+        dest_path: Some(out_dir.path().join("x.jpg").to_string_lossy().into_owned()),
+        dest_dir: Some(out_dir.path().to_string_lossy().into_owned()),
+        filename_template: None,
+        overwrite: false,
+    }));
+    assert_eq!(batch_with_path["error"]["code"], "export_params_mismatch");
+    assert_eq!(std::fs::read_dir(out_dir.path()).unwrap().count(), 0);
 }

@@ -4,8 +4,8 @@
 //! - `arb_any_recipe()`: 値域外・NaN・任意文字列を含む、validate に対する堅牢性確認用の生成器。
 
 use atx_core::recipe::{
-    validate, Anchor, CoordinateSpace, CropMode, Fit, Operation, OutputFormat, Rect, RotateCrop,
-    StripScope, ThresholdMethod, TransformRecipe,
+    validate, Anchor, BlendMode, CoordinateSpace, CropMode, Fit, Operation, OutputFormat, Rect,
+    RotateCrop, StripScope, ThresholdMethod, TransformRecipe,
 };
 use atx_core::{canonical_json, recipe_hash};
 use proptest::prelude::*;
@@ -191,8 +191,39 @@ fn arb_op_no_encode() -> impl Strategy<Value = Operation> {
             }
         ),
         arb_valid_threshold(),
+        arb_svg_overlay(),
         arb_strip_scope().prop_map(|scope| Operation::StripMetadata { scope }),
     ]
+}
+
+/// validate を通る `svg_overlay`。文字描画の 2 フィールド
+/// (`render_text` / `font_revision_ids`)も動かして、
+/// 「正規化 JSON の往復」「hash の並べ替え不変」を新フィールド込みで固定する。
+/// アセット id は validate の規約どおり "rev_" 始まり、font は 0..=4 本。
+fn arb_svg_overlay() -> impl Strategy<Value = Operation> {
+    (
+        (-1000i64..=1000, -1000i64..=1000),
+        prop::option::of(1u32..=4096),
+        prop::option::of(1u32..=4096),
+        0.0f64..=1.0,
+        any::<bool>(),
+        prop::collection::vec((0usize..8).prop_map(|i| format!("rev_font{i}")), 0..=4),
+    )
+        .prop_map(
+            |((x, y), width, height, opacity, render_text, font_revision_ids)| {
+                Operation::SvgOverlay {
+                    svg_revision_id: "rev_svg".to_string(),
+                    x,
+                    y,
+                    width,
+                    height,
+                    opacity,
+                    blend_mode: BlendMode::Normal,
+                    render_text,
+                    font_revision_ids,
+                }
+            },
+        )
 }
 
 fn arb_encode_op() -> impl Strategy<Value = Operation> {

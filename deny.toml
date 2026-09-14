@@ -47,7 +47,8 @@ allow = [
     # --- 単一クレート単位で必要になるもの。各行に理由を明記する。---
     # Zlib: bytemuck / safe_arch / wide(SIMD ヘルパ、fast_image_resize・ravif 経由)、
     #       miniz_oxide(PNG の deflate)、zune-core / zune-inflate / zune-jpeg
-    #       (image クレートの JPEG デコーダ)
+    #       (image クレートの JPEG デコーダ)、slotmap(fontdb のフェイス表)、
+    #       tinyvec(unicode-bidi / fontdb。"Zlib OR Apache-2.0 OR MIT")
     "Zlib",
     # Unicode-3.0: unicode-ident(proc-macro2 経由、ビルド時のみ)。
     #              Unicode, Inc. のデータライセンス。パーミッシブ。
@@ -62,6 +63,19 @@ allow = [
 ]
 
 # 個別クレートの例外(allow に無いライセンスを、そのクレートに限って認める)。
+# --- 文字描画(resvg の `text` 機能、v0.10)で新しく入るクレート -----------------
+# いずれも既存の allow の範囲内で、例外の追加は不要だった(記録のみ):
+#   fontdb(MIT)        : usvg のフォント DB。atx は空 DB に同梱書体だけを入れる
+#   harfrust(MIT)      : 整形器(HarfBuzz の Rust 移植)。純 Rust
+#   skrifa / read-fonts / font-types(MIT OR Apache-2.0): フォント解析(fontations)。
+#                        atx-core が font アセット検証とグリフ被覆確認に直接使う
+#   unicode-bidi / unicode-script / unicode-vo(MIT OR Apache-2.0): 双方向・用字・縦書き
+#   slotmap / tinyvec(Zlib 系): 上記の内部データ構造
+# `Unicode-DFS-2016` は現れなかったので allow への追加はしていない。
+# ttf-parser は**直接依存にしない**(メンテ終了 = RUSTSEC-2026-0192。
+# `unmaintained = "workspace"` は workspace 直接依存だけを見るため、
+# imageproc 経由の推移的依存として残るのは従来どおり許容)。
+
 [[licenses.exceptions]]
 # jpeg-encoder は "MIT OR Apache-2.0 OR IJG"。IJG(Independent JPEG Group)は
 # パーミッシブだが SPDX の OSI 承認外で allow に入れると他クレートにも波及するため、

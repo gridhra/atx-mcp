@@ -13,6 +13,7 @@ jpeg-encoder.workspace = true
 webp.workspace = true
 ravif.workspace = true
 resvg.workspace = true
+skrifa.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true

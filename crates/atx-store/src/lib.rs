@@ -73,7 +73,12 @@ pub struct AssetStore {
     root: PathBuf,
 }
 
-fn ext_for_mime(mime_type: &str) -> &'static str {
+/// MIME からストア内オブジェクトの拡張子を決める。
+///
+/// **この表が唯一の実装**。`export_asset` のファイル名テンプレート `{ext}` も
+/// ここを呼ぶ(MCP 層に同じ表を置いていたら、font/ttf の追加がそちらに入らず
+/// フォントの export だけ `.bin` になっていた)。
+pub fn ext_for_mime(mime_type: &str) -> &'static str {
     match mime_type {
         "image/jpeg" => "jpg",
         "image/png" => "png",
@@ -85,6 +90,10 @@ fn ext_for_mime(mime_type: &str) -> &'static str {
         // ラスタ画像ではないが MIME は image/ で始まるので、寸法検査や
         // デコードの対象にはならない(atx-mcp 側で分岐する)。
         "image/svg+xml" => "svg",
+        // フォントアセット(v0.6: `svg_overlay` の文字描画が参照する .ttf / .otf)。
+        // ラスタ画像ではないので寸法検査やデコードの対象にはならない(atx-mcp 側で分岐する)。
+        "font/ttf" => "ttf",
+        "font/otf" => "otf",
         _ => "bin",
     }
 }
