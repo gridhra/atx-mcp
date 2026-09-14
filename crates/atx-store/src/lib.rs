@@ -177,7 +177,7 @@ impl AssetStore {
         let final_path = dir.join(&filename);
         if !final_path.exists() {
             // 一時ファイルに書いてから rename でアトミックに配置する。
-            let tmp_path = dir.join(format!(".{filename}.tmp-{}", ulid::Ulid::new()));
+            let tmp_path = dir.join(format!(".{filename}.tmp-{}", ulid::Ulid::generate()));
             {
                 let mut tmp_file = File::create(&tmp_path)?;
                 tmp_file.write_all(bytes)?;
@@ -214,8 +214,8 @@ impl AssetStore {
         let rel_path = self.store_object(&sha256, mime_type, bytes)?;
 
         let revision = AssetRevision {
-            asset_id: format!("ast_{}", ulid::Ulid::new()),
-            revision_id: format!("rev_{}", ulid::Ulid::new()),
+            asset_id: format!("ast_{}", ulid::Ulid::generate()),
+            revision_id: format!("rev_{}", ulid::Ulid::generate()),
             source_revision_id: None,
             width,
             height,
@@ -267,7 +267,7 @@ impl AssetStore {
 
         let revision = AssetRevision {
             asset_id,
-            revision_id: format!("rev_{}", ulid::Ulid::new()),
+            revision_id: format!("rev_{}", ulid::Ulid::generate()),
             source_revision_id: Some(source_revision_id.to_string()),
             width,
             height,
@@ -337,7 +337,8 @@ impl AssetStore {
         fs::create_dir_all(&previews_dir)?;
         let path = previews_dir.join(format!("{key}.{ext}"));
         if !path.exists() {
-            let tmp_path = previews_dir.join(format!(".{key}.{ext}.tmp-{}", ulid::Ulid::new()));
+            let tmp_path =
+                previews_dir.join(format!(".{key}.{ext}.tmp-{}", ulid::Ulid::generate()));
             {
                 let mut tmp_file = File::create(&tmp_path)?;
                 tmp_file.write_all(bytes)?;
