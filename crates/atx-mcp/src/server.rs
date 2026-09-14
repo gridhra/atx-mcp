@@ -2,7 +2,7 @@
 //!
 //! - `#[tool_router]` / `#[tool]` / `#[tool_handler]`(rmcp 3.1)でツールを登録
 //! - 返却は `CallToolResult` を自前で組み立て(テキスト + structuredContent)、
-//!   `outputSchema` は `output_schema = schema_for_output::<T>()` で明示する
+//!   `outputSchema` は `output_schema = object_output_schema::<T>()` で明示する
 //! - annotations は DESIGN.md §4 の表に従って全ツールに設定する(`openWorldHint` は常に false)
 
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::schema_for_output;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Implementation, JsonObject, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 
 use crate::mask::GenerateMaskParams;
@@ -22,6 +22,22 @@ use crate::tools::{
     ListOperationsParams, RenderPreviewOutput, RenderPreviewParams, RevisionParams,
     TransformParams,
 };
+
+/// `schema_for_output` の最上位に `type: "object"` を保証した outputSchema。
+///
+/// MCP 仕様は outputSchema の最上位を `type: "object"` に固定している。
+/// 単一/バッチを切り替える untagged enum の出力は schemars が最上位 `anyOf` だけを出すため、
+/// 公式 TypeScript SDK のクライアントが tools/list 全体を拒否した(v0.5.0、mcp-proxy 経由の
+/// Glama 内省で発覚)。各分岐はいずれも object なので、`type` を足しても受理する値は変わらない。
+fn object_output_schema<T: schemars::JsonSchema + std::any::Any>() -> Arc<JsonObject> {
+    let schema = schema_for_output::<T>();
+    if schema.contains_key("type") {
+        return schema;
+    }
+    let mut patched = (*schema).clone();
+    patched.insert("type".to_owned(), serde_json::Value::from("object"));
+    Arc::new(patched)
+}
 
 /// ホスト AI 向けの使い方。initialize の `instructions` として返す。
 pub const INSTRUCTIONS: &str = r#"Deterministic, non-generative image transformation over an immutable local asset store.
@@ -105,7 +121,7 @@ impl AtxServer {
     /// applied twice.
     #[tool(
         name = "import_asset",
-        output_schema = schema_for_output::<ImportResult>(),
+        output_schema = object_output_schema::<ImportResult>(),
         annotations(
             title = "Import asset",
             read_only_hint = false,
@@ -125,7 +141,7 @@ impl AtxServer {
     /// EXIF orientation and summary, and whether GPS (PII) metadata is present.
     #[tool(
         name = "inspect_image",
-        output_schema = schema_for_output::<InspectOutput>(),
+        output_schema = object_output_schema::<InspectOutput>(),
         annotations(
             title = "Inspect image",
             read_only_hint = true,
@@ -150,7 +166,7 @@ impl AtxServer {
     /// Read-only: it never modifies the image. A null recommended angle means "do not correct".
     #[tool(
         name = "detect_tilt",
-        output_schema = schema_for_output::<DetectTiltOutput>(),
+        output_schema = object_output_schema::<DetectTiltOutput>(),
         annotations(
             title = "Detect tilt",
             read_only_hint = true,
@@ -177,7 +193,7 @@ impl AtxServer {
     /// no_quad_found, already_rectified (the page already fills the frame) or low_confidence.
     #[tool(
         name = "detect_document",
-        output_schema = schema_for_output::<DetectDocumentOutput>(),
+        output_schema = object_output_schema::<DetectDocumentOutput>(),
         annotations(
             title = "Detect document",
             read_only_hint = true,
@@ -200,7 +216,7 @@ impl AtxServer {
     /// operation. Read-only.
     #[tool(
         name = "list_operations",
-        output_schema = schema_for_output::<ListOperationsOutput>(),
+        output_schema = object_output_schema::<ListOperationsOutput>(),
         annotations(
             title = "List operations",
             read_only_hint = true,
@@ -224,7 +240,7 @@ impl AtxServer {
     /// Read-only.
     #[tool(
         name = "explain_operation",
-        output_schema = schema_for_output::<ExplainResult>(),
+        output_schema = object_output_schema::<ExplainResult>(),
         annotations(
             title = "Explain operation",
             read_only_hint = true,
@@ -252,7 +268,7 @@ impl AtxServer {
     /// reference produce byte-identical PNG bytes and return the existing revision.
     #[tool(
         name = "generate_mask",
-        output_schema = schema_for_output::<GenerateMaskOutput>(),
+        output_schema = object_output_schema::<GenerateMaskOutput>(),
         annotations(
             title = "Generate mask",
             read_only_hint = false,
@@ -281,7 +297,7 @@ impl AtxServer {
     /// reported as a warning, not an error.
     #[tool(
         name = "apply_transform",
-        output_schema = schema_for_output::<ApplyResult>(),
+        output_schema = object_output_schema::<ApplyResult>(),
         annotations(
             title = "Apply transform",
             read_only_hint = false,
@@ -312,7 +328,7 @@ impl AtxServer {
     /// reported as a warning, not an error.
     #[tool(
         name = "render_preview",
-        output_schema = schema_for_output::<RenderPreviewOutput>(),
+        output_schema = object_output_schema::<RenderPreviewOutput>(),
         annotations(
             title = "Render preview",
             read_only_hint = false,
@@ -335,7 +351,7 @@ impl AtxServer {
     /// a single pixel-difference heatmap plus mean_abs_diff/max_abs_diff/changed_pixel_ratio.
     #[tool(
         name = "compare_revisions",
-        output_schema = schema_for_output::<CompareRevisionsOutput>(),
+        output_schema = object_output_schema::<CompareRevisionsOutput>(),
         annotations(
             title = "Compare revisions",
             read_only_hint = false,
@@ -354,7 +370,7 @@ impl AtxServer {
     /// List revisions in the workspace ledger (lineage, recipe hash, dimensions, sizes).
     #[tool(
         name = "list_assets",
-        output_schema = schema_for_output::<ListAssetsOutput>(),
+        output_schema = object_output_schema::<ListAssetsOutput>(),
         annotations(
             title = "List assets",
             read_only_hint = true,
@@ -374,7 +390,7 @@ impl AtxServer {
     /// Refuses to overwrite an existing file unless overwrite=true (ask the user first).
     #[tool(
         name = "export_asset",
-        output_schema = schema_for_output::<ExportAssetOutput>(),
+        output_schema = object_output_schema::<ExportAssetOutput>(),
         annotations(
             title = "Export asset",
             read_only_hint = false,

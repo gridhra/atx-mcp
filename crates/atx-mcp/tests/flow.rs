@@ -521,6 +521,16 @@ fn tool_registration_matches_the_design_contract() {
             "{}: outputSchema must be declared",
             tool.name
         );
+        // MCP 仕様は outputSchema の最上位を `type: "object"` に固定している。
+        // untagged enum の出力(単一/バッチ)は schemars が最上位 anyOf だけを出すため、
+        // 公式 TypeScript SDK のクライアント(mcp-proxy 経由の Glama 内省など)が
+        // tools/list 全体を拒否した(v0.5.0)。
+        assert_eq!(
+            tool.output_schema.as_ref().unwrap().get("type"),
+            Some(&serde_json::json!("object")),
+            "{}: outputSchema root must be type \"object\" (MCP spec)",
+            tool.name
+        );
         assert!(
             tool.description.is_some(),
             "{}: needs a description",
