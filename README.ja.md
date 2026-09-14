@@ -349,8 +349,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 クレート構成: `atx-core`(レシピ・変換エンジン)/ `atx-geometry`(傾き検出)/
 `atx-store`(immutable アセットストア)/ `atx-mcp`(rmcp stdio サーバ)。
 
-リリース手順は [RELEASING.md](RELEASING.md) を参照。
-
 ## 名前の由来
 
 "atx" は **A**sset **T**ransform の略。末尾の `x` は "transform" の慣用的な

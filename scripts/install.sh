@@ -17,12 +17,13 @@ need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 
 need uname
 need tar
+# HTTPS 以外(リダイレクト先を含む)には接続しない。
 if command -v curl >/dev/null 2>&1; then
-  fetch() { curl -fsSL "$1"; }
-  fetch_to() { curl -fsSL -o "$2" "$1"; }
+  fetch() { curl --proto '=https' --tlsv1.2 -fsSL "$1"; }
+  fetch_to() { curl --proto '=https' --tlsv1.2 -fsSL -o "$2" "$1"; }
 elif command -v wget >/dev/null 2>&1; then
-  fetch() { wget -qO- "$1"; }
-  fetch_to() { wget -qO "$2" "$1"; }
+  fetch() { wget --https-only -qO- "$1"; }
+  fetch_to() { wget --https-only -qO "$2" "$1"; }
 else
   die "need curl or wget"
 fi
@@ -43,6 +44,8 @@ if [ -z "$version" ]; then
     | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
   [ -n "$version" ] || die "could not determine latest release for $REPO"
 fi
+case "$version" in v*) ;; *) version="v$version" ;; esac
+printf '%s' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || die "invalid version: $version (expected e.g. v0.1.0)"
 
 name="atx-mcp-${version#v}-${target}"
 base="https://github.com/$REPO/releases/download/$version"
@@ -53,22 +56,20 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 printf 'Downloading %s %s (%s)\n' "atx-mcp" "$version" "$target" >&2
 fetch_to "$base/$name.tar.gz" "$tmp/$name.tar.gz" || die "download failed: $base/$name.tar.gz"
 
-# Verify against the release's SHA256SUMS when a hashing tool is available.
-if fetch_to "$base/SHA256SUMS" "$tmp/SHA256SUMS" 2>/dev/null; then
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual="$(sha256sum "$tmp/$name.tar.gz" | cut -d' ' -f1)"
-  elif command -v shasum >/dev/null 2>&1; then
-    actual="$(shasum -a 256 "$tmp/$name.tar.gz" | cut -d' ' -f1)"
-  else
-    actual=""
-  fi
-  if [ -n "$actual" ]; then
-    expected="$(grep " \*\{0,1\}$name.tar.gz\$" "$tmp/SHA256SUMS" | cut -d' ' -f1 | head -n1)"
-    [ -n "$expected" ] || die "$name.tar.gz not listed in SHA256SUMS"
-    [ "$actual" = "$expected" ] || die "checksum mismatch (expected $expected, got $actual)"
-    printf 'Checksum OK\n' >&2
-  fi
+# Verify against the release's SHA256SUMS. Verification is mandatory: if the
+# checksum file or a hashing tool is unavailable, refuse to install.
+fetch_to "$base/SHA256SUMS" "$tmp/SHA256SUMS" || die "download failed: $base/SHA256SUMS"
+if command -v sha256sum >/dev/null 2>&1; then
+  actual="$(sha256sum "$tmp/$name.tar.gz" | cut -d' ' -f1)"
+elif command -v shasum >/dev/null 2>&1; then
+  actual="$(shasum -a 256 "$tmp/$name.tar.gz" | cut -d' ' -f1)"
+else
+  die "need sha256sum or shasum to verify the download"
 fi
+expected="$(awk -v f="$name.tar.gz" '{ n = $2; sub(/^\*/, "", n); if (n == f) { print $1; exit } }' "$tmp/SHA256SUMS")"
+[ -n "$expected" ] || die "$name.tar.gz not listed in SHA256SUMS"
+[ "$actual" = "$expected" ] || die "checksum mismatch (expected $expected, got $actual)"
+printf 'Checksum OK\n' >&2
 
 tar -C "$tmp" -xzf "$tmp/$name.tar.gz"
 mkdir -p "$INSTALL_DIR"

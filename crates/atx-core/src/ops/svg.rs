@@ -114,13 +114,44 @@ pub fn validate(
     Ok(())
 }
 
-/// 決定論のためのフォント無し usvg オプション。
+/// `<image>` が外部ファイルを参照している SVG に対する実行時警告(文言はテストで固定する)。
+pub(crate) const EXTERNAL_IMAGE_WARNING: &str =
+    "svg contains image elements that reference external files; external references are \
+     never loaded (embed the image in the SVG, or import it and composite it with layers)";
+
+/// 決定論のためのフォント無し・外部参照無し usvg オプション。
 ///
 /// `resvg` を `default-features = false` でビルドしているため
 /// `Options` に `fontdb` / `font_resolver` フィールドは**存在しない**
 /// (= システムフォントを読む経路がコンパイル時に消えている)。
+///
+/// # `<image href>` の解決(セキュリティ点検で閉じた経路)
+///
+/// usvg の既定の文字列リゾルバは href を**ローカルファイルパス**とみなして
+/// `std::fs::read` する。SVG アセットは信頼できない入力なので、これを許すと
+/// サーバが動くマシンの任意のファイルを読みに行ける(`/dev/zero` で無制限のメモリ確保、
+/// FIFO でハング、読めたローカル SVG は出力へ描き込まれる = 情報漏えい)。さらに出力が
+/// ファイルシステムの状態に依存するので、決定論も壊れる。よって**文字列 href は常に
+/// 解決しない**(`None` = その `<image>` は描かれない)。
+///
+/// `data:` URI は既定のリゾルバのまま許す。中身は SVG バイト列そのものに埋め込まれて
+/// いるので自己完結・決定論的であり、大きさも SVG アセットのバイト上限に縛られる。
+/// 入れ子の SVG は同じ `Options`(= この文字列リゾルバ)で解析されるため、
+/// data: の中から外部ファイルを参照し直す抜け道も無い。なお PNG / JPEG 等のラスタは
+/// `raster-images` 機能を外しているので、data: でも描画はされない(従来どおり)。
 fn options() -> usvg::Options<'static> {
-    usvg::Options::default()
+    let mut opt = usvg::Options::default();
+    opt.image_href_resolver.resolve_string = Box::new(|_, _| None);
+    opt
+}
+
+/// ルート配下に「外部参照の `<image>`」(href が `data:` 以外)があるか。
+fn has_external_image(doc: &usvg::roxmltree::Document) -> bool {
+    const XLINK: &str = "http://www.w3.org/1999/xlink";
+    doc.descendants()
+        .filter(|n| n.is_element() && n.has_tag_name("image"))
+        .filter_map(|n| n.attribute("href").or_else(|| n.attribute((XLINK, "href"))))
+        .any(|href| !href.trim_start().starts_with("data:"))
 }
 
 /// UTF-8 テキストとして SVG ソースを取り出す(BOM を落とす)。
@@ -155,16 +186,39 @@ fn has_intrinsic_size(root: &usvg::roxmltree::Node) -> bool {
 /// (atx-mcp が resvg へ直接依存しなくて済むよう、core 側に 1 本だけ生やす)。
 /// パースできない・固有サイズを持たない SVG では `None`。
 pub fn intrinsic_size(bytes: &[u8]) -> Option<(u32, u32)> {
-    let text = source_text(bytes)?;
-    let doc = usvg::roxmltree::Document::parse(text).ok()?;
-    if !has_intrinsic_size(&doc.root_element()) {
-        return None;
+    validate_asset(bytes).ok().flatten()
+}
+
+/// SVG アセットとして取り込んでよいバイト列かを検証し、固有サイズを返す。
+///
+/// `svg_overlay` の [`rasterize`] が要求するのと同じ条件(UTF-8・XML として解析できる・
+/// ルート要素が `<svg>`・usvg が描画ツリーを組める)を import 時に先取りする。
+/// これが無いと、拡張子が `.svg` なだけの任意内容のファイルが台帳に載り、
+/// export の上書きで任意の場所へ書き出す「ファイル複写」の経路になっていた
+/// (セキュリティ点検、DESIGN.md §9.14)。
+///
+/// - `Ok(Some((w, h)))`: 検証 OK、固有サイズあり
+/// - `Ok(None)`: 検証 OK、固有サイズなし(svg_overlay 側で width/height が必要)
+/// - `Err(reason)`: SVG アセットとして不正(英語の理由。MCP 層がそのまま載せる)
+pub fn validate_asset(bytes: &[u8]) -> std::result::Result<Option<(u32, u32)>, String> {
+    let text = source_text(bytes)
+        .ok_or("the file is not valid UTF-8 text (gzipped .svgz is not supported)")?;
+    let doc = usvg::roxmltree::Document::parse(text)
+        .map_err(|e| format!("the file is not parseable XML: {e}"))?;
+    let root = doc.root_element();
+    if !root.has_tag_name("svg") {
+        return Err(format!(
+            "the root element is <{}>, not <svg>",
+            root.tag_name().name()
+        ));
     }
-    let tree = usvg::Tree::from_xmltree(&doc, &options()).ok()?;
+    let tree = usvg::Tree::from_xmltree(&doc, &options())
+        .map_err(|e| format!("the file is not a renderable SVG: {e}"))?;
+    if !has_intrinsic_size(&root) {
+        return Ok(None);
+    }
     let size = tree.size();
-    let w = round_positive(size.width() as f64)?;
-    let h = round_positive(size.height() as f64)?;
-    Some((w, h))
+    Ok(round_positive(size.width() as f64).zip(round_positive(size.height() as f64)))
 }
 
 /// 正の有限 f64 を u32 へ half-away-from-zero 丸めする(最低 1)。
@@ -255,6 +309,9 @@ pub(crate) fn rasterize(
     // 判定は素朴な文字列走査で十分(誤検出しても警告が 1 本増えるだけ)。
     if text.contains("<text") {
         warnings.push(TEXT_WARNING.to_string());
+    }
+    if has_external_image(&doc) {
+        warnings.push(EXTERNAL_IMAGE_WARNING.to_string());
     }
 
     let mut pixmap = resvg::tiny_skia::Pixmap::new(tw, th)

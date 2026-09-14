@@ -372,8 +372,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 Crate layout: `atx-core` (recipe/transform engine) / `atx-geometry` (tilt
 detection) / `atx-store` (immutable asset store) / `atx-mcp` (rmcp stdio server).
 
-See [RELEASING.md](RELEASING.md) for the release process.
-
 ## Name
 
 "atx" stands for **A**sset **T**ransform; the trailing `x` follows the

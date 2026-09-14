@@ -593,6 +593,10 @@ impl OpRunner<'_> {
                     angle_degrees,
                     crop,
                 } => {
+                    let (iw, ih) = st.img.dimensions();
+                    let (ow, oh) =
+                        pixel_ops::rotate_output_dimensions(iw, ih, *angle_degrees, *crop);
+                    check_op_pixel_limit(index, op, ow, oh, self.limits)?;
                     ensure_space(&mut st.img, &mut st.space, Space::Linear);
                     let (rotated, warning, step) = pixel_ops::rotate(
                         &st.img,
@@ -629,6 +633,10 @@ impl OpRunner<'_> {
                     if let Some(ratio) = aspect_ratio {
                         let ratio = parse_aspect_ratio(ratio)
                             .ok_or_else(|| fail(format!("invalid aspect_ratio {ratio:?}")))?;
+                        // pad は元画像より大きなキャンバスを確保するので、確保前に検査する。
+                        let (iw, ih) = st.img.dimensions();
+                        let (tw, th) = pixel_ops::fit_aspect_dims(iw, ih, ratio, *mode);
+                        check_op_pixel_limit(index, op, tw, th, self.limits)?;
                         let (fitted, step) =
                             pixel_ops::fit_aspect(&st.img, ratio, *anchor, *mode, pad);
                         st.img = fitted;
@@ -722,7 +730,6 @@ impl OpRunner<'_> {
                     fit,
                     without_enlargement,
                 } => {
-                    ensure_space(&mut st.img, &mut st.space, Space::Linear);
                     let (iw, ih) = st.img.dimensions();
                     let ((sw, sh), (cw, ch)) = pixel_ops::resize_targets(
                         iw,
@@ -732,6 +739,11 @@ impl OpRunner<'_> {
                         *fit,
                         *without_enlargement,
                     );
+                    // 出力(sw x sh)に加えて、横パスの中間バッファ(sw x ih)も確保前に検査する
+                    // (縦に長い入力を横へ極端に引き伸ばすと、出力より中間の方が大きい)。
+                    check_op_pixel_limit(index, op, sw, sh, self.limits)?;
+                    check_op_pixel_limit(index, op, sw, ih, self.limits)?;
+                    ensure_space(&mut st.img, &mut st.space, Space::Linear);
                     st.img = pixel_ops::resize_lanczos3(&st.img, sw, sh).map_err(fail)?;
                     // 連続座標では拡縮は原点固定の純粋なスケール。
                     st.xf = st
@@ -762,6 +774,9 @@ impl OpRunner<'_> {
                     horizontal_degrees,
                     pad_color,
                 } => {
+                    let (iw, ih) = st.img.dimensions();
+                    let (ow, oh) = crate::ops::perspective::output_dimensions(iw, ih, quad);
+                    check_op_pixel_limit(index, op, ow, oh, self.limits)?;
                     ensure_space(&mut st.img, &mut st.space, Space::Linear);
                     let (out, warns, step) = crate::ops::perspective::apply(
                         &st.img,
@@ -1158,6 +1173,37 @@ fn check_pixel_limit(width: u32, height: u32, limits: &Limits) -> Result<()> {
     if pixels > limits.max_pixels {
         return Err(AtxError::LimitExceeded(format!(
             "input is {width}x{height} = {pixels} pixels, limit is {} pixels",
+            limits.max_pixels
+        )));
+    }
+    Ok(())
+}
+
+/// op が**これから確保する**画像寸法の画素数検査(セキュリティ点検、DESIGN.md §9.14)。
+///
+/// デコード時の [`check_pixel_limit`] は入力だけを見るので、`resize` の目標寸法や
+/// `crop`(pad)の余白、`perspective`(quad)・`rotate`(full)の出力キャンバスで
+/// 桁違いに大きな画像を作れてしまっていた。寸法を変える op は、画素バッファを
+/// 確保する**前に**必ずこれを通す。エラーはデコード時と同じ `LimitExceeded`
+/// (MCP 層では `limit_exceeded`)で、どの op が原因かを文言に含める。
+///
+/// 寸法を縮めるだけの op(`crop` の rect / crop モード、`trim`)と、画素数を保つ op
+/// (90° 単位の回転、flip、`rotate` の largest_inscribed_rect)は検査不要。
+/// `svg_overlay` のラスタは `ops::svg` 側の上限で、`layers` は backdrop と同寸なので
+/// ここを通らない。
+fn check_op_pixel_limit(
+    index: usize,
+    op: &Operation,
+    width: u32,
+    height: u32,
+    limits: &Limits,
+) -> Result<()> {
+    let pixels = width as u64 * height as u64;
+    if pixels > limits.max_pixels {
+        return Err(AtxError::LimitExceeded(format!(
+            "operations[{index}] ({}) would produce a {width}x{height} = {pixels} pixel image, \
+             limit is {} pixels",
+            op_name(op),
             limits.max_pixels
         )));
     }

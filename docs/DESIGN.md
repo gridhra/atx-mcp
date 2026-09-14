@@ -1360,3 +1360,112 @@ Rust 側のテストは `output_schema.is_some()` しか見ておらず、検出
 **確認**: 修正版を mcp-proxy 6.4.3 越しに起動し、TypeScript SDK 1.30 のクライアント
 (structuredContent を outputSchema で検証する)から tools/list(12 件)と、
 3 ツールの単一/バッチ両形の tools/call が通ることを確認した。
+
+### 9.14 セキュリティ点検への対応(2026-09-14)
+
+読み取り専用のコードレビューで見つかった 5 件を、「失敗するテストで再現 → 修正 → 通過」の順で直した。
+レシピ canonical hash・ツール数・既存ゴールデン(出力バイト列のピン留め)はいずれも変わっていない。
+
+#### (1) SVG の `<image href>` がローカルファイルを読む
+
+**出来事**: SVG アセットの `<image href="/abs/path">` が、import 時の固有サイズ計算と
+`svg_overlay` の描画の両方で、サーバが動くマシンのファイルを読みに行っていた。
+`/dev/zero` を指せば無制限にメモリを確保し、FIFO(名前付きパイプ)を指せばハングする。
+読めたローカル SVG は出力へ描き込まれる(情報漏えい)うえ、出力がファイルシステムの状態に
+依存するので決定論も壊れる。
+
+**原因**: `usvg::Options::default()` の文字列 href リゾルバ(`image_href_resolver.resolve_string`)は、
+href をファイルパスとみなして `std::fs::read` する実装だった。
+
+**修正**: `ops/svg.rs` の `options()` で文字列 href のリゾルバを「常に解決しない」に差し替えた。
+`data:` URI(SVG 本文に埋め込まれた画像)は許す。中身が SVG バイト列の中にあるので自己完結・
+決定論的で、大きさも SVG アセットのバイト上限に縛られる。入れ子の SVG は同じ Options で
+解析されるので、data: の中から外部参照し直す抜け道も無い(PNG / JPEG は `raster-images` 機能を
+外しているので、data: でも従来どおり描かれない)。外部参照の `<image>` がある SVG には
+英語の実行時警告を出す(`<text>` 警告と同じ扱い)。
+
+**テスト**: `tests/svg_overlay.rs` の `image_href_to_a_local_file_is_never_loaded`
+(一時ディレクトリに書いた赤一色の合成 SVG を絶対パスで参照 → `<image>` 無しと画素一致 + 警告)。
+修正前は赤が描き込まれて失敗することを確認した。判断の固定として
+`embedded_data_uri_svg_image_is_still_rendered` も追加。
+
+#### (2) op が作る画像寸法に画素数上限が無い
+
+**出来事**: 入力のデコードは `Limits::max_pixels`(既定 100MP)で縛っていたが、op が作る画像は
+縛っていなかった。`resize` に 4294967295x4294967295 を渡すと CPU 75 秒・メモリ 3.6GB 超を消費した。
+`crop` の pad モード(`aspect_ratio` で余白を足す)、`perspective` の quad 形式(quad は画像外に
+はみ出してよく、出力寸法は平均辺長)、`rotate` の `crop: full`(外接キャンバス)も同様。
+
+**原因**: validate は 0 だけを弾き、各 op は求めた寸法でそのまま画素バッファを確保していた。
+
+**修正**: `engine.rs` に `check_op_pixel_limit` を足し、寸法を変える op が**確保する前に**
+出力寸法の画素数を検査する。`resize` は出力に加えて横パスの中間バッファ(出力幅 × 入力高さ)も
+検査する。出力寸法は `pixel_ops::fit_aspect_dims` / `pixel_ops::rotate_output_dimensions`
+(imageproc と同じ f32 の式。`rotate` 内の debug_assert で一致を固定)/
+`perspective::output_dimensions` で画素を作らずに求める。エラーはデコード時と同じ
+`AtxError::LimitExceeded`(MCP では `limit_exceeded`)で、文言に `operations[i] (op)` を含む。
+縮めるだけの op(`crop` の rect、`trim`)と画素数を保つ op は対象外。`svg_overlay` のラスタは
+既存の専用上限、`layers` は backdrop と同寸なので対象外。
+**挙動の変化**: 入力が上限近くで、中間バッファだけが上限を超える `resize`(例: 100MP の正方形を
+横長 100MP へ引き伸ばす)は、これまで通っていたが今後は `limit_exceeded` になる。
+
+**テスト**: 新規 `tests/op_pixel_limits.rs`。小さな上限(1000 画素)で resize / resize 中間 /
+crop pad / perspective quad / rotate full / レイヤー内 op が拒否されること(修正前はいずれも
+画像を返して失敗することを確認)、上限ちょうどは通ること、既定の上限で巨大寸法の resize / pad /
+quad が 5 秒以内に失敗すること(修正後のみ実行。修正前は巨大確保になるため走らせていない)、
+proptest で「resize は上限エラーか上限内の出力のどちらか」。
+
+#### (3) import_asset がサイズ検査の前にファイル全体を読む
+
+**出来事**: 巨大なファイルのパスを渡すだけで、上限検査に届く前にメモリと I/O を使い切らせられた。
+
+**原因**: `tools.rs` の `import_one` が `fs::read` で全体を読み、その後で種類ごとの上限を見ていた。
+
+**修正**: 読む前に `metadata().len()` を「どの種類でも超えられない上限」(画像 128MiB と
+.cube / SVG 各 16MiB の最大値)と比べ、超えていれば `limit_exceeded` で返す。読み取りも
+`take(上限 + 1)` で縛り、検査後にファイルが伸びても上限以上は読まない。種類ごとの上限は従来どおり
+読んだ後に検査する。
+
+**テスト**: 新規 `crates/atx-mcp/tests/security_hardening.rs` の
+`oversized_file_is_rejected_before_reading`(上限 + 1 バイトの疎ファイル = 実際にはディスクを使わない
+ファイル)。「読まずに」を観測するため Unix では読み取り権限を外した版も確かめる。修正前は
+`io_error`(permission denied)になって失敗することを確認した。
+
+#### (4) export_asset がシンボリックリンク・ハードリンクを辿って不変ストアを書き換える
+
+**出来事**: 書き出し先が「ワークスペースの objects/ を指す宙ぶらりんのシンボリックリンク」だと、
+ワークスペース内判定を素通りして objects/ にファイルが作られた。書き出し先が objects/ の
+ファイルへのハードリンクだと、`overwrite: true` でストアの実体(不変であるべき revision)が
+書き換わった。
+
+**原因**: 宙ぶらりんのリンクは `exists()` が false で、ワークスペース内判定もリンク名の側で行われていた。
+書き込みの `fs::write` はリンクを辿り、既存 inode をその場で切り詰めて書く。
+
+**修正**: 書き出し先を `symlink_metadata` で調べ、シンボリックリンクなら新しいエラーコード
+`dest_is_symlink` で拒否する(リンク先を検査してから辿る方式は、検査と書き込みの間に差し替えられ
+うるので採らない)。書き込みは、新規なら `create_new`(既に何かあれば失敗し辿らない)、
+上書きなら同じディレクトリの一時ファイルへ書いて `rename` で置き換える(ディレクトリエントリの
+差し替えなので、ハードリンクの相手の実体は変わらない)。`overwrite` の意味とワークスペース内拒否は不変。
+**挙動の変化**: ワークスペース外を指す生きたシンボリックリンクへの上書き書き出しも拒否になる。
+
+**テスト**: `dangling_symlink_into_the_workspace_is_refused`、
+`overwrite_through_a_hardlink_does_not_touch_the_store`(いずれも Unix のみ。修正前は objects/ に
+ファイルが作られる / ストアの実体が書き換わって失敗することを確認)、
+`plain_export_and_overwrite_still_work_without_leftovers`。
+
+#### (5) import が .cube / .svg の中身を検証しない
+
+**出来事**: 拡張子が `.cube` / `.svg`(または先頭 4KiB に `<svg`)なだけの任意内容のファイルが
+アセットとして台帳に載り、export の上書きと組み合わせると任意ファイルの複写経路になった。
+
+**原因**: 判定は拡張子と素朴な文字列 sniff だけで、中身の妥当性は適用時まで見ていなかった。
+
+**修正**: atx-core に `validate_cube_asset`(UTF-8 + `parse_cube`)と `validate_svg_asset`
+(UTF-8・XML 解析・ルートが `<svg>`・usvg がツリーを組める。成功時は固有サイズも返す)を公開し、
+import で呼ぶ。不正なら新しいエラーコード `invalid_asset`(英語の理由付き)。
+拡張子なしで `<svg` の sniff だけで SVG と推定したものは、解析できなければ推定の誤り
+(例: XMP に `<svg` を含むラスタ画像)とみなして画像として扱い直す。
+
+**テスト**: `garbage_cube_file_is_rejected`、`garbage_svg_file_is_rejected`、
+`xml_that_is_not_svg_is_rejected`(修正前はいずれも取り込めてしまい失敗することを確認)、
+`valid_cube_and_svg_fixtures_still_import`(既存の合成フィクスチャ 4 件)。
