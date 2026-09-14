@@ -239,6 +239,20 @@ pub fn apply(
     Ok((out, warnings, step))
 }
 
+/// 出力寸法を、画素を確保せずに求める(画素数上限の事前検査用)。
+///
+/// quad 形式は [`quad_homography`] と同じ「平均辺長」の規則、キーストーン形式は入力と同寸。
+/// quad は画像の外へはみ出してよい(validate は有限・凸性のみ)ので、ここが青天井になりうる。
+pub(crate) fn output_dimensions(w: u32, h: u32, quad: &Option<[[f64; 2]; 4]>) -> (u32, u32) {
+    match quad {
+        Some(q) => {
+            let (_, out_w, out_h) = quad_homography(*q, w.max(1), h.max(1));
+            (out_w, out_h)
+        }
+        None => (w, h),
+    }
+}
+
 /// 画像を単位長に正規化するスケール(1 単位 = `max(W, H)` 画素)。
 /// 量子化の刻み 1e-6 が意味を持つ座標系を定めるためのもの。
 fn norm_scale(w: u32, h: u32) -> f64 {

@@ -159,6 +159,33 @@ pub(crate) fn orientation_affine(width: u32, height: u32, orientation: u16) -> A
 
 // -------------------------------------------------------------------- rotate
 
+/// `rotate` の出力寸法を、画素を確保せずに求める(画素数上限の事前検査用)。
+///
+/// `Full` かつ 90° の倍数でない角度では、`imageproc::rotate_about_center_no_crop` と
+/// **同じ f32 の式**で外接キャンバスを求める(`rotate` 内の debug_assert で一致を固定)。
+/// それ以外は入力と同じ画素数以下にしかならない。
+pub(crate) fn rotate_output_dimensions(
+    w: u32,
+    h: u32,
+    angle_degrees: f64,
+    crop: RotateCrop,
+) -> (u32, u32) {
+    if angle_degrees % 90.0 == 0.0 {
+        let quarter = (angle_degrees / 90.0).rem_euclid(4.0) as u32;
+        return if quarter % 2 == 1 { (h, w) } else { (w, h) };
+    }
+    match crop {
+        RotateCrop::Full => {
+            let theta = (angle_degrees as f32).to_radians();
+            let (cos, sin) = (theta.cos(), theta.sin());
+            let ow = (h as f32 * sin.abs() + w as f32 * cos.abs()).ceil() as u32;
+            let oh = (h as f32 * cos.abs() + w as f32 * sin.abs()).ceil() as u32;
+            (ow, oh)
+        }
+        RotateCrop::LargestInscribedRect => (w, h),
+    }
+}
+
 /// 任意角度回転。正の角度 = 時計回り。
 ///
 /// - `crop = Full`: 回転後の外接矩形をキャンバスとし、余白は `pad` 色で塗る
@@ -223,6 +250,11 @@ pub(crate) fn rotate(
             let mut out = from_f32_image(&warped);
             out.unpremultiply();
             let (ow, oh) = out.dimensions();
+            debug_assert_eq!(
+                (ow, oh),
+                rotate_output_dimensions(w, h, angle_degrees, crop),
+                "rotate_output_dimensions must match imageproc's canvas"
+            );
             let xf = Affine::rotate_about(
                 theta as f64,
                 (w as f64 / 2.0 + 0.5, h as f64 / 2.0 + 0.5),

@@ -344,8 +344,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 crate 结构:`atx-core`(配方与变换引擎)/ `atx-geometry`(倾斜检测)/
 `atx-store`(不可变资产存储)/ `atx-mcp`(rmcp stdio 服务器)。
 
-发布流程请参见 [RELEASING.md](RELEASING.md)。
-
 ## 名称由来
 
 "atx" 是 **A**sset **T**ransform 的缩写;末尾的 `x` 沿用了 "transform" 的
