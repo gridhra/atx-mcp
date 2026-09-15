@@ -29,9 +29,24 @@
 //!    極端に高い行(1 行の高さ上限超え)を含むブロック、
 //!    行の高さの合計がブロック高さの 25% に届かないブロックは、
 //!    文字ではなく縞模様(建物の窓・手すり)を拾ったものとして捨てる
-//! 7. 読み順(上→下。y 範囲が重なるブロック同士は左→右)に並べ、`max_blocks` で切る。
+//! 7. ブロックが 1 つも残らなかった場合、インクが多い(画素比 5% 以上・成分 200 個以上)なら
+//!    「インクは多いが横書きの行は無い」事実を警告に足す([`dense_ink_warning`])。
+//!    書字方向の推定はしない(実写で偽陽性を出したため撤回した。同関数の doc 参照)
+//! 8. 読み順(上→下。y 範囲が重なるブロック同士は左→右)に並べ、`max_blocks` で切る。
 //!    ただし帯分割(`recommended_bands`)が使う行位置は**切る前の全ブロック**から集める
 //!    (切った後だけで作ると、ブロックが多いページで帯が途中で終わる)
+//!
+//! # 切り方は 3 通り(`legibility.strategy`)
+//!
+//! 「長辺 1568 のプレビューで行高 16px 以上」を満たす切り出しを返す。
+//! どう切ったかは `strategy` で名指しする([`legibility_of`]):
+//!
+//! - `whole`: 画像全体でもう十分 → 切らない
+//! - `bands`: 縦が律速 → 幅いっぱいの横帯(境界は行間、隣と 1 行重ねる)
+//! - `blocks`: **横幅が律速** → 横帯では救えないので、ブロック単位の切り出し
+//!   ([`block_crops`])。実測(4080x3072 のメニュー写真、行高 13px = 1568 換算 5.0px)
+//!   では、横帯を 1 本にしても幅 4080 が縮小率を決めてしまい読めなかった。
+//!   以前はこの場合に画像全体 1 本 + 警告だけを返しており、次の一手が無かった
 //!
 //! # 「縦ギャップの中央値」を併用する理由(DESIGN からの上乗せ)
 //!
@@ -87,6 +102,18 @@ const LEGIBLE_LONG_EDGE: u64 = 1568;
 const MIN_LEGIBLE_LINE_HEIGHT: u64 = 16;
 /// `recommended_bands` の本数上限。
 const MAX_BANDS: usize = 16;
+/// 「インクは多いのに行が取れない」警告の下限: インク画素が全体のこの %以上。
+/// 文字で埋まった紙面は Otsu 後のインクが数〜20% を占める。5% 未満は
+/// 「ロゴや見出しが少しある画像」で、行が取れなくても不思議はないので黙る。
+const DENSE_INK_PERCENT: u64 = 5;
+/// 同警告の下限: smearing 前の連結成分数。文字が数百字あれば紙面と呼べる。
+/// 罫線数本・アイコン数個ではここに届かない。
+const DENSE_INK_MIN_COMPONENTS: usize = 200;
+/// 切り方の識別子(MCP が返す面なので英語)。
+/// `whole` = 画像全体で読める、`bands` = 横帯、`blocks` = ブロック単位の切り出し。
+const STRATEGY_WHOLE: &str = "whole";
+const STRATEGY_BANDS: &str = "bands";
+const STRATEGY_BLOCKS: &str = "blocks";
 
 /// 検出パラメータ。
 pub struct TextBlockParams {
@@ -142,17 +169,25 @@ pub struct SuggestedCrop {
 /// 読みやすさの見積もりと、読むための帯分割。
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct Legibility {
+    /// How `recommended_bands` was cut: `"whole"` (the text is already large
+    /// enough, one crop covering the image), `"bands"` (full-width horizontal
+    /// bands) or `"blocks"` (per-block crops, used when the image is too wide
+    /// for full-width bands to help).
+    pub strategy: String,
     /// Median line height after shrinking the whole image to long edge 1568,
     /// in preview pixels. Below ~16 the text is usually too small to read.
     pub line_height_at_1568_px: f64,
-    /// Horizontal bands to read the image in, in reading order, each as a `crop`
-    /// operation ready to paste into a recipe before `render_preview` with
-    /// `long_edge: 1568`. Band edges are aligned to gaps between text lines and
-    /// consecutive bands overlap by one line. The bands cover the vertical span
-    /// that holds text, so a blank margin below the last line may be left out.
-    /// A single band covering the whole image means the text is already large
-    /// enough to read without splitting. At most 16 bands are returned; when that
-    /// is not enough, a warning names how much of the text they cover.
+    /// Crops to read the image in, in reading order, each a `crop` operation
+    /// ready to paste into a recipe before `render_preview` with
+    /// `long_edge: 1568`. With `strategy: "bands"` they are full-width
+    /// horizontal bands whose edges are aligned to gaps between text lines and
+    /// which overlap by one line; they cover the vertical span that holds text,
+    /// so a blank margin below the last line may be left out. With
+    /// `strategy: "blocks"` each crop is one text block (or a few adjacent ones)
+    /// padded by one line height, sized so the lines inside render at 16px or
+    /// more at `long_edge: 1568`. A single crop covering the whole image
+    /// (`strategy: "whole"`) means no splitting is needed. At most 16 crops are
+    /// returned; when that is not enough, a warning names what they leave out.
     pub recommended_bands: Vec<SuggestedCrop>,
 }
 
@@ -248,6 +283,15 @@ pub fn detect_text_blocks(image: &DynamicImage, params: &TextBlockParams) -> Tex
     let ink = binarize(&gray);
     let gap_px = ((w.max(h) * SMEAR_GAP_PERCENT) / 100).max(1);
     let smeared = smear_horizontal(&ink, gap_px);
+    // ブロックが 1 つも取れなかったときだけ、「インクは多いのに行が無い」事実を足す
+    // (計数はその場合しか払わない)。
+    let none_with_ink_note = || {
+        let mut d = TextBlockDetection::none();
+        if let Some(warning) = dense_ink_warning(&ink) {
+            d.warnings.push(warning);
+        }
+        d
+    };
 
     let work_area = w as u64 * h as u64;
     let min_px = ((work_area as f64) * params.min_block_area_ratio.clamp(0.0, 1.0)).ceil() as u64;
@@ -256,7 +300,7 @@ pub fn detect_text_blocks(image: &DynamicImage, params: &TextBlockParams) -> Tex
     let max_line_h = (h * MAX_LINE_HEIGHT_PERCENT / 100).max(MIN_LINE_HEIGHT_LIMIT);
     let comps = components(&smeared, min_px, max_px, max_line_h);
     if comps.is_empty() {
-        return TextBlockDetection::none();
+        return none_with_ink_note();
     }
 
     let merged = merge_vertically(comps);
@@ -305,7 +349,7 @@ pub fn detect_text_blocks(image: &DynamicImage, params: &TextBlockParams) -> Tex
         });
     }
     if blocks.is_empty() {
-        return TextBlockDetection::none();
+        return none_with_ink_note();
     }
 
     let median_line_work = median(&mut all_line_heights);
@@ -321,7 +365,14 @@ pub fn detect_text_blocks(image: &DynamicImage, params: &TextBlockParams) -> Tex
     // 帯分割のための行位置(原寸、重なりを潰して昇順)。
     let rows = normalized_rows(line_rows_work, h, orig_h);
     let mut warnings = Vec::new();
-    let legibility = legibility_of(median_line_orig, orig_w, orig_h, &rows, &mut warnings);
+    let legibility = legibility_of(
+        median_line_orig,
+        orig_w,
+        orig_h,
+        &rows,
+        &blocks,
+        &mut warnings,
+    );
 
     TextBlockDetection {
         blocks,
@@ -353,6 +404,84 @@ fn binarize(gray: &GrayImage) -> GrayImage {
         *dst = Luma([if is_ink { 255 } else { 0 }]);
     }
     out
+}
+
+/// 「インクは多いのに横書きの行が 1 つも取れなかった」ときの警告(事実の報告のみ)。
+///
+/// 文字らしさフィルタは「横 > 縦」の成分しか通さない(横書きの 1 行は横に長い)ので、
+/// 縦書きの面では 0 ブロック + `no_text_like_regions` になる。設計どおりだが、
+/// 実写(朝日新聞 1879、1600x2281 の縦書き)のように**文字で埋まったページ**に
+/// 「文字なし」だけを返すと、ホスト AI に次の一手が無い。
+///
+/// # なぜ「縦書きの推定」をやめたのか
+///
+/// 最初は縦方向にも smearing して「縦長成分 vs 横長成分」の比で縦書きを推定していたが、
+/// **横書き**の露語新聞(3 段組、2240x3255)で偽陽性を出した
+/// (縦 1357 : 横 289)。密な文字面では縦 smearing が行同士を縦に繋いでしまい、
+/// 単語や文字の並びが縦長成分になる。書字方向の推定は実写に耐えないので撤回し、
+/// **観測した事実だけ**を述べる警告に置き換えた: インクは多い / 横書きの行は無い。
+/// 判断(回転して再実行するか、そのままプレビューで読むか)はホスト AI に委ねる。
+///
+/// 条件は「ブロックが 1 つも取れなかった」ことに加えて、
+/// インク画素比 ≥ [`DENSE_INK_PERCENT`]% かつ smearing 前の連結成分数 ≥
+/// [`DENSE_INK_MIN_COMPONENTS`]。ブロックが 1 つでも取れた画像では**出さない**
+/// (偽陽性の余地を残さないため)。
+///
+/// 決定論: 画素の計数と `connected_components`(走査順は決定的)の個数比較だけ。
+fn dense_ink_warning(ink: &GrayImage) -> Option<String> {
+    let total = ink.width() as u64 * ink.height() as u64;
+    if total == 0 {
+        return None;
+    }
+    let ink_px = ink.pixels().filter(|p| p[0] != 0).count() as u64;
+    if ink_px * 100 < total * DENSE_INK_PERCENT {
+        return None;
+    }
+    if component_boxes(ink).len() < DENSE_INK_MIN_COMPONENTS {
+        return None;
+    }
+    Some(
+        "dense ink but no horizontal text lines were found; detect_text_blocks handles \
+         horizontal writing only (vertical Japanese/Chinese text is not supported) - if the \
+         text runs top-to-bottom, rotate 90 degrees with \
+         {\"op\":\"rotate\",\"angle_degrees\":90} and re-run, or read the page directly with \
+         render_preview long_edge 1568"
+            .to_string(),
+    )
+}
+
+/// 連結成分(8 近傍)の外接矩形を 1 パスで集める。
+///
+/// 決定論: `connected_components` のラベル付けと走査順は決定的。
+fn component_boxes(mask: &GrayImage) -> Vec<Rect> {
+    let labels = connected_components(mask, Connectivity::Eight, Luma([0u8]));
+    let mut boxes: Vec<Option<Rect>> = Vec::new();
+    for (x, y, p) in labels.enumerate_pixels() {
+        let label = p[0] as usize;
+        if label == 0 {
+            continue;
+        }
+        if label >= boxes.len() {
+            boxes.resize(label + 1, None);
+        }
+        match &mut boxes[label] {
+            Some(r) => {
+                r.x0 = r.x0.min(x);
+                r.y0 = r.y0.min(y);
+                r.x1 = r.x1.max(x);
+                r.y1 = r.y1.max(y);
+            }
+            slot => {
+                *slot = Some(Rect {
+                    x0: x,
+                    y0: y,
+                    x1: x,
+                    y1: y,
+                })
+            }
+        }
+    }
+    boxes.into_iter().flatten().collect()
 }
 
 /// 水平方向の run-length smearing。インク画素に挟まれた `gap_px` 以下の
@@ -625,11 +754,19 @@ fn normalized_rows(mut rows: Vec<(u32, u32)>, h: u32, orig_h: u32) -> Vec<(u32, 
 }
 
 /// 読みやすさと帯分割を組み立てる。
+///
+/// 切り方は 3 通り([`Legibility::strategy`] で返す):
+///
+/// - `whole`: 画像全体を長辺 1568 で見れば行高 16px 以上 → 切らない
+/// - `bands`: 縦が律速 → 横帯に割る(帯の境界は行間に合わせ、1 行重ねる)
+/// - `blocks`: **横幅が律速**(帯を 1 本にしても 1568 換算で行高 < 16px)→
+///   横帯では救えないので、ブロック単位の切り出しを返す([`block_crops`])
 fn legibility_of(
     median_line_orig: u32,
     orig_w: u32,
     orig_h: u32,
     rows: &[(u32, u32)],
+    blocks: &[TextBlock],
     warnings: &mut Vec<String>,
 ) -> Legibility {
     let long = orig_w.max(orig_h) as u64;
@@ -653,19 +790,49 @@ fn legibility_of(
     if long <= allowed {
         // 画像全体で既に十分。
         return Legibility {
+            strategy: STRATEGY_WHOLE.to_string(),
             line_height_at_1568_px: line_height_at_1568,
             recommended_bands: whole(),
         };
     }
+    // 横幅が律速: 幅いっぱいの帯を 1 本にしても 1568 換算で行高が 16px に届かない。
+    // 横帯を返しても次の一手にならないので、ブロック単位の切り出しに切り替える。
     if orig_w as u64 > allowed {
         let at_width = round3(LEGIBLE_LONG_EDGE as f64 * median_line_orig as f64 / orig_w as f64);
+        // 切り出しの警告(16 本で足りない場合)は、下の説明の**後**に並べたいので
+        // いったん別の Vec で受ける。
+        let mut crop_warnings = Vec::new();
+        let crops = block_crops(
+            blocks,
+            median_line_orig,
+            orig_w,
+            orig_h,
+            allowed,
+            &mut crop_warnings,
+        );
+        if !crops.is_empty() {
+            warnings.push(format!(
+                "text is small relative to the image width: even a full-width band renders lines \
+                 at about {at_width:.1}px at long_edge 1568 (below 16px); read the {} block crops \
+                 in recommended_bands (strategy \"blocks\") instead of full-width bands",
+                crops.len()
+            ));
+            warnings.extend(crop_warnings);
+            return Legibility {
+                strategy: STRATEGY_BLOCKS.to_string(),
+                line_height_at_1568_px: line_height_at_1568,
+                recommended_bands: crops,
+            };
+        }
         warnings.push(format!(
-            "text is small relative to the image width: even a full-width band renders lines at about {at_width:.1}px at long_edge 1568 (below 16px); crop horizontally as well"
+            "text is small relative to the image width: even a full-width band renders lines at \
+             about {at_width:.1}px at long_edge 1568 (below 16px); crop horizontally as well"
         ));
     }
     let band_h = allowed.clamp(1, orig_h as u64) as u32;
     if band_h >= orig_h {
         return Legibility {
+            strategy: STRATEGY_WHOLE.to_string(),
             line_height_at_1568_px: line_height_at_1568,
             recommended_bands: whole(),
         };
@@ -730,8 +897,130 @@ fn legibility_of(
     }
 
     Legibility {
+        strategy: STRATEGY_BANDS.to_string(),
         line_height_at_1568_px: line_height_at_1568,
         recommended_bands: bands,
+    }
+}
+
+/// ブロック単位の切り出し(横幅が律速のときの `recommended_bands`)。
+///
+/// 横に広い写真(実測: 4080x3072 のメニュー、行高 13px = 1568 換算 5.0px)では、
+/// 横帯をいくら細くしても幅 4080 が縮小率を決めてしまうので文字は読めない。
+/// そこで「縮小後に読める大きさで収まる矩形」を並べる。
+///
+/// 手順(すべて整数演算 = 決定論):
+///
+/// 1. 各ブロックの rect に行高 1 行分(`pad`)の余白を付け、画像内へクランプ
+/// 2. 読み順に走査し、隣接ブロックの和が `allowed`(= 長辺がこれ以下なら
+///    1568 換算で行高 >= 16px)に収まる限りまとめる
+/// 3. それでも長辺が `allowed` を超える矩形(1 ブロックが広すぎる場合)は、
+///    一辺 `allowed` 以下のタイルへ読み順(上→下、左→右)に分割する
+/// 4. [`MAX_BANDS`] 本を超えたら**面積の大きい順**に 16 本まで残し(同面積は読み順)、
+///    返すときは読み順に戻す。落とした分は警告で告げる
+fn block_crops(
+    blocks: &[TextBlock],
+    pad: u32,
+    orig_w: u32,
+    orig_h: u32,
+    allowed: u64,
+    warnings: &mut Vec<String>,
+) -> Vec<SuggestedCrop> {
+    if blocks.is_empty() || allowed == 0 {
+        return Vec::new();
+    }
+    let limit = allowed.min(orig_w.max(orig_h) as u64) as u32;
+    let limit = limit.max(1);
+
+    // 1. 余白付け + クランプ。
+    let padded: Vec<BlockRect> = blocks
+        .iter()
+        .map(|b| {
+            let x0 = b.rect.x.saturating_sub(pad);
+            let y0 = b.rect.y.saturating_sub(pad);
+            let x1 = (b.rect.x + b.rect.width + pad).min(orig_w);
+            let y1 = (b.rect.y + b.rect.height + pad).min(orig_h);
+            BlockRect {
+                x: x0,
+                y: y0,
+                width: x1.saturating_sub(x0).max(1),
+                height: y1.saturating_sub(y0).max(1),
+            }
+        })
+        .collect();
+
+    // 2. 読み順のまま、収まる限り隣とまとめる。
+    let mut groups: Vec<BlockRect> = Vec::new();
+    for r in padded {
+        if let Some(last) = groups.last_mut() {
+            let u = union_rect(last, &r);
+            if u.width.max(u.height) as u64 <= limit as u64 {
+                *last = u;
+                continue;
+            }
+        }
+        groups.push(r);
+    }
+
+    // 3. 1 つで収まらない矩形はタイルに割る。
+    let mut tiles: Vec<BlockRect> = Vec::new();
+    for g in groups {
+        if g.width.max(g.height) <= limit {
+            tiles.push(g);
+            continue;
+        }
+        let mut y = g.y;
+        while y < g.y + g.height {
+            let h = limit.min(g.y + g.height - y);
+            let mut x = g.x;
+            while x < g.x + g.width {
+                let w = limit.min(g.x + g.width - x);
+                tiles.push(BlockRect {
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                });
+                x += w;
+            }
+            y += h;
+        }
+    }
+
+    // 4. 16 本に収まらなければ面積の大きい順に残し、読み順へ戻す。
+    let total = tiles.len();
+    if total > MAX_BANDS {
+        let mut indexed: Vec<(usize, BlockRect)> = tiles.into_iter().enumerate().collect();
+        indexed.sort_by_key(|(i, r)| (std::cmp::Reverse(r.width as u64 * r.height as u64), *i));
+        indexed.truncate(MAX_BANDS);
+        indexed.sort_by_key(|(i, _)| *i);
+        tiles = indexed.into_iter().map(|(_, r)| r).collect();
+        warnings.push(format!(
+            "recommended_bands cover only the {MAX_BANDS} largest of {total} text crops; \
+             re-run detect_text_blocks on a crop of the remainder"
+        ));
+    }
+
+    tiles
+        .into_iter()
+        .map(|rect| SuggestedCrop {
+            op: "crop".to_string(),
+            rect,
+        })
+        .collect()
+}
+
+/// 2 つの原寸矩形の外接矩形。
+fn union_rect(a: &BlockRect, b: &BlockRect) -> BlockRect {
+    let x0 = a.x.min(b.x);
+    let y0 = a.y.min(b.y);
+    let x1 = (a.x + a.width).max(b.x + b.width);
+    let y1 = (a.y + a.height).max(b.y + b.height);
+    BlockRect {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
     }
 }
 
@@ -781,6 +1070,43 @@ mod tests {
         assert_eq!(
             out.iter().map(|r| (r.x0, r.y0)).collect::<Vec<_>>(),
             vec![(0, 0), (50, 0), (0, 100)]
+        );
+    }
+
+    /// ブロック切り出しが 16 本を超えるときは、面積の大きい順に 16 本へ切って
+    /// 残りを名指しする警告を出す(黙って切らない)。
+    #[test]
+    fn block_crops_are_capped_at_sixteen_with_a_warning() {
+        // 100x50 のブロックを縦に 20 個(200px 間隔)。余白 10px、収まる上限 120px。
+        // 縦に離れているのでまとめられず、20 本の切り出し候補になる。
+        let blocks: Vec<TextBlock> = (0..20u32)
+            .map(|i| TextBlock {
+                rect: BlockRect {
+                    x: 10,
+                    y: i * 200 + 10,
+                    width: 100,
+                    height: 50,
+                },
+                line_count: 3,
+                median_line_height_px: 10,
+                ink_ratio: 0.3,
+            })
+            .collect();
+        let mut warnings = Vec::new();
+        let crops = block_crops(&blocks, 10, 200, 4000, 120, &mut warnings);
+        assert_eq!(crops.len(), MAX_BANDS);
+        // 面積が同じなので読み順の先頭 16 本が残る。
+        assert_eq!(crops[0].rect.y, 0);
+        assert!(crops.windows(2).all(|w| w[0].rect.y < w[1].rect.y));
+        for c in &crops {
+            assert_eq!(c.op, "crop");
+            assert!(c.rect.width.max(c.rect.height) <= 120, "{:?}", c.rect);
+        }
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("recommended_bands cover only the 16 largest of 20")),
+            "{warnings:?}"
         );
     }
 

@@ -88,7 +88,7 @@ Note on ICC: for png/webp/avif encode output any ICC color profile on the source
 Reading text in an image (documents, receipts, slides, screenshots)
 1. detect_document - if it returns a quad, paste its `suggested_operation` as the FIRST op of your recipe; a null quad means fall back to detect_tilt + rotate.
 2. apply_transform with a recipe of: the detected perspective op -> {"op": "trim"} (drop margins) -> {"op": "preset", "name": "ocr_document"} - that last entry is the preset macro, which inlines the preset's own ops (grayscale, auto_levels, unsharp_mask) at that position. Do NOT binarize for a vision model - thresholding thins strokes; `threshold` / ocr_binarize are for external OCR engines such as Tesseract.
-3. detect_text_blocks on the rectified revision - if `legibility.line_height_at_1568_px` is under ~16 the whole page is too small to read at once, so paste `legibility.recommended_bands[i]` (already a crop op, in reading order) one band at a time; a single band means one preview is enough.
+3. detect_text_blocks on the rectified revision - if `legibility.line_height_at_1568_px` is under ~16 the whole page is too small to read at once, so paste `legibility.recommended_bands[i]` (already a crop op, in reading order) one at a time; `legibility.strategy` tells you what they are ("whole" = one preview is enough, "bands" = full-width bands, "blocks" = per-block crops for an image too wide for bands).
 4. Read it with render_preview `long_edge: 1568`. A vision model reads a downscaled image, so dropping the margins BEFORE that downscale is what buys pixels per glyph; preview a long document in bands with crop.rect.
 
 Visual verification: render_preview takes an optional `overlay` ("grid" | "thirds" | "horizon", or "mask" with a mask_revision_id); compare_revisions shows two revisions side by side or stacked inline, or layout="diff" (same dimensions) for a difference heatmap plus mean/max/changed-ratio stats."#;
@@ -225,9 +225,11 @@ impl AtxServer {
     /// median_line_height_px and ink_ratio. `legibility.line_height_at_1568_px` is the
     /// median line height once the whole image is shrunk to long edge 1568 (below ~16 the
     /// text is usually unreadable), and `legibility.recommended_bands` splits the image into
-    /// horizontal bands that clear that bar - each entry is already a `crop` operation, so
-    /// paste one into a recipe before render_preview `long_edge: 1568` and read the bands in
-    /// order. Optional `max_blocks` (1..=128, default 32) and `min_block_area_ratio`
+    /// crops that clear that bar - each entry is already a `crop` operation, so paste one into
+    /// a recipe before render_preview `long_edge: 1568` and read them in order.
+    /// `legibility.strategy` says how it split: "whole" (no split needed), "bands"
+    /// (full-width horizontal bands) or "blocks" (per-block crops, used when the image is too
+    /// wide for full-width bands to help). Optional `max_blocks` (1..=128, default 32) and `min_block_area_ratio`
     /// (0.0..=1.0, default 0.00005) bound how many and how small the blocks may be.
     /// No block found means the image has no text-like structure, not an error.
     #[tool(
