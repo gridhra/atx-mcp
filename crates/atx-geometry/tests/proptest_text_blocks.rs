@@ -76,7 +76,11 @@ proptest! {
         }
 
         match (&a.legibility, a.blocks.is_empty()) {
-            (None, true) => prop_assert_eq!(&a.warnings, &vec!["no_text_like_regions".to_string()]),
+            // ブロックが無いときは理由が先頭に来る(縦書きの疑いなど、後続の警告は付きうる)。
+            (None, true) => prop_assert_eq!(
+                a.warnings.first().map(String::as_str),
+                Some("no_text_like_regions")
+            ),
             (Some(leg), false) => {
                 prop_assert!(!leg.recommended_bands.is_empty());
                 prop_assert!(leg.recommended_bands.len() <= 16);

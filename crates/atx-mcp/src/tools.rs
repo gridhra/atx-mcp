@@ -2190,13 +2190,18 @@ impl AtxTools {
         let text = match (&detection.median_line_height_px, &detection.legibility) {
             (Some(line_height), Some(legibility)) => {
                 let bands = legibility.recommended_bands.len();
-                let plan = if bands <= 1 {
-                    "large enough to read in one pass: render_preview with long_edge 1568"
-                        .to_string()
-                } else {
-                    format!(
-                        "read in {bands} bands - paste legibility.recommended_bands[i] as a crop op before render_preview long_edge 1568"
-                    )
+                // 切り方(strategy)で次の一手の言い方を変える。横に広い画像では
+                // 横帯が効かないので「ブロック切り出し」と名指しする。
+                let plan = match legibility.strategy.as_str() {
+                    "blocks" => format!(
+                        "read in {bands} block crops - paste legibility.recommended_bands[i] as a crop op before render_preview long_edge 1568"
+                    ),
+                    "bands" => format!(
+                        "read in {bands} band{} - paste legibility.recommended_bands[i] as a crop op before render_preview long_edge 1568",
+                        if bands == 1 { "" } else { "s" }
+                    ),
+                    _ => "large enough to read in one pass: render_preview with long_edge 1568"
+                        .to_string(),
                 };
                 format!(
                     "{}: {} text-like block(s) (covering {:.0}% of the frame), median line height {line_height}px = {:.0}px at long_edge 1568: {plan}",
@@ -2206,7 +2211,17 @@ impl AtxTools {
                     legibility.line_height_at_1568_px,
                 )
             }
-            _ => format!("{}: no text-like regions found", params.revision_id,),
+            // 「文字なし」だけでは手がかりが無いので、後続の警告(インクは多いが
+            // 横書きの行が無い)をサマリにも併記する。
+            _ => {
+                let hint = detection
+                    .warnings
+                    .iter()
+                    .find(|w| w.starts_with("dense ink but no horizontal text lines"))
+                    .map(|w| format!(" - {w}"))
+                    .unwrap_or_default();
+                format!("{}: no text-like regions found{hint}", params.revision_id)
+            }
         };
         ok_result(
             text,
