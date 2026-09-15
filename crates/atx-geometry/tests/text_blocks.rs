@@ -464,3 +464,192 @@ fn bands_reach_the_last_block_even_past_max_blocks() {
         bands.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// 横幅が律速の版面(strategy = "blocks")
+// ---------------------------------------------------------------------------
+
+/// 横に広い画像では横帯が無意味なので、ブロック単位の切り出しを返す。
+///
+/// 実測(4080x3072 のメニュー写真)では行高 13px = 長辺 1568 換算 5.0px で、
+/// 横帯を 1 本にしても読めないのに `recommended_bands` は画像全体 1 本しか
+/// 返さず、エージェントに次の一手が無かった。
+#[test]
+fn a_wide_image_recommends_block_crops() {
+    // 4000x1000。行高 12px・行送り 30px の 10 行ブロックを左右に 2 つ。
+    // 長辺 4000 → 1568 換算の行高 = 12 * 1568/4000 = 4.7px で読めない。
+    // 「1568 換算で行高 >= 16px」を満たす切り出しの長辺上限 = 1568*12/16 = 1176px。
+    const W: u32 = 4000;
+    const H: u32 = 1000;
+    const LIMIT: u32 = 1176;
+    let mut img = GrayImage::from_pixel(W, H, Luma([240]));
+    let columns = [(200u32, 1000u32), (2600u32, 3600u32)];
+    for (x0, x1) in columns {
+        for line in 0..10u32 {
+            let y0 = 200 + line * 30;
+            for y in y0..y0 + 12 {
+                for x in x0..x1 {
+                    img.put_pixel(x, y, Luma([25]));
+                }
+            }
+        }
+    }
+    let d = detect_text_blocks(&DynamicImage::ImageLuma8(img), &no_downscale());
+    let leg = d.legibility.as_ref().expect("legibility");
+    assert!(
+        leg.line_height_at_1568_px < 16.0,
+        "line_height_at_1568_px = {}",
+        leg.line_height_at_1568_px
+    );
+    assert_eq!(
+        leg.strategy, "blocks",
+        "横幅が律速なのでブロック切り出しを選ぶこと: {leg:?}"
+    );
+    let crops = &leg.recommended_bands;
+    assert_eq!(crops.len(), 2, "左右 2 ブロック分の切り出し: {crops:?}");
+    for (i, crop) in crops.iter().enumerate() {
+        assert_eq!(crop.op, "crop");
+        let r = crop.rect;
+        assert!(
+            r.x + r.width <= W && r.y + r.height <= H,
+            "切り出しは画像内に収まること: {r:?}"
+        );
+        let long = r.width.max(r.height);
+        assert!(
+            long <= LIMIT,
+            "切り出し {i} の長辺 {long} は 1568 換算で行高 16px を満たす上限 {LIMIT} 以下であること: {r:?}"
+        );
+        // 対応するブロック(左 → 右)を含んでいること。
+        let (x0, x1) = columns[i];
+        assert!(
+            r.x <= x0 && r.x + r.width >= x1,
+            "切り出し {i} は列 {x0}..{x1} を覆うこと: {r:?}"
+        );
+    }
+    // 読み順(左 → 右)。
+    assert!(
+        crops[0].rect.x < crops[1].rect.x,
+        "切り出しは読み順で返すこと: {crops:?}"
+    );
+    // 警告は「ブロック切り出しを使え」と次の一手を書く。
+    let warning = d
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("text is small relative to the image width"))
+        .unwrap_or_else(|| panic!("横幅が律速である旨の警告が必要: {:?}", d.warnings));
+    assert!(
+        warning.contains("block crops"),
+        "警告は次の一手(ブロック切り出し)を書くこと: {warning}"
+    );
+}
+
+/// 既存の合成書類は「画像全体で読める」= strategy "whole"、
+/// 縦に細長い小さな文字の版面は横帯 = strategy "bands"。
+#[test]
+fn strategy_names_how_the_image_was_split() {
+    let doc = run(&fixture("tests/fixtures/synthetic_document.png"));
+    assert_eq!(
+        doc.legibility.expect("legibility").strategy,
+        "whole",
+        "合成書類は長辺 1568 のプレビューでそのまま読める"
+    );
+
+    // 1000x6000、行高 12px・行送り 48px の 100 行(幅 1000 <= 1176 なので横帯で救える)。
+    let img = striped(1000, 6000, 12, 48, 120, 880);
+    let tall = detect_text_blocks(&img, &no_downscale());
+    let leg = tall.legibility.expect("legibility");
+    assert_eq!(leg.strategy, "bands", "幅が足りているので横帯で切る");
+    assert!(leg.recommended_bands.len() > 1);
+}
+
+// ---------------------------------------------------------------------------
+// 「インクは多いのに横書きの行が取れない」ときの警告
+// ---------------------------------------------------------------------------
+
+/// 文字で埋まった面で 0 ブロックなら、事実(インクは多い / 行は無い)と次の一手を告げる。
+///
+/// 実写(朝日新聞 1879、1600x2281 の縦書き)で 0 ブロック + `no_text_like_regions`
+/// だけが返っていた。文字らしさフィルタが「横 > 縦」の成分しか通さない設計どおりの
+/// 挙動だが、文字で埋まったページに「文字なし」だけを返すと手がかりが無い。
+///
+/// 以前は「縦 smearing 後の縦長成分 vs 横長成分」で縦書きを推定していたが、
+/// 横書きの露語新聞(3 段組、2240x3255)で偽陽性(縦 1357 : 横 289)を出したので
+/// 撤回した。密な文字面では縦 smearing が行同士を縦に繋いでしまう。
+#[test]
+fn dense_ink_without_horizontal_lines_is_named_in_a_warning() {
+    // 縦書きの日本語を模した「正方形の連なり」: 22px 角の塊を 18px 間隔で縦に並べた列を
+    // 列間 40px(x ピッチ 62)で幅いっぱいに。1 字ずつが正方形なので横書きの行にはならない。
+    const W: u32 = 1600;
+    const H: u32 = 2281;
+    const GLYPH: u32 = 22;
+    const GLYPH_GAP: u32 = 18;
+    const COL_PITCH: u32 = GLYPH + 40;
+    let mut img = GrayImage::from_pixel(W, H, Luma([240]));
+    let mut columns = 0u32;
+    let mut x0 = 40;
+    while x0 + GLYPH <= W - 40 {
+        let mut y0 = 100;
+        while y0 + GLYPH <= H - 100 {
+            for y in y0..y0 + GLYPH {
+                for x in x0..x0 + GLYPH {
+                    img.put_pixel(x, y, Luma([25]));
+                }
+            }
+            y0 += GLYPH + GLYPH_GAP;
+        }
+        columns += 1;
+        x0 += COL_PITCH;
+    }
+    assert!(
+        columns >= 20,
+        "この版面は 20 列以上を前提にしている: {columns}"
+    );
+
+    let d = detect_text_blocks(&DynamicImage::ImageLuma8(img), &no_downscale());
+    // 警告は「ブロックが 1 つも取れなかったとき」だけの事実報告。
+    // ブロックが取れる版面なら警告なしが正しい挙動なので、期待をそちらに合わせる。
+    if d.blocks.is_empty() {
+        assert_eq!(
+            d.warnings.first().map(String::as_str),
+            Some("no_text_like_regions"),
+            "理由は先頭に残すこと: {:?}",
+            d.warnings
+        );
+        let warning = d
+            .warnings
+            .iter()
+            .find(|w| w.starts_with("dense ink but no horizontal text lines were found"))
+            .unwrap_or_else(|| panic!("インクが多い旨の警告が必要: {:?}", d.warnings));
+        assert!(
+            warning.contains("vertical Japanese/Chinese text is not supported")
+                && warning.contains(r#"{"op":"rotate","angle_degrees":90}"#)
+                && warning.contains("render_preview long_edge 1568"),
+            "警告は次の一手(90 度回転して再実行 / そのまま読む)を書くこと: {warning}"
+        );
+    } else {
+        assert!(
+            !d.warnings.iter().any(|w| w.starts_with("dense ink")),
+            "ブロックが取れた画像では出さない: {:?}",
+            d.warnings
+        );
+    }
+}
+
+/// 横書きの合成書類と建物写真では出さない(ブロックが取れるので警告の余地が無い)。
+#[test]
+fn images_with_text_blocks_get_no_dense_ink_warning() {
+    let d = run(&fixture("tests/fixtures/synthetic_document.png"));
+    assert!(!d.blocks.is_empty());
+    assert!(
+        !d.warnings.iter().any(|w| w.starts_with("dense ink")),
+        "横書きの書類で出してはいけない: {:?}",
+        d.warnings
+    );
+
+    let scene = run(&fixture("tests/fixtures/synthetic_scene.jpg"));
+    assert!(
+        !scene.warnings.iter().any(|w| w.starts_with("dense ink")),
+        "建物写真で出してはいけない: {:?}",
+        scene.warnings
+    );
+}

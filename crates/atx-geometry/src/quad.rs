@@ -20,6 +20,8 @@
 //!      dilate による隅の面取りをそのまま拾って長辺の数 % ずれることがある。
 //!      4 辺を直交回帰で当てはめ直し、隣接直線の交点を隅とする
 //!      ([`refine_corners`]。改善にならない場合は DP の頂点へ戻す)
+//!    - **形状の健全性検査**(DESIGN からの上乗せ): 辺長比・内角・対辺比・頂点順序が
+//!      「長方形の射影」として筋が通らない候補を捨てる([`is_plausible_quad`])
 //! 5. スコア = 多角形面積(大きいものを優先)。同点は直角性で決める
 //! 6. 座標を原寸へ戻し、tl / tr / br / bl(画面上の時計回り)に並べ替える
 //! 7. 4 頂点が取れなければ `quad: null` + `no_quad_found`
@@ -56,13 +58,28 @@ const FIT_MIN_POINTS: usize = 8;
 /// 精密化した隅が DP の頂点からこの割合(長辺比)以上ずれたら、精密化を捨てる。
 const FIT_MAX_SHIFT_RATIO: f64 = 0.05;
 /// confidence における辺サポートの寄与(残りが直角性による減点分)。
-const SUPPORT_WEIGHT: f64 = 0.7;
+///
+/// 0.7 だった頃は「直角性 0」の候補でも confidence が support の 0.7 倍まで出たので、
+/// 実測のホワイトボード写真で退化した細長い四角形が 0.414(既定閾値 0.4)を越えて
+/// 通ってしまった(support 0.59 × 0.7 = 0.414。付箋の縁が偶然エッジ上に乗っていた)。
+/// 0.5 にすると直角性 0 の候補は confidence 0.5 を越えられない
+/// (= 既定閾値 0.5 に届かない。support がちょうど 1.0 のときだけ同値)。
+const SUPPORT_WEIGHT: f64 = 0.5;
 /// `already_rectified` と見なす面積比の下限。
 const RECTIFIED_AREA_RATIO: f64 = 0.97;
 /// `already_rectified` と見なす「隅が画像隅に近い」距離(長辺に対する比)。
 const RECTIFIED_CORNER_RATIO: f64 = 0.01;
 /// 作業解像度でこれ未満の辺を持つ四角形は退化とみなす(画素)。
 const MIN_EDGE_PX: f64 = 8.0;
+/// 形状の健全性: 4 辺の最短 / 最長の長さ比の下限。
+/// 紙の射影で極端な短辺は出ない(斜めから撮った台形でも 0.3 程度は残る)。
+const MIN_EDGE_RATIO: f64 = 0.2;
+/// 形状の健全性: 対辺(top/bottom、left/right)の長さ比の許容範囲。
+const MIN_OPPOSITE_RATIO: f64 = 0.25;
+const MAX_OPPOSITE_RATIO: f64 = 4.0;
+/// 形状の健全性: 内角が 90° ± 45° に収まること。
+/// 角度そのものを出さず `|cos θ| <= cos(45°) = 1/√2` で見る(`acos` を呼ばない)。
+const MAX_ANGLE_COS: f64 = std::f64::consts::FRAC_1_SQRT_2;
 /// 検出手法の識別子。
 const METHOD_CONTOUR: &str = "contour";
 
@@ -85,7 +102,9 @@ impl Default for DocumentParams {
     fn default() -> Self {
         Self {
             min_area_ratio: 0.2,
-            min_confidence: 0.4,
+            // 0.4 では、直角性 0 の退化した四角形が support 0.59 で通っていた
+            // (ホワイトボード写真の実測 confidence 0.414)。
+            min_confidence: 0.5,
             working_long_edge: 1024,
         }
     }
@@ -188,6 +207,10 @@ pub fn detect_document(image: &DynamicImage, params: &DocumentParams) -> Documen
         let quad = refine_corners(&contour.points, quad, work_w.max(work_h) as f64);
         let area = polygon_area(&quad);
         if area < min_area {
+            continue;
+        }
+        // 「長方形の射影ならありえない形」をここで捨てる(凸性だけでは足りない)。
+        if !is_plausible_quad(&quad) {
             continue;
         }
         let candidate = Candidate {
@@ -572,6 +595,64 @@ fn is_strictly_convex_in_order(q: &[[f64; 2]; 4]) -> bool {
     })
 }
 
+/// 「長方形を射影した形」として筋が通っているか(tl, tr, br, bl の順を仮定)。
+///
+/// 凸性([`is_strictly_convex_in_order`])だけでは、細長い三角形に近い退化した
+/// 四角形が通ってしまう。実測(ホワイトボード写真 3456x4608、付箋が多数)では
+/// `[[166.5,4261.5],[3442.5,1615.5],[3303,4383],[3294,4486.5]]` が返り、
+/// br と bl が 100px しか離れていない(= 下辺が辺として存在しない)ため、
+/// `perspective` を適用すると画像が引き裂かれた縞模様になった。
+/// そこで次の 4 つを課す。どれか 1 つでも破れた候補は捨てる
+/// (候補が残らなければ `no_quad_found`)。
+///
+/// 1. 4 辺の最短 / 最長の比 >= [`MIN_EDGE_RATIO`]
+/// 2. 4 内角がすべて 90° ± 45°(`|cos| <= ` [`MAX_ANGLE_COS`])
+/// 3. 対辺の長さ比(top/bottom、left/right)が
+///    [`MIN_OPPOSITE_RATIO`]..=[`MAX_OPPOSITE_RATIO`]
+/// 4. 頂点の順序整合: tl は tr より左、bl は br より左、tl は bl より上、
+///    tr は br より上(並べ替え後にこれが崩れているのは退化の印)
+///
+/// 決定論: 四則演算と比較だけ。`sqrt` は [`edge_len`] 経由で 1e-6 量子化される。
+fn is_plausible_quad(q: &[[f64; 2]; 4]) -> bool {
+    let top = edge_len(q[0], q[1]);
+    let right = edge_len(q[1], q[2]);
+    let bottom = edge_len(q[2], q[3]);
+    let left = edge_len(q[3], q[0]);
+    let lens = [top, right, bottom, left];
+    let shortest = lens.iter().copied().fold(f64::INFINITY, f64::min);
+    let longest = lens.iter().copied().fold(0.0f64, f64::max);
+    if shortest <= 0.0 || longest <= 0.0 || shortest / longest < MIN_EDGE_RATIO {
+        return false;
+    }
+
+    let ratio_ok = |a: f64, b: f64| {
+        let r = a / b;
+        (MIN_OPPOSITE_RATIO..=MAX_OPPOSITE_RATIO).contains(&r)
+    };
+    if !ratio_ok(top, bottom) || !ratio_ok(left, right) {
+        return false;
+    }
+
+    for i in 0..4 {
+        let prev = q[(i + 3) % 4];
+        let cur = q[i];
+        let next = q[(i + 1) % 4];
+        let u = [prev[0] - cur[0], prev[1] - cur[1]];
+        let v = [next[0] - cur[0], next[1] - cur[1]];
+        let nu = edge_len([0.0, 0.0], u);
+        let nv = edge_len([0.0, 0.0], v);
+        if nu == 0.0 || nv == 0.0 {
+            return false;
+        }
+        if ((u[0] * v[0] + u[1] * v[1]) / (nu * nv)).abs() > MAX_ANGLE_COS {
+            return false;
+        }
+    }
+
+    let (tl, tr, br, bl) = (q[0], q[1], q[2], q[3]);
+    tl[0] < tr[0] && bl[0] < br[0] && tl[1] < bl[1] && tr[1] < br[1]
+}
+
 /// 多角形面積(靴紐公式)。
 fn polygon_area(q: &[[f64; 2]; 4]) -> f64 {
     let mut sum = 0.0;
@@ -745,6 +826,91 @@ mod tests {
             "{detection:?}"
         );
         assert!(detection.area_ratio > RECTIFIED_AREA_RATIO, "{detection:?}");
+    }
+
+    /// 実測(ホワイトボード写真 3456x4608)で confidence 0.414 のまま返っていた
+    /// 退化 quad。br と bl が 100px しか離れておらず、「左辺」は左下から右上への
+    /// 長い対角線 = 長方形の射影ではありえない形。健全性検査で落ちること。
+    #[test]
+    fn the_degenerate_whiteboard_quad_is_rejected_by_the_shape_check() {
+        let quad = [
+            [166.5, 4261.5],
+            [3442.5, 1615.5],
+            [3303.0, 4383.0],
+            [3294.0, 4486.5],
+        ];
+        // 凸性だけでは落ちない(= 以前はこれで通っていた)ことも固定する。
+        assert!(is_strictly_convex_in_order(&quad));
+        assert!(
+            !is_plausible_quad(&quad),
+            "the degenerate quad must fail the shape sanity check"
+        );
+    }
+
+    /// 斜めから撮った紙のような台形は健全性検査を通ること(検査が厳しすぎないこと)。
+    #[test]
+    fn a_keystoned_trapezoid_passes_the_shape_check() {
+        let quad = [
+            [120.0, 90.0],
+            [700.0, 150.0],
+            [660.0, 560.0],
+            [160.0, 520.0],
+        ];
+        assert!(is_plausible_quad(&quad));
+    }
+
+    /// 上の退化 quad と同じ比率の「細長い三角形に近い」明るい四角形を描いた
+    /// 合成画像(面積比 ~28% なので `min_area_ratio` では落ちない)では
+    /// `quad: null` + `no_quad_found` になること。
+    ///
+    /// なお、この形は短辺が 26px しかないので Douglas-Peucker(ε = 周長の 2% ≈ 61px)
+    /// の段階で 3 頂点に潰れ、健全性検査に届く前に候補から外れる。
+    /// つまりこのテストは「この入力で壊れた quad を返さない」ことを固定するもので、
+    /// 健全性検査そのものは上の 2 つのテストが守る。
+    /// 強く傾いた平行四辺形(内角 45°/135°)は、4 辺がどれも十分長く凸でもあるので
+    /// 以前は confidence 0.545 で**通っていた**。内角の検査(90° ± 45°)で落ちること。
+    ///
+    /// 辺長比 0.70、対辺比 1.0、頂点順序も整合しているので、この画像を弾くのは
+    /// 内角の検査だけ(= 検査 4 本のうち内角の分をこのテストが守る)。
+    #[test]
+    fn a_strongly_sheared_parallelogram_yields_no_quad() {
+        let quad = [
+            [50.0, 100.0],
+            [500.0, 100.0],
+            [1000.0, 500.0],
+            [550.0, 500.0],
+        ];
+        assert!(!is_plausible_quad(&quad));
+        let detection = detect_document(&synthetic(1060, 620, &quad), &DocumentParams::default());
+        assert!(
+            detection.quad.is_none(),
+            "a 45-degree sheared parallelogram is not a projected rectangle ({detection:?})"
+        );
+        assert!(
+            detection.warnings[0].starts_with(REASON_NO_QUAD),
+            "{detection:?}"
+        );
+    }
+
+    #[test]
+    fn a_sliver_quad_yields_no_quad() {
+        // 3456x4608 の 1/4。比率(= 角度と辺長比)は実測の quad と同一。
+        let quad = [
+            [41.625, 1065.375],
+            [860.625, 403.875],
+            [825.75, 1095.75],
+            [823.5, 1121.625],
+        ];
+        let image = synthetic(864, 1152, &quad);
+        let detection = detect_document(&image, &DocumentParams::default());
+        assert!(
+            detection.quad.is_none(),
+            "a sliver quad must not be returned ({detection:?})"
+        );
+        assert!(
+            detection.warnings[0].starts_with(REASON_NO_QUAD),
+            "{detection:?}"
+        );
     }
 
     #[test]
