@@ -2,6 +2,8 @@
 
 [English](README.md) | **日本語** | [简体中文](README.zh-CN.md)
 
+[![Mentioned in Awesome MCP Servers](https://awesome.re/mentioned-badge.svg)](https://github.com/punkpeye/awesome-mcp-servers)
+
 汎用 AI エージェント向けの、決定論的(非生成)アセット変換 MCP サーバ。Rust 製。
 
 編集意図(「水平にして 16:9 に整えて軽く明るく」)を宣言的な変換レシピとして実行し、

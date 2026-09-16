@@ -2,6 +2,8 @@
 
 **English** | [日本語](README.ja.md) | [简体中文](README.zh-CN.md)
 
+[![Mentioned in Awesome MCP Servers](https://awesome.re/mentioned-badge.svg)](https://github.com/punkpeye/awesome-mcp-servers)
+
 A deterministic (non-generative) asset transformation MCP server for general-purpose
 AI agents, written in Rust.
 
