@@ -2,6 +2,8 @@
 
 [English](README.md) | [日本語](README.ja.md) | **简体中文**
 
+[![Mentioned in Awesome MCP Servers](https://awesome.re/mentioned-badge.svg)](https://github.com/punkpeye/awesome-mcp-servers)
+
 面向通用 AI agent 的确定性(非生成式)资产变换 MCP 服务器,使用 Rust 编写。
 
 它把编辑意图(例如"把水平线调平、裁成 16:9、稍微调亮一点")作为声明式的变换配方
