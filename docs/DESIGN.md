@@ -1721,3 +1721,62 @@ release ビルドの stdio 経由で回した。著作権法 30 条の 4 第 1 �
 4. 多段組(改善): 縦方向の投影プロファイルで段の空白を先に見つけ、段ごとに行検出する。今回は記録のみ
 5. ピンぼけ耐性(改善): 上記のとおり。sharpness(同写真は 748、スキャンは 4,000〜27,000)と組み合わせて
    「sharpness が低いときは行高推定を信用しない」と instructions に書くのが最も安い対策
+
+### 9.16 配布経路の是正: crates.io / OCI を本流に、npm は補助(2026-09-18)
+
+#### 何が起きたか
+
+v0.4.1 で MCP 公式レジストリ(registry.modelcontextprotocol.io)に載せる際、「レジストリ掲載には npm パッケージが
+必要」という前提で npm ランチャー(`npx atx-mcp`。OS 別バイナリを optionalDependencies で引く薄い起動器)を
+主配布にした。この前提は誤りだった。レジストリの `server.json` は npm / pypi / **cargo** / **oci** / nuget / mcpb を
+受け付け、所有権の検証もそれぞれ用意されている(cargo: crates.io 上の README に `mcp-name: <server-name>` の行、
+oci: イメージのラベル `io.modelcontextprotocol.server.name`)。Rust 製の価値(単一バイナリ・依存ゼロ)を届ける本流が
+Node 依存の起動器になっていた上、v0.6.1 では npm 側の反映遅延(受理から約 30 時間)で復旧作業に振り回された。
+
+**教訓(規則)**: 外部サービスの「必須」条件は、一次情報(スキーマとバリデータの実装)を読んで確認する。
+二次情報や過去の会話の前提を、確認せずに引き継がない。司令塔がこの前提を疑わなかったことも同じ失敗。
+
+#### 判断
+
+配布は 3 経路。順位は Rust 本流を前に出す。
+
+| 順位 | 経路 | 対象 | レジストリ検証 |
+|---|---|---|---|
+| 1 | **crates.io**(`cargo binstall atx-mcp` = GitHub Release のバイナリを取得、`cargo install atx-mcp` = ソースビルド) | Rust ツールチェインを持つ利用者、ライブラリ利用(atx-core 単体) | README の `mcp-name:` 行 |
+| 2 | **OCI**(`ghcr.io/gridhra/atx-mcp`、scratch ベースの静的 musl バイナリ、amd64 / arm64) | Docker 前提の MCP ホスト | イメージラベル |
+| 3 | **npm**(`npx atx-mcp`) | Node しか無い環境へのインストール不要の導線。**残す**(消すほどではない。cargo には npx 相当のワンショット実行が無い) | package.json の `mcpName` |
+
+- 4 クレート(atx-geometry → atx-core → atx-store → atx-mcp の依存順)を crates.io に公開する。
+  atx-core を単体で使えるようにすることも目的(README とメタデータを整える)
+- **公開名**: crates.io の `atx-core` は別プロジェクト(Apple ATX テクスチャの読み取りライブラリ)が取得済みで使えない。
+  名前は改名不可なので、ライブラリ 3 本を最初から揃える。当初 `atx-mcp-core` 等を考えたが、**ライブラリは MCP に
+  依存しない**ため接頭辞が中身を誤って伝える(ユーザー指摘)。プロジェクト名の由来(atx = Asset Transform、
+  リポジトリ名 asset-transform-mcp)に沿って **`asset-transform-core` / `asset-transform-geometry` / `asset-transform-store`**
+  とする(3 つとも未取得を確認)。バイナリは `atx-mcp`。ディレクトリ名と `[lib] name`(`atx_core` 等)は変えないので
+  Rust ソースは 0 行変更。利用側は `asset-transform-core = "0.6.1"` と依存に書き、コードでは `use atx_core::` のまま
+- `server.json` の packages は cargo → oci → npm の 3 件。レジストリ登録は 3 経路の公開がすべて成功した後
+- 版更新箇所が増える: `workspace.package.version`、`workspace.dependencies` の path 依存の `version`、`server.json` の 3 package。
+  CI がタグとの一致を全箇所で検査する
+- crates.io は Trusted Publishing(GitHub Actions OIDC)。初回だけ所有者が手で publish し、各クレートに
+  Trusted Publisher を登録する(npm と同じ運用。手順は RELEASING.md)
+
+#### 実装上の要点
+
+- `include_str!` でクレート外(リポジトリ直下 `presets/`)を読んでいたため publish できない → `crates/atx-mcp/presets/` へ移動
+- `cargo binstall` 用メタデータは GitHub Release の実際の成果物名(`atx-mcp-{version}-{target}.tar.gz`、Windows は zip)に合わせる
+- Dockerfile は `FROM scratch` + 事前ビルドの静的バイナリ。stdio なので `docker run -i --rm -v "$PWD:/workspace" ...`、
+  import_asset に渡すパスはコンテナ内パス
+
+#### 実装時差分(2026-09-18)
+
+- OCI package の `registryBaseUrl` と `version` は書かない(レジストリのバリデータが存在を明示的にエラーにする。版は
+  `identifier` のタグに入れる)。`runtimeArguments` はマウントだけ(`run` / `-i` / `--rm` はクライアント側が付ける前提の公式例に合わせた)
+- 版の照合は `versions` ジョブとして独立(cargo / oci / npm の 3 ジョブの手前に置く必要があるため)。
+  `workspace.package.version`、path 依存 3 本、`server.json` の全 package をタグと照合。正負両方をテスト済み
+- レジストリ登録は `registry` ジョブとして独立し、cargo / oci / npm すべて成功が条件
+- ライブラリ 3 本の `categories` は `["multimedia::images"]`(workspace 継承の `command-line-utilities` は不正確なため外した)
+- Dockerfile は実物の v0.6.1 aarch64-musl バイナリで起動確認(ラベル 7 件、initialize への JSON-RPC 応答)
+- package サイズ: geometry 71KB / core 501KB(同梱フォント含む)/ store 25KB / atx-mcp 165KB(プリセット 34 本含む)。いずれも圧縮後
+- 版を書く場所は計 20 箇所(RELEASING.md にチェックリストと grep のレシピ)
+- 未検証(初回 publish 後に確定): crates.io の実 publish、`cargo binstall` の実動作、ghcr.io へのマルチアーキ push、
+  レジストリのバリデータが crates.io のレンダリング済み README から `mcp-name:` 行を読めること

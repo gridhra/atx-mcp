@@ -94,11 +94,10 @@ allow = ["NCSA"]
 # --- 明示的に塞ぐクレート(ライセンス方針の二重化) ---------------------------
 [bans]
 multiple-versions = "warn"      # 重複バージョンは是正したいが CI を止めるほどではない
-# ワークスペース内の path 依存(atx-core / atx-geometry / atx-store)は version を
-# 書いておらず wildcard 扱いになる。allow-wildcard-paths は publish = false の
-# クレートにしか効かないため、ここは "warn" に留める(外部クレートへの "*" 依存が
-# 増えたら警告として気づける)。crates.io に publish する段になったら
-# path 依存に version を併記すること。
+# ワークスペース内の path 依存(atx-core / atx-geometry / atx-store)には
+# crates.io publish のために version を併記済みなので、もう wildcard にはならない。
+# それでも "deny" にせず "warn" に留めているのは、外部クレートへの "*" 依存が
+# 混ざったときに CI を止めずに気づける形にしておくため。
 wildcards = "warn"
 
 [[bans.deny]]

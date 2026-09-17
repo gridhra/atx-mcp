@@ -386,7 +386,7 @@ fn source_space_crop_survives_perspective() {
 /// imageproc の bicubic warp・JPEG エンコーダ設定)をピン留めする。
 /// 意図的に挙動を変えた場合のみ `ENGINE_VERSION` を上げた上で更新すること。
 /// 入力は完全合成のフィクスチャ `tests/fixtures/synthetic_scene.jpg`
-/// (`cargo run -p atx-core --example gen_fixture` で再生成可能)。
+/// (`cargo run -p asset-transform-core --example gen_fixture` で再生成可能)。
 #[test]
 fn golden_perspective_pipeline_sha256() {
     let r = recipe(

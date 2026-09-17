@@ -1,8 +1,19 @@
 [package]
-name = "atx-store"
+# crates.io 公開名(命名の理由は Cargo.toml の workspace.dependencies のコメント参照)。
+# `[lib] name` は `atx_store` のまま。
+name = "asset-transform-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories = ["multimedia::images"]
+readme = "README.md"
+description = "Content-addressed, append-only asset store for deterministic image transforms: immutable revisions with recipe lineage. Part of the atx-mcp MCP server."
+
+[lib]
+name = "atx_store"
+path = "src/lib.rs"
 
 [dependencies]
 atx-core.workspace = true
