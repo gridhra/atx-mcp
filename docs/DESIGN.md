@@ -1722,19 +1722,17 @@ release ビルドの stdio 経由で回した。著作権法 30 条の 4 第 1 �
 5. ピンぼけ耐性(改善): 上記のとおり。sharpness(同写真は 748、スキャンは 4,000〜27,000)と組み合わせて
    「sharpness が低いときは行高推定を信用しない」と instructions に書くのが最も安い対策
 
-### 9.16 配布経路の是正: crates.io / OCI を本流に、npm は補助(2026-09-18)
+### 9.16 配布経路: crates.io / OCI を本流に、npm は補助(2026-09-18)
 
-#### 何が起きたか
+#### 背景
 
-v0.4.1 で MCP 公式レジストリ(registry.modelcontextprotocol.io)に載せる際、「レジストリ掲載には npm パッケージが
-必要」という前提で npm ランチャー(`npx atx-mcp`。OS 別バイナリを optionalDependencies で引く薄い起動器)を
-主配布にした。この前提は誤りだった。レジストリの `server.json` は npm / pypi / **cargo** / **oci** / nuget / mcpb を
-受け付け、所有権の検証もそれぞれ用意されている(cargo: crates.io 上の README に `mcp-name: <server-name>` の行、
-oci: イメージのラベル `io.modelcontextprotocol.server.name`)。Rust 製の価値(単一バイナリ・依存ゼロ)を届ける本流が
-Node 依存の起動器になっていた上、v0.6.1 では npm 側の反映遅延(受理から約 30 時間)で復旧作業に振り回された。
-
-**教訓(規則)**: 外部サービスの「必須」条件は、一次情報(スキーマとバリデータの実装)を読んで確認する。
-二次情報や過去の会話の前提を、確認せずに引き継がない。司令塔がこの前提を疑わなかったことも同じ失敗。
+v0.4.1 以降の配布は GitHub Release のバイナリと npm ランチャー(`npx atx-mcp`。OS 別バイナリを
+optionalDependencies で引く薄い起動器)で、MCP 公式レジストリ(registry.modelcontextprotocol.io)の
+`server.json` にも npm だけを載せていた。レジストリは npm / pypi / **cargo** / **oci** / nuget / mcpb を受け付け、
+所有権の検証もそれぞれ用意されている(cargo: crates.io 上の README に `mcp-name: <server-name>` の行、
+oci: イメージのラベル `io.modelcontextprotocol.server.name`)。Rust 製の価値(単一バイナリ・依存ゼロ)を
+届ける経路として crates.io と OCI を本流に据え、npm は Node しか無い環境向けの補助とする。
+npm 側は v0.6.1 で受理から反映まで約 30 時間かかる事例があり、単一経路への依存を減らす意味もある。
 
 #### 判断
 
@@ -1750,7 +1748,7 @@ Node 依存の起動器になっていた上、v0.6.1 では npm 側の反映遅
   atx-core を単体で使えるようにすることも目的(README とメタデータを整える)
 - **公開名**: crates.io の `atx-core` は別プロジェクト(Apple ATX テクスチャの読み取りライブラリ)が取得済みで使えない。
   名前は改名不可なので、ライブラリ 3 本を最初から揃える。当初 `atx-mcp-core` 等を考えたが、**ライブラリは MCP に
-  依存しない**ため接頭辞が中身を誤って伝える(ユーザー指摘)。プロジェクト名の由来(atx = Asset Transform、
+  依存しない**ため接頭辞が中身を誤って伝える。プロジェクト名の由来(atx = Asset Transform、
   リポジトリ名 asset-transform-mcp)に沿って **`asset-transform-core` / `asset-transform-geometry` / `asset-transform-store`**
   とする(3 つとも未取得を確認)。バイナリは `atx-mcp`。ディレクトリ名と `[lib] name`(`atx_core` 等)は変えないので
   Rust ソースは 0 行変更。利用側は `asset-transform-core = "0.6.1"` と依存に書き、コードでは `use atx_core::` のまま
@@ -1778,5 +1776,11 @@ Node 依存の起動器になっていた上、v0.6.1 では npm 側の反映遅
 - Dockerfile は実物の v0.6.1 aarch64-musl バイナリで起動確認(ラベル 7 件、initialize への JSON-RPC 応答)
 - package サイズ: geometry 71KB / core 501KB(同梱フォント含む)/ store 25KB / atx-mcp 165KB(プリセット 34 本含む)。いずれも圧縮後
 - 版を書く場所は計 20 箇所(RELEASING.md にチェックリストと grep のレシピ)
-- 未検証(初回 publish 後に確定): crates.io の実 publish、`cargo binstall` の実動作、ghcr.io へのマルチアーキ push、
-  レジストリのバリデータが crates.io のレンダリング済み README から `mcp-name:` 行を読めること
+- **初回 publish の結果(v0.6.2、2026-09-18)**: 4 クレートを手動 publish → タグ push。`cargo binstall atx-mcp` は
+  GitHub Release から取得して 3.6 秒で入り `atx-mcp 0.6.2` を返した。ghcr.io のイメージは amd64 / arm64 の
+  マニフェストが**匿名 pull 可能**(GitHub は公開リポジトリの Actions から push したパッケージを既定で public にした。
+  手動の公開設定は不要だった)。crates.io のレンダリング済み README に `mcp-name:` 行は残っている
+- **cargo ジョブの順序不具合**: Trusted Publishing の認証ステップが「publish 要否の判定」より先にあり、手動 publish 済みで
+  Trusted Publisher 未登録の状態では publish が不要でも job が落ち、依存する registry ジョブが走らなかった。
+  判定を先に置き、publish が要るときだけ認証するよう修正。v0.6.2 のレジストリ登録は Trusted Publisher 登録後に
+  同じ実行の失敗ジョブを再実行して通す(タグ ref なので npm の Environment 制限も満たす)
