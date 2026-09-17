@@ -7,7 +7,7 @@
 //! - `evals/fixtures/dark_ui_screenshot.png` … ダークモード UI のスクリーンショット風合成
 //!
 //! ```sh
-//! cargo run -p atx-core --example gen_fixture
+//! cargo run -p asset-transform-core --example gen_fixture
 //! ```
 //!
 //! ## tilted_scene.jpg(evals/tasks/t01_straighten_eyecatch.json 用)

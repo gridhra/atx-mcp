@@ -278,7 +278,7 @@ fn deterministic_for_same_input() {
     );
 }
 
-/// 写真らしい合成フィクスチャ(`cargo run -p atx-core --example gen_fixture`)。
+/// 写真らしい合成フィクスチャ(`cargo run -p asset-transform-core --example gen_fixture`)。
 /// 建物の水平・垂直エッジが支配的で、シーン自体は完全に水平なので
 /// 検出角はほぼ 0° になる(または棄却)。
 #[test]

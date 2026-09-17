@@ -56,32 +56,30 @@ atx にできないこと(生成的な画像編集・RAW 現像・機械学習�
 
 ## インストール
 
-Rust toolchain は不要。以下のいずれかを選ぶ。
+atx-mcp は依存のない単一バイナリ。以下のいずれかを選ぶ。
 
-### 1. npx(最も手軽・推奨)
-
-Node.js 18+ があれば他に何も要らない。プラットフォーム対応のネイティブバイナリが
-`optionalDependencies` 経由で自動的に入る。
+### 1. cargo binstall(ビルド済みバイナリ・コンパイルなし)
 
 ```sh
-# --scope user で全プロジェクトから利用可能になる(省略時はカレントプロジェクト限定)
-claude mcp add --scope user asset-transform -- npx -y atx-mcp --workspace /path/to/asset-workspace
+cargo binstall atx-mcp
+claude mcp add --scope user asset-transform -- atx-mcp --workspace /path/to/asset-workspace
 ```
 
-MCP クライアントの設定ファイルに直接書く場合:
+[`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) は、コンパイルの代わりに
+本リポジトリの CI が作ったリリースアーカイブを取得する。Rust toolchain がすでにある人には
+これが一番速い。(`--scope user` で全プロジェクトから利用可能になる。省略時はカレント
+プロジェクト限定。)
 
-```json
-{
-  "mcpServers": {
-    "asset-transform": {
-      "command": "npx",
-      "args": ["-y", "atx-mcp", "--workspace", "/path/to/asset-workspace"]
-    }
-  }
-}
+### 2. cargo install(ソースからビルド)
+
+```sh
+cargo install atx-mcp
 ```
 
-### 2. ビルド済みバイナリ
+Rust toolchain が動くプラットフォームならどこでも通る(ビルド済みバイナリが無い環境も含む)。
+C コンパイラも必要(libwebp をソース同梱でビルドするため)。
+
+### 3. ビルド済みバイナリ(Rust toolchain 不要)
 
 インストーラスクリプト(既定の設置先は `~/.local/bin`、Windows は
 `%LOCALAPPDATA%\Programs\atx-mcp`。SHA256SUMS で検証してから展開する):
@@ -111,14 +109,40 @@ irm https://raw.githubusercontent.com/gridhra/atx-mcp/main/scripts/install.ps1 |
 claude mcp add asset-transform -- ~/.local/bin/atx-mcp --workspace /path/to/asset-workspace
 ```
 
-### 3. ソースからビルド(上記以外のプラットフォーム)
+### 4. Docker
 
-必要なもの: Rust toolchain と C コンパイラ(libwebp のソース同梱ビルド用)のみ。
+`ghcr.io/gridhra/atx-mcp` は `FROM scratch` のイメージで、静的リンクのバイナリ以外は
+何も入っていない(`linux/amd64` と `linux/arm64`)。
 
 ```sh
-cargo build --release
-# => target/release/atx-mcp
-claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /path/to/asset-workspace
+claude mcp add asset-transform -- \
+  docker run -i --rm -v "$PWD:/workspace" ghcr.io/gridhra/atx-mcp:0.6.2
+```
+
+注意が 2 つ。**`-i` は必須**(サーバは MCP の stdio トランスポートで話すため、標準入力を
+開いたままにする必要がある)。**パスはコンテナ内のパス**になる(bind mount したディレクトリは
+コンテナ内では `/workspace` として見えるので、`import_asset` / `export_asset` に渡すのは
+ホストのパスではなく `/workspace/photos/shot.jpg` のような形)。
+
+### 5. npx(Node.js 18+・インストール不要)
+
+プラットフォーム対応のネイティブバイナリが `optionalDependencies` 経由で自動的に入る。
+
+```sh
+claude mcp add --scope user asset-transform -- npx -y atx-mcp --workspace /path/to/asset-workspace
+```
+
+MCP クライアントの設定ファイルに直接書く場合:
+
+```json
+{
+  "mcpServers": {
+    "asset-transform": {
+      "command": "npx",
+      "args": ["-y", "atx-mcp", "--workspace", "/path/to/asset-workspace"]
+    }
+  }
+}
 ```
 
 ---
@@ -316,7 +340,7 @@ atx はシステムフォントを一切読まない(インストールされて
 規則は `explain_operation {"operation":"preset"}` で引ける。
 
 `apply_transform` / `render_preview` は `recipe`(生の DSL)と
-`preset`([`presets/`](presets) 同梱の名前付きレシピ)のどちらか一方を受ける(排他・どちらか必須):
+`preset`([`crates/atx-mcp/presets/`](crates/atx-mcp/presets) 同梱の名前付きレシピ)のどちらか一方を受ける(排他・どちらか必須):
 
 | セット | プリセット | 内容 |
 |---|---|---|
@@ -376,12 +400,26 @@ cargo clippy --workspace --all-targets -- -D warnings
 クレート構成: `atx-core`(レシピ・変換エンジン)/ `atx-geometry`(傾き検出)/
 `atx-store`(immutable アセットストア)/ `atx-mcp`(rmcp stdio サーバ)。
 
+ライブラリ 3 本は、crates.io では長い名前で公開している(crates.io の `atx-core` は
+無関係の別プロジェクトが先に取得しているため):
+
+| ディレクトリ | crates.io 公開名 | コード中のライブラリ名 |
+|---|---|---|
+| `crates/atx-core` | [`asset-transform-core`](https://crates.io/crates/asset-transform-core) | `atx_core` |
+| `crates/atx-geometry` | [`asset-transform-geometry`](https://crates.io/crates/asset-transform-geometry) | `atx_geometry` |
+| `crates/atx-store` | [`asset-transform-store`](https://crates.io/crates/asset-transform-store) | `atx_store` |
+| `crates/atx-mcp` | [`atx-mcp`](https://crates.io/crates/atx-mcp) | `atx_mcp`(バイナリは `atx-mcp`) |
+
+したがって変換エンジンをライブラリとして使うときは、依存に
+`asset-transform-core = "0.6.2"` と書き、コードでは `use atx_core::…` と書く。
+
 ## 名前の由来
 
 "atx" は **A**sset **T**ransform の略。末尾の `x` は "transform" の慣用的な
-省略記法(xform / tx)にならったもの。短くタイプしやすいバイナリ名・クレート
-接頭辞(`atx-core` など)として採用しており、PC の ATX 規格や Markdown の
-ATX 見出しとは関係ない。
+省略記法(xform / tx)にならったもの。短くタイプしやすいバイナリ名・ディレクトリ
+接頭辞(`crates/atx-core` など)として採用しており、PC の ATX 規格や Markdown の
+ATX 見出しとは関係ない。crates.io のパッケージ名は略さず綴っている
+(`asset-transform-core` など)。
 
 ## ライセンス
 

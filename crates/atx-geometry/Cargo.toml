@@ -1,8 +1,19 @@
 [package]
-name = "atx-geometry"
+# crates.io 公開名(命名の理由は Cargo.toml の workspace.dependencies のコメント参照)。
+# `[lib] name` は `atx_geometry` のまま。
+name = "asset-transform-geometry"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories = ["multimedia::images"]
+readme = "README.md"
+description = "Geometry detection for deterministic image transforms: scan tilt (Hough) and document quadrilateral detection. Part of the atx-mcp MCP server."
+
+[lib]
+name = "atx_geometry"
+path = "src/lib.rs"
 
 [dependencies]
 image.workspace = true

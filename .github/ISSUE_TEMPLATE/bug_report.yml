@@ -122,7 +122,7 @@ body:
       description: |
         If the bug needs a specific image, describe how to obtain or generate
         it. A fully synthetic fixture
-        (`cargo run -p atx-core --example gen_fixture`) is ideal. **Please do
+        (`cargo run -p asset-transform-core --example gen_fixture`) is ideal. **Please do
         not attach photos containing personal data** — check `has_gps` in the
         `inspect_image` output above before uploading anything.
     validations:

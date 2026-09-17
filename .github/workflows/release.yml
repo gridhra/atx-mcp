@@ -216,9 +216,206 @@ jobs:
           TAG: ${{ steps.meta.outputs.tag }}
         run: gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
 
+  # 配布経路(crates.io / ghcr.io / npm)へ出す前に、**版が書かれている全箇所**が
+  # タグと一致していることを 1 か所で確かめる。途中まで公開してから食い違いに
+  # 気づくと、crates.io は同じ版を取り消せない(yank しかできない)ため、
+  # 公開ジョブすべての手前に置く。
+  versions:
+    name: check versions
+    needs: release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.release.outputs.tag }}
+          persist-credentials: false
+
+      - name: Check every version field against the tag
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, tomllib
+
+          want = os.environ["VERSION"]
+          bad = []
+
+          def eq(label, got):
+              if got != want:
+                  bad.append(f"{label}: {got!r} != tag {want!r}")
+
+          # 1. Cargo.toml: workspace.package.version と、path 依存に付けた version
+          #    (crates.io への publish には path 依存にも version が必須で、
+          #     ここは版更新時に忘れやすい)。
+          with open("Cargo.toml", "rb") as f:
+              ws = tomllib.load(f)["workspace"]
+          eq("Cargo.toml workspace.package.version", ws["package"]["version"])
+          for name in ("atx-core", "atx-geometry", "atx-store"):
+              dep = ws["dependencies"][name]
+              eq(f"Cargo.toml workspace.dependencies.{name}.version", dep.get("version"))
+
+          # 2. server.json: サーバ本体の version と、**全 package**。
+          #    oci の package は version フィールドを持てない仕様なので
+          #    (レジストリのバリデータが拒否する)、identifier のタグを見る。
+          with open("server.json", "rb") as f:
+              server = json.load(f)
+          eq("server.json version", server["version"])
+
+          seen = set()
+          for pkg in server["packages"]:
+              rt = pkg["registryType"]
+              seen.add(rt)
+              if rt == "oci":
+                  if "version" in pkg or "registryBaseUrl" in pkg:
+                      bad.append("server.json oci package must not carry 'version'/'registryBaseUrl'")
+                  eq("server.json oci identifier tag", pkg["identifier"].rsplit(":", 1)[-1])
+              else:
+                  eq(f"server.json {rt} package version", pkg.get("version"))
+
+          missing = {"cargo", "oci", "npm"} - seen
+          if missing:
+              bad.append(f"server.json is missing packages for: {sorted(missing)}")
+
+          if bad:
+              for line in bad:
+                  print(f"::error::{line}")
+              sys.exit(1)
+          print(f"all version fields match {want}")
+          PY
+
+  cargo:
+    name: publish crates.io
+    needs: [release, versions]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write # OIDC: crates.io trusted publishing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.release.outputs.tag }}
+          persist-credentials: false
+
+      # `cargo publish` は同梱内容をその場でビルドして検証する。x86_64 では
+      # ravif -> rav1e が nasm を必要とするので、build ジョブと同じものを入れる。
+      - name: Install nasm
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+
+      # Auth: crates.io trusted publishing via GitHub OIDC — トークンも Secret も置かない。
+      # 各クレートの Trusted Publisher(owner gridhra / repo atx-mcp / workflow release.yml /
+      # environment 空)を crates.io 側で登録しておくことが所有権のゲートになるので、
+      # このジョブに Environment は付けない。**初回はこの登録が無いので必ず失敗する**:
+      # 所有者が手で publish してから登録する(手順は RELEASING.md)。
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+
+      # 依存順に publish する(geometry -> core -> store -> atx-mcp)。
+      # 途中で落ちた後の再実行に備え、既に同じ版が crates.io にあるものは飛ばす
+      # (npm ジョブの idempotency guard と同じ考え方)。
+      - name: Publish crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          for crate in asset-transform-geometry asset-transform-core asset-transform-store atx-mcp; do
+            code="$(curl --proto '=https' --tlsv1.2 -s -o /dev/null -w '%{http_code}' \
+              -A "atx-mcp release workflow (https://github.com/gridhra/atx-mcp)" \
+              "https://crates.io/api/v1/crates/$crate/$VERSION")"
+            if [ "$code" = "200" ]; then
+              echo "$crate@$VERSION already on crates.io, skipping"
+              continue
+            fi
+            echo "==> publishing $crate@$VERSION"
+            cargo publish -p "$crate" --locked
+          done
+
+  oci:
+    name: publish OCI image
+    needs: [release, versions]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write # ghcr.io への push
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.release.outputs.tag }}
+          persist-credentials: false
+
+      # 同じタグのイメージが既にあれば作り直さない(再実行耐性)。
+      - id: existing
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          ref="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/atx-mcp"
+          echo "image=$ref" >> "$GITHUB_OUTPUT"
+          token="$(curl --proto '=https' -fsSL "https://ghcr.io/token?scope=repository:${GITHUB_REPOSITORY_OWNER,,}/atx-mcp:pull&service=ghcr.io" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' || echo "")"
+          code="$(curl --proto '=https' -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" \
+            "https://ghcr.io/v2/${GITHUB_REPOSITORY_OWNER,,}/atx-mcp/manifests/$VERSION")"
+          if [ "$code" = "200" ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "$ref:$VERSION already exists, skipping build and push"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # イメージの中身は build ジョブが作った**静的リンクの musl バイナリ**そのもの。
+      # ここではコンパイルしないので QEMU も Rust ツールチェインも要らない。
+      - if: steps.existing.outputs.published != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: npmbin-linux-*
+          path: npmbins
+
+      # Dockerfile が期待する形(<context>/amd64/atx-mcp、<context>/arm64/atx-mcp)に並べる。
+      - name: Stage build context
+        if: steps.existing.outputs.published != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p oci-context/amd64 oci-context/arm64
+          cp npmbins/npmbin-linux-x64/atx-mcp oci-context/amd64/atx-mcp
+          cp npmbins/npmbin-linux-arm64/atx-mcp oci-context/arm64/atx-mcp
+          cp LICENSE Dockerfile oci-context/
+          chmod +x oci-context/amd64/atx-mcp oci-context/arm64/atx-mcp
+          ls -lR oci-context
+
+      - if: steps.existing.outputs.published != 'true'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - if: steps.existing.outputs.published != 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - if: steps.existing.outputs.published != 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: oci-context
+          file: oci-context/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          build-args: |
+            VERSION=${{ needs.release.outputs.version }}
+          tags: |
+            ${{ steps.existing.outputs.image }}:${{ needs.release.outputs.version }}
+            ${{ steps.existing.outputs.image }}:latest
+
   npm:
     name: publish npm packages
-    needs: release
+    needs: [release, versions]
     runs-on: ubuntu-24.04
     # 配備対象を v* タグに限定し、承認者の承認を待つ Environment。
     # npm の Trusted Publisher にも同じ Environment 名を登録する。
@@ -243,16 +440,6 @@ jobs:
       # latest ではなく版を固定する。
       - name: Update npm for trusted publishing
         run: npm install -g npm@11.19.1 && npm --version
-
-      # MCP 公式レジストリ用の server.json がタグと同じ版か、公開前に確かめる
-      # (途中まで公開してから食い違いに気づくのを避ける)。
-      - name: Check server.json version
-        env:
-          VERSION: ${{ needs.release.outputs.version }}
-        run: |
-          set -euo pipefail
-          test "$(node -p "require('./server.json').version")" = "$VERSION"
-          test "$(node -p "require('./server.json').packages[0].version")" = "$VERSION"
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -308,10 +495,26 @@ jobs:
             npm publish --provenance --access public npm/dist/atx-mcp
           fi
 
-      # MCP 公式レジストリへ server.json を公開する。レジストリは npm パッケージの mcpName で
-      # 所有権を検証するので npm 公開の後に置く(npm の反映遅れに備えて再試行する)。
-      # 認証は GitHub Actions OIDC(id-token: write)で、トークンを保存しない。
-      # mcp-publisher は Dependabot の対象外なので、版とチェックサムは手で更新する。
+  # MCP 公式レジストリへ server.json を公開する。レジストリは server.json の
+  # **全 package の実在と所有権**を検証する(crates.io のレンダリング済み README に
+  # `mcp-name:` 行、ghcr.io のイメージラベル、npm の package.json の `mcpName`)。
+  # したがって 3 経路すべての公開が成功した後にだけ走らせる。どれか 1 つでも
+  # 落ちたらレジストリには登録しない。
+  # 認証は GitHub Actions OIDC(id-token: write)で、トークンを保存しない。
+  # mcp-publisher は Dependabot の対象外なので、版とチェックサムは手で更新する。
+  registry:
+    name: publish to MCP Registry
+    needs: [release, cargo, oci, npm]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write # OIDC: mcp-publisher login github-oidc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.release.outputs.tag }}
+          persist-credentials: false
+
       - name: Publish to MCP Registry
         env:
           VERSION: ${{ needs.release.outputs.version }}

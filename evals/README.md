@@ -152,8 +152,8 @@ python3 evals/score.py --selftest
 
 ## 既知の制約
 
-- `t09_preset_use` はビルトインプリセット(`presets/` + `apply_transform` の `preset` 引数)を
-  前提にしている。プリセット機構は実装済みで、`presets/` には 30 本のプリセットが
+- `t09_preset_use` はビルトインプリセット(`crates/atx-mcp/presets/` + `apply_transform` の `preset` 引数)を
+  前提にしている。プリセット機構は実装済みで、`crates/atx-mcp/presets/` には 30 本のプリセットが
   同梱されている(docs/DESIGN.md §9.10)。このタスクは通常どおり green であることを期待する。
 - `t17_batch_export`(一括書き出し)は、ハーネスの制約から「3 枚の別画像を取り込む」形には
   できていない: `input_fixture` は1タスク1枚しか渡せず、`setup.seed_files` はテキストしか
