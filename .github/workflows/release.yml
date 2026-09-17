@@ -312,13 +312,38 @@ jobs:
       # environment 空)を crates.io 側で登録しておくことが所有権のゲートになるので、
       # このジョブに Environment は付けない。**初回はこの登録が無いので必ず失敗する**:
       # 所有者が手で publish してから登録する(手順は RELEASING.md)。
-      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      # 認証(Trusted Publishing)より**先に**、全クレートが既に crates.io にあるかを見る。
+      # 手動で publish 済みの版(初回や部分復旧)では認証自体を飛ばす。認証を先に置くと、
+      # Trusted Publisher 未登録のときに publish の必要が無くても job が落ち、依存する
+      # registry ジョブまで止まる(2026-09-18、v0.6.2 で発生)。
+      - id: pending
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          pending=0
+          for crate in asset-transform-geometry asset-transform-core asset-transform-store atx-mcp; do
+            code="$(curl --proto '=https' --tlsv1.2 -s -o /dev/null -w '%{http_code}' \
+              -A "atx-mcp release workflow (https://github.com/gridhra/atx-mcp)" \
+              "https://crates.io/api/v1/crates/$crate/$VERSION")"
+            if [ "$code" = "200" ]; then
+              echo "$crate@$VERSION already on crates.io"
+            else
+              echo "$crate@$VERSION not yet on crates.io (HTTP $code)"
+              pending=1
+            fi
+          done
+          echo "any=$pending" >> "$GITHUB_OUTPUT"
+
+      - if: steps.pending.outputs.any == '1'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
 
       # 依存順に publish する(geometry -> core -> store -> atx-mcp)。
       # 途中で落ちた後の再実行に備え、既に同じ版が crates.io にあるものは飛ばす
       # (npm ジョブの idempotency guard と同じ考え方)。
       - name: Publish crates in dependency order
+        if: steps.pending.outputs.any == '1'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
           VERSION: ${{ needs.release.outputs.version }}
