@@ -164,10 +164,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "atx-core"
-version = "0.6.1"
+name = "asset-transform-core"
+version = "0.6.2"
 dependencies = [
- "atx-geometry",
+ "asset-transform-geometry",
  "fast_image_resize",
  "hex",
  "image",
@@ -187,8 +187,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "atx-geometry"
-version = "0.6.1"
+name = "asset-transform-geometry"
+version = "0.6.2"
 dependencies = [
  "image",
  "imageproc",
@@ -200,13 +200,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "asset-transform-store"
+version = "0.6.2"
+dependencies = [
+ "asset-transform-core",
+ "hex",
+ "proptest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "time",
+ "ulid",
+]
+
+[[package]]
 name = "atx-mcp"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
- "atx-core",
- "atx-geometry",
- "atx-store",
+ "asset-transform-core",
+ "asset-transform-geometry",
+ "asset-transform-store",
  "base64",
  "clap",
  "hex",
@@ -221,23 +238,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "atx-store"
-version = "0.6.1"
-dependencies = [
- "atx-core",
- "hex",
- "proptest",
- "schemars",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "time",
- "ulid",
 ]
 
 [[package]]

@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/gridhra/atx-mcp"
@@ -16,9 +16,16 @@ keywords = ["mcp", "image", "transform", "deterministic", "assets"]
 categories = ["multimedia::images", "command-line-utilities"]
 
 [workspace.dependencies]
-atx-core = { path = "crates/atx-core" }
-atx-geometry = { path = "crates/atx-geometry" }
-atx-store = { path = "crates/atx-store" }
+# crates.io の公開名は `asset-transform-*`(atx = Asset Transform、リポジトリ名に沿う)。
+# `atx-core` は無関係の別プロジェクトが先に取得済みで使えず、`atx-mcp-*` は
+# これらが MCP に依存しないライブラリであることを誤って伝えるため採らなかった。
+# ディレクトリ名と `[lib] name`(= コード中の `atx_core` 等)は変えていないので、
+# `package = ` で公開名だけ読み替える。**版を上げるときは workspace.package.version と
+# ここの version、server.json の全 package の version を必ず同時に更新する**
+# (crates.io への publish には path 依存にも version が必須)。
+atx-core = { package = "asset-transform-core", path = "crates/atx-core", version = "0.6.2" }
+atx-geometry = { package = "asset-transform-geometry", path = "crates/atx-geometry", version = "0.6.2" }
+atx-store = { package = "asset-transform-store", path = "crates/atx-store", version = "0.6.2" }
 
 image = "0.25.10"
 imageproc = "0.27"
