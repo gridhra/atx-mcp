@@ -632,7 +632,7 @@ fn color_ops_are_deterministic() {
 /// フルパイプラインのゴールデン(curves + color_matrix + JPEG エンコード)。
 ///
 /// 合成フィクスチャ `tests/fixtures/synthetic_scene.jpg`
-/// (`cargo run -p atx-core --example gen_fixture` で再生成可能)に対して
+/// (`cargo run -p asset-transform-core --example gen_fixture` で再生成可能)に対して
 /// 出力 sha256 をピン留めする。engine.rs のゴールデンと同じ規律:
 /// **意図的にアルゴリズムを変えた場合のみ `ENGINE_VERSION` を上げた上で更新すること**。
 /// フィクスチャを作り直した場合もこの値の更新が必要。

@@ -57,34 +57,31 @@ atx 不做的事(生成式编辑、RAW 显影、基于机器学习的自动裁�
 
 ## 安装
 
-无需 Rust 工具链。可任选以下一种方式。
+atx-mcp 是无运行时依赖的单一二进制文件。任选其一。
 
-### 1. npx(最简单,推荐)
-
-只要有 Node.js 18+ 即可,无需其他依赖。适配当前平台的原生二进制文件会通过
-`optionalDependencies` 自动安装。
+### 1. cargo binstall(预编译二进制,无需编译)
 
 ```sh
-# --scope user 使其在所有项目中可用(省略则仅限当前项目)
-claude mcp add --scope user asset-transform -- npx -y atx-mcp --workspace /path/to/asset-workspace
+cargo binstall atx-mcp
+claude mcp add --scope user asset-transform -- atx-mcp --workspace /path/to/asset-workspace
 ```
 
-也可以直接写入 MCP 客户端的配置文件:
+[`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) 不做编译,而是直接下载
+本仓库 CI 构建的发布归档,因此对已有 Rust 工具链的用户这是最快的方式。
+(`--scope user` 使其在所有项目中可用;省略则仅限当前项目。)
 
-```json
-{
-  "mcpServers": {
-    "asset-transform": {
-      "command": "npx",
-      "args": ["-y", "atx-mcp", "--workspace", "/path/to/asset-workspace"]
-    }
-  }
-}
+### 2. cargo install(从源码构建)
+
+```sh
+cargo install atx-mcp
 ```
 
-### 2. 预编译二进制文件
+只要 Rust 工具链支持的平台都可以,包括没有预编译二进制的平台。还需要一个 C 编译器
+(libwebp 从随包源码构建)。
 
-安装脚本(默认安装位置为 `~/.local/bin`,Windows 上为
+### 3. 预编译二进制文件(无需 Rust 工具链)
+
+安装脚本(默认安装位置为 `~/.local/bin`,Windows 为
 `%LOCALAPPDATA%\Programs\atx-mcp`;解压前会用 SHA256SUMS 校验):
 
 ```sh
@@ -97,10 +94,10 @@ curl -fsSL https://raw.githubusercontent.com/gridhra/atx-mcp/main/scripts/instal
 irm https://raw.githubusercontent.com/gridhra/atx-mcp/main/scripts/install.ps1 | iex
 ```
 
-如需手动下载,可从 [Releases](https://github.com/gridhra/atx-mcp/releases) 获取
-`atx-mcp-<version>-<target>.tar.gz`(Windows 为 `.zip`)。提供以下目标平台:
+手动下载请从 [Releases](https://github.com/gridhra/atx-mcp/releases) 获取
+`atx-mcp-<version>-<target>.tar.gz`(Windows 为 `.zip`)。支持的目标:
 
-| 平台 | 目标三元组 (target triple) |
+| 平台 | 目标三元组 |
 |---|---|
 | macOS (Apple Silicon) | `aarch64-apple-darwin` |
 | macOS (Intel) | `x86_64-apple-darwin` |
@@ -112,19 +109,44 @@ irm https://raw.githubusercontent.com/gridhra/atx-mcp/main/scripts/install.ps1 |
 claude mcp add asset-transform -- ~/.local/bin/atx-mcp --workspace /path/to/asset-workspace
 ```
 
-### 3. 从源码构建(以上平台之外)
+### 4. Docker
 
-只需要 Rust 工具链和 C 编译器(用于构建随附源码的 libwebp)。
+`ghcr.io/gridhra/atx-mcp` 是 `FROM scratch` 镜像,除静态链接的二进制文件外不含其他内容
+(`linux/amd64` 与 `linux/arm64`)。
 
 ```sh
-cargo build --release
-# => target/release/atx-mcp
-claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /path/to/asset-workspace
+claude mcp add asset-transform -- \
+  docker run -i --rm -v "$PWD:/workspace" ghcr.io/gridhra/atx-mcp:0.6.2
+```
+
+两点须注意。**`-i` 是必需的**:服务器使用 MCP 的 stdio 传输,需要保持标准输入打开。
+**路径是容器内路径**:绑定挂载的目录在容器内显示为 `/workspace`,因此传给
+`import_asset` / `export_asset` 的不是宿主机路径,而是形如 `/workspace/photos/shot.jpg`。
+
+### 5. npx(Node.js 18+,无需安装)
+
+对应平台的预编译原生二进制会通过 `optionalDependencies` 自动引入。
+
+```sh
+claude mcp add --scope user asset-transform -- npx -y atx-mcp --workspace /path/to/asset-workspace
+```
+
+或直接写入 MCP 客户端配置:
+
+```json
+{
+  "mcpServers": {
+    "asset-transform": {
+      "command": "npx",
+      "args": ["-y", "atx-mcp", "--workspace", "/path/to/asset-workspace"]
+    }
+  }
+}
 ```
 
 ---
 
-`--workspace`(环境变量:`ATX_WORKSPACE`)是资产存储所在的目录,若不存在会自动创建。
+`--workspace`(env: `ATX_WORKSPACE`)是用作资产存储的目录。若不存在会自动创建。
 
 ## 工具(13 个)
 
@@ -308,7 +330,7 @@ atx 不加载任何系统字体(各机器安装的字体不同,会破坏逐字�
 会返回结构化错误)。规则可用 `explain_operation {"operation":"preset"}` 查询。
 
 `apply_transform` 与 `render_preview` 接受 `recipe`(原始 DSL)或
-`preset`(随包提供的具名配方,见 [`presets/`](presets))之一(二者互斥,且必须有其一):
+`preset`(随包提供的具名配方,见 [`crates/atx-mcp/presets/`](crates/atx-mcp/presets))之一(二者互斥,且必须有其一):
 
 | 分组 | 预设 | 作用 |
 |---|---|---|
@@ -369,11 +391,24 @@ cargo clippy --workspace --all-targets -- -D warnings
 crate 结构:`atx-core`(配方与变换引擎)/ `atx-geometry`(倾斜检测)/
 `atx-store`(不可变资产存储)/ `atx-mcp`(rmcp stdio 服务器)。
 
+三个库在 crates.io 上使用更长的名称发布,因为那里的 `atx-core` 是一个无关的项目:
+
+| 目录 | crates.io 发布名 | 代码中的库名 |
+|---|---|---|
+| `crates/atx-core` | [`asset-transform-core`](https://crates.io/crates/asset-transform-core) | `atx_core` |
+| `crates/atx-geometry` | [`asset-transform-geometry`](https://crates.io/crates/asset-transform-geometry) | `atx_geometry` |
+| `crates/atx-store` | [`asset-transform-store`](https://crates.io/crates/asset-transform-store) | `atx_store` |
+| `crates/atx-mcp` | [`atx-mcp`](https://crates.io/crates/atx-mcp) | `atx_mcp`(二进制为 `atx-mcp`) |
+
+因此,若要把变换引擎当作库使用,请在依赖中写 `asset-transform-core = "0.6.2"`,
+而在代码中仍写 `use atx_core::…`。
+
 ## 名称由来
 
 "atx" 是 **A**sset **T**ransform 的缩写;末尾的 `x` 沿用了 "transform" 的
-惯用简写(如 xform / tx)。选它是因为便于作为简短易输入的二进制名和 crate
-前缀(如 `atx-core`),与 PC 的 ATX 规格或 Markdown 的 ATX 风格标题并无关系。
+惯用简写(如 xform / tx)。选它是因为便于作为简短易输入的二进制名和目录
+前缀(如 `crates/atx-core`),与 PC 的 ATX 规格或 Markdown 的 ATX 风格标题并无关系。
+crates.io 上的包名则完整拼出(如 `asset-transform-core`)。
 
 ## 许可证
 

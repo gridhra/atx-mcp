@@ -6,11 +6,26 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+readme = "README.md"
 description = "Deterministic (non-generative) asset transformation MCP server: immutable, content-addressed image transforms for AI agents."
 
 [lib]
 name = "atx_mcp"
 path = "src/lib.rs"
+
+# `cargo binstall atx-mcp` が GitHub Release のビルド済みバイナリを取れるようにする
+# (ソースからのビルドを回避)。書式は release.yml が実際に作る成果物名に合わせてある:
+#   アーカイブ  atx-mcp-<version>-<target>.tar.gz(Windows は .zip)
+#   中身        atx-mcp-<version>-<target>/atx-mcp(Windows は atx-mcp.exe)
+# target は release.yml の matrix の 5 つ(aarch64-apple-darwin / x86_64-apple-darwin /
+# x86_64-unknown-linux-musl / aarch64-unknown-linux-musl / x86_64-pc-windows-msvc)。
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/atx-mcp-{ version }-{ target }{ archive-suffix }"
+bin-dir = "atx-mcp-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [[bin]]
 name = "atx-mcp"

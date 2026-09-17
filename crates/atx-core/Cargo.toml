@@ -1,8 +1,20 @@
 [package]
-name = "atx-core"
+# crates.io 公開名。`atx-core` は無関係の別プロジェクトが先に取得済みのため使えない。
+# `[lib] name` は `atx_core` のままなので、利用者は `asset-transform-core = "0.6.2"` と書いて
+# コードでは `use atx_core::…` と書く。
+name = "asset-transform-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories = ["multimedia::images"]
+readme = "README.md"
+description = "Deterministic, non-generative image transform engine: pure recipe DSL (crop, resize, rotate, tone, LUT, mask, layers) with byte-identical output. Core of the atx-mcp MCP server."
+
+[lib]
+name = "atx_core"
+path = "src/lib.rs"
 
 [dependencies]
 image.workspace = true

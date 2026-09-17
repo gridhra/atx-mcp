@@ -58,32 +58,33 @@ What atx doesn't do — generative editing, RAW development, ML-based auto-cropp
 
 ## Install
 
-No Rust toolchain required. Pick one of the following.
+atx-mcp is a single self-contained binary with no runtime dependencies. Pick
+one of the following.
 
-### 1. npx (easiest, recommended)
-
-Node.js 18+ is all you need. The prebuilt native binary for your platform is
-pulled in automatically via `optionalDependencies`.
+### 1. cargo binstall (prebuilt binary, no compilation)
 
 ```sh
-# --scope user makes it available in every project (omit for current-project only)
-claude mcp add --scope user asset-transform -- npx -y atx-mcp --workspace /path/to/asset-workspace
+cargo binstall atx-mcp
+claude mcp add --scope user asset-transform -- atx-mcp --workspace /path/to/asset-workspace
 ```
 
-Or add it directly to your MCP client config:
+[`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) downloads the
+release archive built by this repository's CI instead of compiling, so this is
+the fastest route for anyone who already has a Rust toolchain. (`--scope user`
+makes the server available in every project; omit it for the current project
+only.)
 
-```json
-{
-  "mcpServers": {
-    "asset-transform": {
-      "command": "npx",
-      "args": ["-y", "atx-mcp", "--workspace", "/path/to/asset-workspace"]
-    }
-  }
-}
+### 2. cargo install (builds from source)
+
+```sh
+cargo install atx-mcp
 ```
 
-### 2. Prebuilt binary
+Works on any platform a Rust toolchain supports, including ones without a
+prebuilt binary. Needs a C compiler as well (libwebp is built from its vendored
+source).
+
+### 3. Prebuilt binary (no Rust toolchain)
 
 Installer scripts (default install location is `~/.local/bin`, or
 `%LOCALAPPDATA%\Programs\atx-mcp` on Windows; the archive is verified against
@@ -115,15 +116,42 @@ Supported targets:
 claude mcp add asset-transform -- ~/.local/bin/atx-mcp --workspace /path/to/asset-workspace
 ```
 
-### 3. Build from source (any other platform)
+### 4. Docker
 
-All you need is a Rust toolchain and a C compiler (for building libwebp from
-its vendored source).
+`ghcr.io/gridhra/atx-mcp` is a `FROM scratch` image holding the statically
+linked binary and nothing else (`linux/amd64` and `linux/arm64`).
 
 ```sh
-cargo build --release
-# => target/release/atx-mcp
-claude mcp add asset-transform -- "$PWD/target/release/atx-mcp" --workspace /path/to/asset-workspace
+claude mcp add asset-transform -- \
+  docker run -i --rm -v "$PWD:/workspace" ghcr.io/gridhra/atx-mcp:0.6.2
+```
+
+Two things to keep in mind. **`-i` is required**: the server speaks the MCP
+stdio transport and needs stdin to stay open. And **paths are container
+paths**: the directory you bind-mount appears as `/workspace` inside the
+container, so `import_asset` and `export_asset` take paths like
+`/workspace/photos/shot.jpg`, not host paths.
+
+### 5. npx (Node.js 18+, nothing to install)
+
+The prebuilt native binary for your platform is pulled in automatically via
+`optionalDependencies`.
+
+```sh
+claude mcp add --scope user asset-transform -- npx -y atx-mcp --workspace /path/to/asset-workspace
+```
+
+Or add it directly to your MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "asset-transform": {
+      "command": "npx",
+      "args": ["-y", "atx-mcp", "--workspace", "/path/to/asset-workspace"]
+    }
+  }
+}
 ```
 
 ---
@@ -335,7 +363,7 @@ preset that carries `layers` cannot be inlined (that is a structured error).
 Call `explain_operation {"operation":"preset"}` for the rules.
 
 `apply_transform` and `render_preview` take either `recipe` (the raw DSL) or
-`preset` (a built-in named recipe from [`presets/`](presets)) — exactly one of
+`preset` (a built-in named recipe from [`crates/atx-mcp/presets/`](crates/atx-mcp/presets)) — exactly one of
 the two:
 
 | Set | Preset | What it does |
@@ -400,12 +428,27 @@ cargo clippy --workspace --all-targets -- -D warnings
 Crate layout: `atx-core` (recipe/transform engine) / `atx-geometry` (tilt
 detection) / `atx-store` (immutable asset store) / `atx-mcp` (rmcp stdio server).
 
+The three libraries are published on crates.io under longer names, because
+`atx-core` there is an unrelated project:
+
+| Directory | Published as | Library name in code |
+|---|---|---|
+| `crates/atx-core` | [`asset-transform-core`](https://crates.io/crates/asset-transform-core) | `atx_core` |
+| `crates/atx-geometry` | [`asset-transform-geometry`](https://crates.io/crates/asset-transform-geometry) | `atx_geometry` |
+| `crates/atx-store` | [`asset-transform-store`](https://crates.io/crates/asset-transform-store) | `atx_store` |
+| `crates/atx-mcp` | [`atx-mcp`](https://crates.io/crates/atx-mcp) | `atx_mcp` (binary `atx-mcp`) |
+
+So to use the transform engine as a library, depend on
+`asset-transform-core = "0.6.2"` and write `use atx_core::…`.
+
 ## Name
 
 "atx" stands for **A**sset **T**ransform; the trailing `x` follows the
 familiar shorthand for "transform" (as in xform / tx). It was chosen as a
-short, easy-to-type binary name and crate prefix (`atx-core`, etc.), and it
-has no relation to the PC ATX form factor or Markdown ATX-style headings.
+short, easy-to-type binary name and directory prefix (`crates/atx-core`,
+etc.), and it has no relation to the PC ATX form factor or Markdown ATX-style
+headings. The crates.io packages spell the name out in full
+(`asset-transform-core`, and so on).
 
 ## License
 

@@ -1,7 +1,7 @@
 //! 変換エンジンのテスト(DESIGN §6「ゴールデンテスト」「決定論」)。
 //!
 //! 写真らしい合成フィクスチャ `tests/fixtures/synthetic_scene.jpg`
-//! (`cargo run -p atx-core --example gen_fixture` で生成)と、
+//! (`cargo run -p asset-transform-core --example gen_fixture` で生成)と、
 //! テスト内で生成する小さな合成画像を併用する。
 
 use atx_core::recipe::TransformRecipe;
@@ -1159,7 +1159,7 @@ fn golden_full_pipeline_sha256() {
     assert_eq!(atx_core::ENGINE_VERSION, "atx-core/2");
     assert_eq!((out.width, out.height), (800, 450));
     // 出力ハッシュは合成フィクスチャ `tests/fixtures/synthetic_scene.jpg`
-    // (`cargo run -p atx-core --example gen_fixture` で再生成可能)に対してピン留めしている。
+    // (`cargo run -p asset-transform-core --example gen_fixture` で再生成可能)に対してピン留めしている。
     // フィクスチャを作り直した場合はこの値も必ず更新すること。
     //
     // 履歴: 以前は個人所有の実写フィクスチャに対する値
