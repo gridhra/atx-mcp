@@ -2,6 +2,7 @@
 
 [English](README.md) | **日本語** | [简体中文](README.zh-CN.md)
 
+[![atx-mcp MCP server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/gridhra/atx-mcp/badges/score.svg)](https://glama.ai/mcp/servers/gridhra/atx-mcp)
 [![Mentioned in Awesome MCP Servers](https://awesome.re/mentioned-badge.svg)](https://github.com/punkpeye/awesome-mcp-servers)
 
 汎用 AI エージェント向けの、決定論的(非生成)アセット変換 MCP サーバ。Rust 製。
