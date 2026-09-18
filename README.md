@@ -2,6 +2,7 @@
 
 **English** | [日本語](README.ja.md) | [简体中文](README.zh-CN.md)
 
+[![atx-mcp MCP server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/gridhra/atx-mcp/badges/score.svg)](https://glama.ai/mcp/servers/gridhra/atx-mcp)
 [![Mentioned in Awesome MCP Servers](https://awesome.re/mentioned-badge.svg)](https://github.com/punkpeye/awesome-mcp-servers)
 
 A deterministic (non-generative) asset transformation MCP server for general-purpose
