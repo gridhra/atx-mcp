@@ -53,7 +53,7 @@ resvg = { version = "0.48.1", default-features = false, features = ["text"] }
 # 選ぶ理由: ttf-parser はメンテ終了が宣言されており(RUSTSEC-2026-0192)、
 # cargo-deny の unmaintained ゲート(workspace 直接依存のみ対象)に触れる。
 # skrifa はその勧告自身が挙げる後継。
-skrifa = "0.44"
+skrifa = "0.47"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
