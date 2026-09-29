@@ -121,7 +121,7 @@ claude mcp add asset-transform -- ~/.local/bin/atx-mcp --workspace /path/to/asse
 
 ```sh
 claude mcp add asset-transform -- \
-  docker run -i --rm -v "$PWD:/workspace" ghcr.io/gridhra/atx-mcp:0.6.3
+  docker run -i --rm -v "$PWD:/workspace" ghcr.io/gridhra/atx-mcp:0.6.4
 ```
 
 注意が 2 つ。**`-i` は必須**(サーバは MCP の stdio トランスポートで話すため、標準入力を
@@ -416,7 +416,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | `crates/atx-mcp` | [`atx-mcp`](https://crates.io/crates/atx-mcp) | `atx_mcp`(バイナリは `atx-mcp`) |
 
 したがって変換エンジンをライブラリとして使うときは、依存に
-`asset-transform-core = "0.6.3"` と書き、コードでは `use atx_core::…` と書く。
+`asset-transform-core = "0.6.4"` と書き、コードでは `use atx_core::…` と書く。
 
 ## 名前の由来
 
