@@ -215,6 +215,21 @@ v0.9 で広げた守備範囲(画像を材料に仕事をするエージェン�
 - `inspect_image.include_exif` で EXIF 全量(既定出力は不変、オプトイン)
 - 含めない: OCR エンジン、ML 文字検出、PDF 入力(決定論的ラスタライズの純 Rust 実装が未成熟。需要待ち)、CJK フォント同梱
 
+### v0.11 — 写っていない領域の補完と、その周辺(実運用 FB、2026-09-29 追加)
+
+斜め撮影の紙をスキャン風に仕上げる作業で、atx-mcp だけでは完結できなかった実運用 FB への対応
+(詳細は DESIGN.md §9.18。「非生成」の線引きを 3 条件に言い直し、乱数を使わない補完を許容範囲に入れた)。
+op 数 29 → 30、ツール数 12 は不変。
+
+- op `pad`(上下左右の余白。一様色、ざらつき無し)
+- `perspective`: `output_size`(出力寸法の直接指定)、`fill: "extend"`(未撮影域を、接する帯の明るさの 2 次式 +
+  帯の残差の折り返し転写で埋める。`fill_report` と警告付き、比率上限 10%)
+- `inspect_image`: `regions` / `bands_outside_quad`(範囲ごとの中央値・平均・標準偏差・画素数)
+- `detect_document`: `allow_offscreen`(辺の直線当てはめで画面外の隅も返す)、`edge_fit` 残差、`inset_px`
+- `render_preview`: overlay `quad`(四隅の線 + 2×2 の隅拡大)、overlay `document`(紙判定画素の可視化)
+- eval t19 + 合成フィクスチャ `mounted_sheet_oblique.jpg`
+- 含めない: 画素画像の位置指定合成(`pad` で足りる)、縦横比の推定、PatchMatch 等の模様合成、補完マスクの revision 出力
+
 ### v0.8+ — 入出力の翼(Phase E、需要駆動)
 
 RAW(rawler)→ レンズ補正(lensfun DB)→ PSD 読み → resvg 焼き込み → LUT 書き出し。
