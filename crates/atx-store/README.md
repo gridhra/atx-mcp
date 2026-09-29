@@ -10,6 +10,6 @@ recipe hash)` pair returns the existing result instead of recomputing it. Part
 of the [atx-mcp](https://github.com/gridhra/atx-mcp) MCP server.
 
 > The crate is published as **`asset-transform-store`**, but its library target is
-> `atx_store`: depend on `asset-transform-store = "0.6.2"` and write `use atx_store::…`.
+> `atx_store`: depend on `asset-transform-store = "0.6.3"` and write `use atx_store::…`.
 
 MIT licensed.
