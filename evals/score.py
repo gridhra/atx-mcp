@@ -137,6 +137,16 @@ def _eval_expect_revision(spec: dict[str, Any], ledger: list[dict[str, Any]]) ->
             continue
         if "height" in spec and rev.get("height") != spec["height"]:
             continue
+        # 寸法の範囲指定(境界を含む)。「元の半分より狭く、紙 1 枚より広い」のように
+        # 正確な値を決め打てないが範囲で証拠になるケース用(t18)。
+        if "width_min" in spec and rev.get("width", 0) < spec["width_min"]:
+            continue
+        if "width_max" in spec and rev.get("width", 0) > spec["width_max"]:
+            continue
+        if "height_min" in spec and rev.get("height", 0) < spec["height_min"]:
+            continue
+        if "height_max" in spec and rev.get("height", 0) > spec["height_max"]:
+            continue
         if "aspect_ratio" in spec and not aspect_ratio_matches(
             rev.get("width", 0), rev.get("height", 0), spec["aspect_ratio"]
         ):
@@ -672,6 +682,42 @@ def run_selftests() -> None:
     ]
     ok, _ = evaluate(criteria_layers, ledger_layers_wrong_mode)
     assert not ok, "expected fail when recipe text does not contain 'screen'"
+
+    # --- width_min / width_max / height_min / height_max (t18 相当: 範囲指定、境界を含む) ---
+    criteria_range = {
+        "expect_revision": {
+            "recipe_contains_ops": ["crop"],
+            "width_min": 775,
+            "width_max": 999,
+            "height_min": 1090,
+            "height_max": 1399,
+            "min_matches": 2,
+        }
+    }
+    crop_ops = [{"op": "crop", "rect": {"x": 0, "y": 0, "width": 1000, "height": 1400}}, {"op": "trim"}]
+    ledger_range_ok = [
+        _mk_import(),
+        _mk_derived("rev_range01", "rev_import01", 968, 1286, "image/jpeg", crop_ops),
+        _mk_derived("rev_range02", "rev_import01", 775, 1399, "image/jpeg", crop_ops),  # 境界値
+    ]
+    ok, detail = evaluate(criteria_range, ledger_range_ok)
+    assert ok, f"expected pass for 2 revisions inside the size range: {detail}"
+    # 1 枚が半分のまま(幅 1000 = 縁を落としていない)だと min_matches 2 に届かず fail。
+    ledger_range_bad = [
+        _mk_import(),
+        _mk_derived("rev_range03", "rev_import01", 968, 1286, "image/jpeg", crop_ops),
+        _mk_derived("rev_range04", "rev_import01", 1000, 1400, "image/jpeg", crop_ops),
+    ]
+    ok, _ = evaluate(criteria_range, ledger_range_bad)
+    assert not ok, "expected fail when the second revision is still the untrimmed half"
+    # 紙ぴったり(幅 767 < width_min)= 縁を残していないので fail。
+    ledger_range_tight = [
+        _mk_import(),
+        _mk_derived("rev_range05", "rev_import01", 968, 1286, "image/jpeg", crop_ops),
+        _mk_derived("rev_range06", "rev_import01", 767, 1085, "image/jpeg", crop_ops),
+    ]
+    ok, _ = evaluate(criteria_range, ledger_range_tight)
+    assert not ok, "expected fail when a revision is trimmed tight to the sheet (no border kept)"
 
     # --- aspect_ratio tolerance ---
     assert aspect_ratio_matches(1600, 900, "16:9")

@@ -2819,13 +2819,31 @@ impl AtxTools {
     /// `apply_transform` と同等の画素処理コストがかかる。
     /// 代わりに「プレビューで見た構図 = 本適用の構図」が厳密に一致する。
     pub fn render_preview(&self, params: &RenderPreviewParams) -> CallToolResult {
-        let (recipe, expansions) =
+        // 「見るだけ」を許す(2026-09-25): recipe も preset も無ければ空レシピとして扱い、
+        // 元画像の縮小プレビュー(+ overlay)を返す。格子オーバレイで crop の座標を
+        // 読みたいだけのときに、無意味な encode を足す往復を無くすため。
+        // apply_transform は従来どおり空レシピを拒否する(revision を作らないプレビュー
+        // だけの緩和。プレビュー用レシピは末尾に resize + encode が足されるので、
+        // エンジン側の validate は通る)。
+        let (recipe, expansions) = if params.recipe.is_none() && params.preset.is_none() {
+            (
+                TransformRecipe {
+                    operations: Vec::new(),
+                    layers: None,
+                },
+                PresetExpansions::default(),
+            )
+        } else {
             match resolve_recipe(params.recipe.as_ref(), params.preset.as_deref()) {
                 Ok(resolved) => resolved,
                 Err(result) => return result,
-            };
-        if let Err(e) = atx_core::recipe::validate(&recipe) {
-            return expansions.annotate(atx_error(e));
+            }
+        };
+        let is_view_only = recipe.operations.is_empty() && recipe.layers.is_none();
+        if !is_view_only {
+            if let Err(e) = atx_core::recipe::validate(&recipe) {
+                return expansions.annotate(atx_error(e));
+            }
         }
         if let Some(overlay) = params.overlay.as_deref() {
             if !OVERLAY_VALUES.contains(&overlay) {

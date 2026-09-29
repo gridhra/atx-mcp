@@ -1,5 +1,5 @@
 #!/bin/sh
-# evals/run.sh — 10 タスクを実際の claude CLI(headless, --print)で MCP 経由に実行し、
+# evals/run.sh — evals/tasks の全タスクを実際の claude CLI(headless, --print)で MCP 経由に実行し、
 # 各タスクの成果を evals/score.py で採点、evals/results/<timestamp>.json にまとめる。
 #
 # ⚠️ 課金注意: --dry-run を付けない実行は毎回 Claude の実トークンを消費する。

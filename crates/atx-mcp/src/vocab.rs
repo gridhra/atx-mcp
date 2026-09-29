@@ -174,9 +174,11 @@ pub const OPERATIONS: &[OpDoc] = &[
         examples: &[
             r#"{"op": "crop", "aspect_ratio": "16:9", "anchor": "center"}"#,
             r#"{"op": "crop", "rect": {"x": 120, "y": 80, "width": 1600, "height": 900}, "coordinate_space": "source"}"#,
+            r#"{"op": "crop", "rect": {"x": 0, "y": 0, "width": 2000, "height": 2800}}"#,
         ],
         warnings: &[
             "aspect_ratio and rect are mutually exclusive and one of them is required.",
+            "To SPLIT one image into several files (two sheets on one mount, a scanned spread, several prints on a table) there is no split op: run one apply_transform per piece against the same source revision, each with its own crop.rect (the left/right half is often enough) followed by trim to snap to the piece's edges, then export all of them with export_asset revision_ids. Use render_preview with no recipe and overlay=\"grid\" to read the coordinates first.",
             "coordinate_space=\"source\" is only valid together with rect. After a rotate/perspective, the four mapped corners are replaced by their AXIS-ALIGNED BOUNDING BOX, so the crop is slightly larger than the tilted quad you drew.",
             "A source-space rect is rounded half-away-from-zero and clamped to the current image; clamping is reported in warnings, and an empty intersection is a structured error.",
         ],
@@ -1050,13 +1052,22 @@ pub const OPERATIONS: &[OpDoc] = &[
                 requirement: "default: 0",
                 semantics: "Margin in pixels to keep outside the content's bounding box, clamped to the image edges. Use a small value (4-16) so glyphs on the outer edge are not shaved.",
             },
+            ParamDoc {
+                name: "min_content_px",
+                type_hint: "u32 >= 1",
+                requirement: "default: 1",
+                semantics: "How many non-background pixels a row (or column) must contain before it counts as content. The default 1 means a single stray pixel is enough to pin the bounding box to it; raise it (e.g. 16-64) so scattered noise, paper texture or dust is ignored while any real content edge - which spans many pixels - still counts. Rows and columns are re-counted against each other until stable, so trim with padding 0 stays idempotent.",
+            },
         ],
         examples: &[
             r#"{"op": "trim"}"#,
             r###"{"op": "trim", "tolerance": 8, "background": "#ffffff", "padding": 8}"###,
+            r###"{"op": "trim", "tolerance": 64, "background": "#697b55", "min_content_px": 32, "padding": 24}"###,
         ],
         warnings: &[
             "Trim BEFORE resize when the goal is reading text: a reader downsamples the image to a fixed budget, so removing margin first spends those pixels on the glyphs instead of the paper.",
+            "Scanned paper mounts and textured or noisy backgrounds: the default tolerance 16 sees the texture as content and trims nothing (warning \"nothing was trimmed\"). Raise tolerance (64-96), set background explicitly to the mount color, and use min_content_px (e.g. 32) so a handful of stray pixels do not pin the box to the frame edge. Check the output dimensions against the input.",
+            "If the content already touches all four edges (or the stray pixels do), trim is a no-op and reports \"nothing was trimmed\" in warnings; that is the cue to adjust tolerance / background / min_content_px.",
             "If every pixel counts as background (a blank or entirely uniform image), trim is a no-op and reports \"no content found, image left unchanged\" in warnings rather than producing an empty image.",
             "On an image with alpha, a pixel whose alpha is <= tolerance counts as background whatever its RGB is (fully transparent pixels often carry junk color).",
             "A geometric op, so there is no mask param. Like crop, it shifts the coordinate system: a later crop with coordinate_space=\"source\" is mapped through the trim automatically.",

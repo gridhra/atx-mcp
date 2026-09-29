@@ -5,6 +5,8 @@
 //! - `tests/fixtures/synthetic_document.png` … 白い用紙 + 単語状バー + 一様な灰色余白
 //! - `evals/fixtures/document_photo.jpg` … 上の用紙を暗い机に置き、キーストーンで歪めた「写真」
 //! - `evals/fixtures/dark_ui_screenshot.png` … ダークモード UI のスクリーンショット風合成
+//! - `evals/fixtures/two_sheets_on_mount.jpg` … 緑の台紙に白い紙 2 枚を並べたスキャン風合成
+//!   (織り目ノイズ + 散在する外れ値画素。`trim` の許容差選びを試す eval t18 用)
 //!
 //! ```sh
 //! cargo run -p asset-transform-core --example gen_fixture
@@ -417,6 +419,8 @@ fn main() {
     gen_synthetic_document();
     gen_document_photo();
     gen_dark_ui_screenshot();
+    // 台紙の上の紙 2 枚(eval t18)。既存フィクスチャのバイト列には触れない。
+    gen_two_sheets_on_mount();
 }
 
 /// `evals/fixtures/tilted_scene.jpg` を生成する。
@@ -907,4 +911,301 @@ fn gen_dark_ui_screenshot() {
     let path = repo_path("evals/fixtures/dark_ui_screenshot.png");
     std::fs::write(&path, &first).expect("write dark_ui_screenshot.png");
     println!("wrote {} (1280x800, {} bytes)", path.display(), first.len());
+}
+
+// ===========================================================================
+// 台紙の上に紙 2 枚(eval t18_split_two_sheets)のフィクスチャ
+// ===========================================================================
+//
+// 実運用の事例(色付き台紙に白い紙が左右 2 枚並んだスキャン)を模す。
+// 実写はリポジトリに入れられないので完全合成で再現する。再現すべき性質は 3 つ:
+//
+// 1. 台紙は一様な色ではなく**織り目ノイズ**を持ち、さらに **0.3% ほどの画素が
+//    基調色から Chebyshev 距離 50〜80 離れた暗い/明るい点**として散在する
+//    (実写では `trim` の tolerance 48 で約 0.3% の画素が背景外になり、外れ値に
+//    引っかかって余白が落ちなかった。tolerance を上げると落ちる)。
+// 2. 紙はわずかに(0.3°〜0.5°)傾いている(検出器の再現に必要)。
+// 3. 紙の内側には文字ではなく単純な図形(暗い矩形 + 明るい円 + 高彩度の小さな円)だけを描く。
+//
+// 台紙の外周・紙の間の隙間は広めにしてある。左右半分に切ってから
+// `trim` に padding 100 を与えても隙間の中央線に届かない(= 幅が半分未満に収まる)
+// ようにするため(padding < 隙間/2 が条件。隙間 220 なら padding 109 まで)。
+
+/// 全体寸法。
+const SHEETS_W: u32 = 2000;
+const SHEETS_H: u32 = 1400;
+/// 台紙の基調色 `#697b55`。
+const MOUNT: [f32; 3] = [105.0, 123.0, 85.0];
+const MOUNT_HEX: &str = "#697b55";
+/// 紙 1 枚の寸法(傾ける前)。比率 ≈ 0.70。
+const SHEET_W: f64 = 760.0;
+const SHEET_H: f64 = 1080.0;
+/// 外周の台紙幅(左右 / 上下)と紙の間の隙間。130 + 760 + 220 + 760 + 130 = 2000。
+const SHEET_MARGIN_X: f64 = 130.0;
+const SHEET_MARGIN_Y: f64 = 160.0;
+const SHEET_GAP: f64 = 220.0;
+/// 左右それぞれの傾き(度、正 = 時計回り)。
+const SHEET_TILT_LEFT_DEG: f64 = 0.4;
+const SHEET_TILT_RIGHT_DEG: f64 = -0.35;
+/// 散在する外れ値画素の比率と、基調色からの距離の範囲(Chebyshev)。
+const SPECK_RATIO: f64 = 0.0015;
+const SPECK_MIN: u32 = 50;
+const SPECK_MAX: u32 = 80;
+
+/// 傾いた紙 1 枚(中心座標・傾き)。
+struct Sheet {
+    cx: f64,
+    cy: f64,
+    tilt_deg: f64,
+}
+
+impl Sheet {
+    /// 画像座標 (x, y) を紙のローカル座標(左上原点、傾きを戻したもの)へ写す。
+    /// 紙の外なら None。
+    fn local(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let (s, c) = self.tilt_deg.to_radians().sin_cos();
+        let (dx, dy) = (x - self.cx, y - self.cy);
+        // 時計回り tilt で描いた紙を戻すので、逆回転(反時計回り)を掛ける。
+        let u = c * dx + s * dy;
+        let v = -s * dx + c * dy;
+        if u.abs() <= SHEET_W / 2.0 && v.abs() <= SHEET_H / 2.0 {
+            Some((u + SHEET_W / 2.0, v + SHEET_H / 2.0))
+        } else {
+            None
+        }
+    }
+
+    /// 傾いた紙の軸平行外接矩形 (x0, y0, x1, y1)。
+    fn bbox(&self) -> (f64, f64, f64, f64) {
+        let (s, c) = self.tilt_deg.to_radians().sin_cos();
+        let hw = (SHEET_W / 2.0 * c).abs() + (SHEET_H / 2.0 * s).abs();
+        let hh = (SHEET_W / 2.0 * s).abs() + (SHEET_H / 2.0 * c).abs();
+        (self.cx - hw, self.cy - hh, self.cx + hw, self.cy + hh)
+    }
+}
+
+fn two_sheets() -> [Sheet; 2] {
+    let cy = SHEET_MARGIN_Y + SHEET_H / 2.0;
+    [
+        Sheet {
+            cx: SHEET_MARGIN_X + SHEET_W / 2.0,
+            cy,
+            tilt_deg: SHEET_TILT_LEFT_DEG,
+        },
+        Sheet {
+            cx: SHEET_MARGIN_X + SHEET_W + SHEET_GAP + SHEET_W / 2.0,
+            cy,
+            tilt_deg: SHEET_TILT_RIGHT_DEG,
+        },
+    ]
+}
+
+/// 紙の中身(ローカル座標 u, v)。暗い矩形 + 明るい円 + 高彩度の小さな円。文字は描かない。
+fn sheet_content(u: f64, v: f64, rng_noise: f32) -> [f32; 3] {
+    let inside_circle = |cx: f64, cy: f64, r: f64| (u - cx).powi(2) + (v - cy).powi(2) <= r * r;
+    if inside_circle(SHEET_W / 2.0, 860.0, 110.0) {
+        // 高彩度の小さな円。中心に紙色の小さな穴を空けて輪郭を作る。
+        if inside_circle(SHEET_W / 2.0, 860.0, 78.0) && !inside_circle(SHEET_W / 2.0, 860.0, 52.0) {
+            return [236.0, 226.0, 214.0];
+        }
+        return [190.0, 42.0, 44.0];
+    }
+    if (80.0..=680.0).contains(&u) && (120.0..=640.0).contains(&v) {
+        if inside_circle(500.0, 260.0, 70.0) {
+            return [240.0, 232.0, 190.0];
+        }
+        return [24.0, 30.0, 58.0];
+    }
+    let n = rng_noise * 3.0;
+    [PAPER[0] + n, PAPER[1] + n, PAPER[2] + n]
+}
+
+fn draw_two_sheets_on_mount() -> Canvas {
+    let mut canvas = Canvas::new(SHEETS_W, SHEETS_H, MOUNT);
+    let mut rng = Lcg(0x5EE7_5000);
+    let sheets = two_sheets();
+
+    // 台紙: 織り目(低周波のムラ ±6)+ 粒状ノイズ(±14)。合わせて Chebyshev ±20 以内。
+    // 紙: 上の内容関数で塗る。
+    for y in 0..SHEETS_H {
+        for x in 0..SHEETS_W {
+            let (fx, fy) = (x as f64 + 0.5, y as f64 + 0.5);
+            let n = rng.noise();
+            let px = if let Some((u, v)) = sheets.iter().find_map(|s| s.local(fx, fy)) {
+                sheet_content(u, v, n)
+            } else {
+                let weave = ((fx * 0.35).sin() * (fy * 0.29).cos()) as f32 * 6.0;
+                let mut c = MOUNT;
+                for ch in c.iter_mut() {
+                    *ch += weave + rng.noise() * 14.0;
+                }
+                c
+            };
+            canvas.buf[(y * SHEETS_W + x) as usize] = px;
+        }
+    }
+
+    // 散在する外れ値(暗い/明るい点)。2x2 の粒にして JPEG 圧縮で潰れないようにする。
+    // 紙の上には置かない。個数は台紙全体の SPECK_RATIO に相当する画素数 / 4
+    // (JPEG のリンギングで粒の周囲にも距離 50 超の画素が生まれ、復号後の比率は
+    //  配置比率の約 2 倍になる。実測は生成時に表示・assert する)。
+    let count = (SPECK_RATIO * (SHEETS_W * SHEETS_H) as f64 / 4.0).round() as u32;
+    let mut placed = 0u32;
+    while placed < count {
+        let x = (rng.next_u32() % (SHEETS_W - 1)) as i64;
+        let y = (rng.next_u32() % (SHEETS_H - 1)) as i64;
+        let magnitude = (SPECK_MIN + rng.next_u32() % (SPECK_MAX - SPECK_MIN + 1)) as f32;
+        let sign = if rng.next_u32() & 1 == 0 { -1.0 } else { 1.0 };
+        let on_sheet = sheets
+            .iter()
+            .any(|s| s.local(x as f64 + 1.0, y as f64 + 1.0).is_some());
+        if on_sheet {
+            continue;
+        }
+        let c = [
+            MOUNT[0] + sign * magnitude,
+            MOUNT[1] + sign * magnitude,
+            MOUNT[2] + sign * magnitude,
+        ];
+        canvas.rect(x, y, 2, 2, c);
+        placed += 1;
+    }
+    canvas
+}
+
+/// 生成した JPEG を復号し、台紙領域(紙の外接矩形から 8px 以上離れた画素)について
+/// 基調色からの Chebyshev 距離の分布を測る。戻り値: (±20 以内の割合, 50 以上の割合)。
+fn measure_mount_noise(img: &image::RgbImage, sheets: &[Sheet; 2]) -> (f64, f64) {
+    let (mut total, mut within20, mut over50) = (0u64, 0u64, 0u64);
+    for (x, y, p) in img.enumerate_pixels() {
+        let (fx, fy) = (x as f64 + 0.5, y as f64 + 0.5);
+        let near_sheet = sheets.iter().any(|s| {
+            let (x0, y0, x1, y1) = s.bbox();
+            fx >= x0 - 8.0 && fx <= x1 + 8.0 && fy >= y0 - 8.0 && fy <= y1 + 8.0
+        });
+        if near_sheet {
+            continue;
+        }
+        let d = (0..3)
+            .map(|c| (p[c] as f32 - MOUNT[c]).abs() as u32)
+            .max()
+            .unwrap();
+        total += 1;
+        if d <= 20 {
+            within20 += 1;
+        }
+        if d >= 50 {
+            over50 += 1;
+        }
+    }
+    (within20 as f64 / total as f64, over50 as f64 / total as f64)
+}
+
+/// `two_sheets_on_mount.jpg` の左半分を切り出して `trim` を掛けたときの出力寸法。
+fn trim_left_half(jpeg: &[u8], tolerance: u8, padding: u32) -> (u32, u32) {
+    let recipe = TransformRecipe {
+        layers: None,
+        operations: vec![
+            Operation::Crop {
+                aspect_ratio: None,
+                rect: Some(atx_core::recipe::Rect {
+                    x: 0,
+                    y: 0,
+                    width: SHEETS_W / 2,
+                    height: SHEETS_H,
+                }),
+                anchor: Default::default(),
+                mode: Default::default(),
+                pad_color: None,
+                coordinate_space: Default::default(),
+            },
+            Operation::Trim {
+                tolerance,
+                background: Some(MOUNT_HEX.to_string()),
+                padding,
+                // 1 = 従来の「1 画素でもあれば内容」。外れ値で trim が止まる現象を
+                // 再現する自己検証なので、外れ値を無視する新機能はここでは使わない。
+                min_content_px: 1,
+            },
+            Operation::Encode {
+                format: OutputFormat::Jpeg,
+                quality: Some(QUALITY),
+                bit_depth: None,
+            },
+        ],
+    };
+    let out = atx_core::apply_recipe(jpeg, &recipe, &Limits::default())
+        .expect("apply_recipe(crop + trim) on two_sheets_on_mount.jpg");
+    (out.width, out.height)
+}
+
+/// `evals/fixtures/two_sheets_on_mount.jpg` を生成する。
+///
+/// 自己検証(実写で起きた「外れ値で trim が止まる」現象がこの合成でも起きること):
+/// - 台紙のノイズ分布: ±20 以内が 90% 以上、距離 50 以上が 0.1%〜1.0%
+/// - 左半分を tolerance 48 / padding 0 で trim → 外れ値に阻まれてほぼ落ちない(幅 ≥ 990)
+/// - 左半分を tolerance 96 / padding 100 で trim → 紙 + 縁に収まる(幅 < 1000、紙より広い)
+fn gen_two_sheets_on_mount() {
+    let first = encode_jpeg_sized(&draw_two_sheets_on_mount().to_rgb(), QUALITY);
+    let second = encode_jpeg_sized(&draw_two_sheets_on_mount().to_rgb(), QUALITY);
+    assert_eq!(
+        first, second,
+        "two_sheets_on_mount.jpg generation must be byte-for-byte deterministic"
+    );
+    assert!(
+        !first.windows(6).any(|w| w == b"Exif\x00\x00"),
+        "two_sheets_on_mount.jpg must never carry an EXIF segment"
+    );
+
+    let sheets = two_sheets();
+    let decoded = image::load_from_memory(&first)
+        .expect("decode generated two_sheets_on_mount.jpg")
+        .to_rgb8();
+    let (within20, over50) = measure_mount_noise(&decoded, &sheets);
+    println!(
+        "two_sheets_on_mount.jpg: mount noise (after JPEG decode) within ±20: {:.2}%, ≥50: {:.3}%",
+        within20 * 100.0,
+        over50 * 100.0
+    );
+    assert!(
+        within20 >= 0.90,
+        "mount noise too strong: within ±20 = {within20:.4}"
+    );
+    assert!(
+        (0.001..=0.010).contains(&over50),
+        "speck ratio out of range: ≥50 = {over50:.5} (want 0.1%..1.0%)"
+    );
+
+    let sheet_bbox_w = {
+        let (x0, _, x1, _) = sheets[0].bbox();
+        x1 - x0
+    };
+    let (w48, h48) = trim_left_half(&first, 48, 0);
+    let (w96, h96) = trim_left_half(&first, 96, 100);
+    println!(
+        "two_sheets_on_mount.jpg: left half trim tolerance=48 padding=0 -> {w48}x{h48}; tolerance=96 padding=100 -> {w96}x{h96} (sheet bbox width {sheet_bbox_w:.1})"
+    );
+    assert!(
+        w48 >= SHEETS_W / 2 - 10 && h48 >= SHEETS_H - 10,
+        "tolerance 48 should be defeated by the specks (got {w48}x{h48})"
+    );
+    assert!(
+        (w96 as f64) > sheet_bbox_w && w96 < SHEETS_W / 2 && h96 < SHEETS_H,
+        "tolerance 96 / padding 100 should keep the sheet plus a border (got {w96}x{h96})"
+    );
+    for (i, s) in sheets.iter().enumerate() {
+        let (x0, y0, x1, y1) = s.bbox();
+        println!(
+            "two_sheets_on_mount.jpg: sheet {i} center=({:.0},{:.0}) tilt={:+.2}° bbox=({x0:.1},{y0:.1})-({x1:.1},{y1:.1})",
+            s.cx, s.cy, s.tilt_deg
+        );
+    }
+
+    let path = repo_path("evals/fixtures/two_sheets_on_mount.jpg");
+    std::fs::write(&path, &first).expect("write two_sheets_on_mount.jpg");
+    println!(
+        "wrote {} ({SHEETS_W}x{SHEETS_H}, {} bytes)",
+        path.display(),
+        first.len()
+    );
 }
