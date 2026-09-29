@@ -92,6 +92,18 @@ pub enum Operation {
         /// 内容の外接矩形の外側に残す余白 [px](0..=4096、画像端でクランプ)。
         #[serde(default, skip_serializing_if = "is_zero_u32")]
         padding: u32,
+        /// 行(または列)を「内容を含む」と数えるのに必要な、その行(列)内の
+        /// 背景外画素の数(1 以上)。既定 1 = 1 画素でもあれば内容(従来どおり)。
+        ///
+        /// 台紙の織り目や JPEG ノイズのような**散在する外れ値**が外接矩形を
+        /// 画像の縁まで引っ張るのを防ぐ。行と列の判定を交互に繰り返して
+        /// 不動点を取るので、`padding: 0` の trim は冪等のまま。
+        /// 既定値は正規化 JSON に現れない(既存レシピの `recipe_hash` は不変)。
+        #[serde(
+            default = "default_trim_min_content_px",
+            skip_serializing_if = "is_default_trim_min_content_px"
+        )]
+        min_content_px: u32,
     },
     /// リサイズ。width/height の少なくとも一方を指定。
     Resize {
@@ -759,6 +771,15 @@ fn is_default_trim_tolerance(v: &u8) -> bool {
     *v == default_trim_tolerance()
 }
 
+/// `trim.min_content_px` の既定値(1 = 従来の「1 画素でもあれば内容」)。
+pub(crate) fn default_trim_min_content_px() -> u32 {
+    1
+}
+
+fn is_default_trim_min_content_px(v: &u32) -> bool {
+    *v == default_trim_min_content_px()
+}
+
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
@@ -1209,8 +1230,9 @@ fn validate_operations(operations: &[Operation]) -> crate::Result<()> {
             Operation::Trim {
                 background,
                 padding,
+                min_content_px,
                 ..
-            } => crate::ops::trim::validate(index, background, *padding)?,
+            } => crate::ops::trim::validate(index, background, *padding, *min_content_px)?,
             Operation::Threshold {
                 method,
                 value,

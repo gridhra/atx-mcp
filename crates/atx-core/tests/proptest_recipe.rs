@@ -188,6 +188,7 @@ fn arb_op_no_encode() -> impl Strategy<Value = Operation> {
                 tolerance,
                 background,
                 padding,
+                min_content_px: 1,
             }
         ),
         arb_valid_threshold(),
@@ -354,6 +355,7 @@ fn arb_any_op() -> impl Strategy<Value = Operation> {
                 tolerance,
                 background,
                 padding,
+                min_content_px: 1,
             }),
         (
             arb_threshold_method(),
