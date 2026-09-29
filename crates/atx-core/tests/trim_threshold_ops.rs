@@ -185,6 +185,141 @@ fn trim_is_deterministic() {
     assert_eq!(apply(&png, json).bytes, apply(&png, json).bytes);
 }
 
+/// 内容が画像の縁まで達していて何も切れなかったとき、英語の警告を 1 行積む
+/// (エージェントが寸法を見比べなくても気づけるように)。
+///
+/// 四隅の外側 1 画素だけを内容色にした白背景の画像: 内容の外接矩形 = 画像全体。
+#[test]
+fn trim_warns_when_nothing_was_trimmed() {
+    let mut img = RgbaImage::from_pixel(20, 14, Rgba(WHITE));
+    for (x, y) in [(0, 0), (19, 0), (0, 13), (19, 13)] {
+        img.put_pixel(x, y, Rgba(BLACK));
+    }
+    let out = apply(
+        &encode_png(&img),
+        r###"{"operations":[{"op":"trim","background":"#ffffff"}]}"###,
+    );
+    assert_eq!((out.width, out.height), (20, 14));
+    assert!(
+        out.warnings.iter().any(|w| w
+            == "operations[0] (trim): nothing was trimmed (no border row or column was \
+                within tolerance of the background); raise tolerance, set background \
+                explicitly, or use min_content_px to ignore stray pixels"),
+        "expected a nothing-trimmed warning, got {:?}",
+        out.warnings
+    );
+}
+
+/// 通常の切り詰め(内容が縁に達していない)では無変化警告は出ない。
+/// padding のクランプで結果が全面になった場合も、内容自体は切れているので出ない。
+#[test]
+fn trim_does_not_warn_when_something_was_trimmed() {
+    let img = canvas_with_box(40, 30, WHITE, BLACK, (8, 6, 16, 12));
+    for json in [
+        r#"{"operations":[{"op":"trim"}]}"#,
+        r#"{"operations":[{"op":"trim","padding":100}]}"#,
+    ] {
+        let out = apply(&encode_png(&img), json);
+        assert!(
+            !out.warnings
+                .iter()
+                .any(|w| w.contains("nothing was trimmed")),
+            "{json}: unexpected warning {:?}",
+            out.warnings
+        );
+    }
+}
+
+/// 決定論的な疑似乱数(LCG)で、背景色から遠い「ゴミ画素」を約 0.3% 撒く。
+/// 戻り値は (画像, 1 行あたりのゴミ画素数の最大, 1 列あたりの最大)。
+fn sprinkle_noise(img: &mut RgbaImage, count: u32, seed: u64) -> (u32, u32) {
+    let (w, h) = img.dimensions();
+    let mut rows = vec![0u32; h as usize];
+    let mut cols = vec![0u32; w as usize];
+    let mut state = seed;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as u32
+    };
+    for _ in 0..count {
+        let x = next() % w;
+        let y = next() % h;
+        img.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+        rows[y as usize] += 1;
+        cols[x as usize] += 1;
+    }
+    (*rows.iter().max().unwrap(), *cols.iter().max().unwrap())
+}
+
+/// 織り目のある台紙の模擬: 灰色背景 200x200 にゴミ画素を 120 個(0.3%)撒き、
+/// 中央に (60, 50) から 80x100 の黒い矩形を置く。
+///
+/// - 既定(`min_content_px` 1)ではゴミ画素が外接矩形を広げ、矩形には切り詰まらない
+/// - `min_content_px` を「ゴミの行/列あたり個数より大きく、矩形の一辺より小さい」値に
+///   すると矩形 + padding ちょうどに切り詰まる
+#[test]
+fn trim_min_content_px_ignores_stray_pixels() {
+    let bg = [100, 100, 100, 255];
+    let mut img = canvas_with_box(200, 200, bg, BLACK, (60, 50, 80, 100));
+    let (max_row, max_col) = sprinkle_noise(&mut img, 120, 0x5eed);
+    // テストの前提: ゴミは 1 行/1 列あたり 16 未満(矩形の一辺 80 より十分小さい)。
+    assert!(
+        max_row < 16 && max_col < 16,
+        "noise too dense: {max_row}/{max_col}"
+    );
+    // ゴミが矩形の上に落ちた分は矩形の画素を上書きしているだけ(内容には変わりない)。
+
+    let default_out = run(
+        &img,
+        r###"{"operations":[{"op":"trim","background":"#646464","tolerance":16}]}"###,
+    );
+    let (dw, dh) = default_out.dimensions();
+    assert!(
+        dw > 80 && dh > 100,
+        "with the default min_content_px the stray pixels must widen the box, got {dw}x{dh}"
+    );
+
+    let out = run(
+        &img,
+        r###"{"operations":[{"op":"trim","background":"#646464","tolerance":16,"min_content_px":16}]}"###,
+    );
+    assert_eq!(out.dimensions(), (80, 100));
+
+    let padded = run(
+        &img,
+        r###"{"operations":[{"op":"trim","background":"#646464","tolerance":16,"min_content_px":16,"padding":4}]}"###,
+    );
+    assert_eq!(padded.dimensions(), (88, 108));
+    // 左上 (4, 4) が矩形の左上 (60, 50) に対応する。
+    assert_eq!(*padded.get_pixel(4, 4), Rgba(BLACK));
+}
+
+/// `min_content_px` が画像の幅・高さより大きいと、どの行も内容を持たない
+/// = 既存の "no content found" 経路(恒等 + 警告)。
+#[test]
+fn trim_min_content_px_above_the_image_size_is_no_content() {
+    let img = canvas_with_box(40, 30, WHITE, BLACK, (8, 6, 16, 12));
+    let out = apply(
+        &encode_png(&img),
+        r#"{"operations":[{"op":"trim","min_content_px":1000}]}"#,
+    );
+    assert_eq!((out.width, out.height), (40, 30));
+    assert!(out
+        .warnings
+        .iter()
+        .any(|w| w == "operations[0] (trim): no content found, image left unchanged"));
+}
+
+/// `min_content_px` 0 は validate で拒否(既存の書式 `operations[i] (trim): ...`)。
+#[test]
+fn trim_rejects_min_content_px_zero() {
+    let err = validate_err(r#"{"operations":[{"op":"trim","min_content_px":0}]}"#);
+    assert!(err.contains("operations[0] (trim)"), "{err}");
+    assert!(err.contains("min_content_px"), "{err}");
+}
+
 // ---------------------------------------------------------------------------
 // threshold
 // ---------------------------------------------------------------------------
@@ -462,6 +597,30 @@ fn arb_boxed_image() -> impl Strategy<Value = RgbaImage> {
         })
 }
 
+/// `arb_boxed_image` にゴミ画素(背景からちょうど 128 離れた色)を 0..6 個撒いたものと、
+/// `min_content_px` 1..=4 と、背景色の CSS hex の組。ゴミが縁に落ちれば既定の trim は
+/// 外接矩形をそこまで広げ、`min_content_px` が大きければ無視する。
+///
+/// 背景は明示して渡す: 四隅の多数決に任せると、1 回目で切った結果の隅が内容色に
+/// なって 2 回目の背景が変わりうる(`min_content_px` とは無関係の、多数決の性質)。
+fn arb_noisy_boxed_image_and_min_content_px() -> impl Strategy<Value = (RgbaImage, u32, String)> {
+    (
+        arb_boxed_image(),
+        prop::collection::vec((0u32..24, 0u32..24), 0..6),
+        1u32..=4,
+    )
+        .prop_map(|(mut img, dots, k)| {
+            let (w, h) = img.dimensions();
+            // arb_boxed_image の内容は左上 3x3 以内なので右下隅は必ず背景。
+            let bg = img.get_pixel(w - 1, h - 1)[0];
+            let fg = bg.wrapping_add(128);
+            for (x, y) in dots {
+                img.put_pixel(x % w, y % h, Rgba([fg, fg, fg, 255]));
+            }
+            (img, k, format!("#{bg:02x}{bg:02x}{bg:02x}"))
+        })
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
@@ -471,6 +630,24 @@ proptest! {
     fn trim_is_idempotent(img in arb_boxed_image()) {
         let once = run(&img, r#"{"operations":[{"op":"trim"}]}"#);
         let twice = run(&once, r#"{"operations":[{"op":"trim"}]}"#);
+        prop_assert_eq!(once.dimensions(), twice.dimensions());
+        prop_assert_eq!(once.into_raw(), twice.into_raw());
+    }
+
+    /// `min_content_px` を付けても padding = 0 の trim は冪等。
+    ///
+    /// ゴミ画素を撒いた画像で検証する: 切った結果の縁の行・列は
+    /// 「切った後の範囲の中で」`min_content_px` 個以上の内容画素を持つ
+    /// (行と列の判定を交互に繰り返して不動点を取る定義)ので、もう一度切っても動かない。
+    #[test]
+    fn trim_with_min_content_px_is_idempotent(
+        (img, k, bg) in arb_noisy_boxed_image_and_min_content_px()
+    ) {
+        let json = format!(
+            r#"{{"operations":[{{"op":"trim","background":"{bg}","min_content_px":{k}}}]}}"#
+        );
+        let once = run(&img, &json);
+        let twice = run(&once, &json);
         prop_assert_eq!(once.dimensions(), twice.dimensions());
         prop_assert_eq!(once.into_raw(), twice.into_raw());
     }

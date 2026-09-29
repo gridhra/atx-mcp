@@ -117,6 +117,7 @@ fn arb_pipeline_recipe() -> impl Strategy<Value = TransformRecipe> {
                         tolerance,
                         background: None,
                         padding,
+                        min_content_px: 1,
                     });
                 }
                 if let Some((method, value, window, k, invert)) = threshold {

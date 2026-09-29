@@ -778,6 +778,7 @@ impl OpRunner<'_> {
                     tolerance,
                     background,
                     padding,
+                    min_content_px,
                 } => {
                     // 閾値は u8 符号値の色距離で定義されているので、比較の前に
                     // 必ず sRGB 符号値空間へ移す(`ops::trim` のモジュールドキュメント)。
@@ -789,8 +790,26 @@ impl OpRunner<'_> {
                         ),
                         None => None,
                     };
-                    match crate::ops::trim::content_rect(&st.img, *tolerance, bg, *padding) {
-                        Some(rect) => {
+                    let (w, h) = st.img.dimensions();
+                    match crate::ops::trim::content_bounds(&st.img, *tolerance, bg, *min_content_px)
+                    {
+                        Some(bounds) => {
+                            // 内容が 4 辺すべてに達している = 何も切れない。恒等ではあるが、
+                            // エージェントが寸法を見比べなくても気づけるよう理由を警告に残す
+                            // (padding のクランプで全面になった場合は内容自体は切れているので出さない)。
+                            if bounds.x == 0
+                                && bounds.y == 0
+                                && bounds.width == w
+                                && bounds.height == h
+                            {
+                                st.warnings.push(format!(
+                                    "operations[{index}] (trim): nothing was trimmed (no border row \
+                                     or column was within tolerance of the background); raise \
+                                     tolerance, set background explicitly, or use min_content_px to \
+                                     ignore stray pixels"
+                                ));
+                            }
+                            let rect = crate::ops::trim::pad_rect(bounds, *padding, w, h);
                             st.img = pixel_ops::crop_rect(&st.img, rect).map_err(fail)?;
                             // crop.rect と同じ平行移動を積む(後続の
                             // `coordinate_space: "source"` の crop を正しく写すため)。

@@ -305,3 +305,30 @@ fn omitted_bit_depth_is_invisible_to_the_canonical_form() {
         recipe::recipe_hash(&sixteen).unwrap()
     );
 }
+
+/// **`min_content_px` を書かない trim レシピの canonical JSON / hash は従来と 1 バイトも変わらない。**
+///
+/// `#[serde(default = ..., skip_serializing_if = ...)]` なので、既定値 1 のときは
+/// フィールドが正規化 JSON に現れない(`coordinate_space` / `bit_depth` と同じ手口)。
+/// 既存 revision の冪等キーが壊れないことのゲート。
+#[test]
+fn omitted_min_content_px_is_invisible_to_the_canonical_form() {
+    let without = parse(r#"{"operations":[{"op":"trim"}]}"#);
+    let explicit_default = parse(r#"{"operations":[{"op":"trim","min_content_px":1}]}"#);
+    let thirty_two = parse(r#"{"operations":[{"op":"trim","min_content_px":32}]}"#);
+
+    let canonical = recipe::canonical_json(&without).unwrap();
+    assert_eq!(
+        canonical, r#"{"operations":[{"op":"trim"}]}"#,
+        "omitting min_content_px must keep the pre-existing canonical form"
+    );
+    // 既定値を明示しても省略と同じ(canonical の定義どおり)。
+    assert_eq!(
+        recipe::recipe_hash(&without).unwrap(),
+        recipe::recipe_hash(&explicit_default).unwrap()
+    );
+    assert_ne!(
+        recipe::recipe_hash(&without).unwrap(),
+        recipe::recipe_hash(&thirty_two).unwrap()
+    );
+}
