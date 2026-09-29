@@ -199,7 +199,7 @@ pub fn detect_document(image: &DynamicImage, params: &DocumentParams) -> Documen
         }
         let epsilon = quantize_1e6(perimeter(&contour.points) * DP_EPSILON_RATIO);
         let approx = approximate_polygon_dp(&contour.points, epsilon, true);
-        let Some(quad) = quad_from_approximation(&approx) else {
+        let Some(quad) = quad_from_approximation(&approx, epsilon) else {
             continue;
         };
         // DP の頂点は「輪郭上に実在する点」なので、隅のドット 1 個の癖や
@@ -370,7 +370,7 @@ fn perimeter(points: &[Point<i32>]) -> f64 {
 /// - 重心まわりの擬似角で画面上の時計回りに並べ、最も左上に近い頂点を tl に回す
 /// - atx-core `perspective` の `is_strictly_convex_in_order` と同じ条件を課すので、
 ///   返した quad はそのまま recipe に貼って validate を通る
-fn quad_from_approximation(approx: &[Point<i32>]) -> Option<[[f64; 2]; 4]> {
+fn quad_from_approximation(approx: &[Point<i32>], epsilon: f64) -> Option<[[f64; 2]; 4]> {
     let mut pts: Vec<[f64; 2]> = Vec::with_capacity(approx.len());
     for p in approx {
         let p = [p.x as f64, p.y as f64];
@@ -382,6 +382,7 @@ fn quad_from_approximation(approx: &[Point<i32>]) -> Option<[[f64; 2]; 4]> {
     if pts.len() > 1 && pts.first() == pts.last() {
         pts.pop();
     }
+    prune_near_collinear_vertices(&mut pts, epsilon);
     if pts.len() != 4 {
         return None;
     }
@@ -424,6 +425,48 @@ fn quad_from_approximation(approx: &[Point<i32>]) -> Option<[[f64; 2]; 4]> {
         }
     }
     Some(quad)
+}
+
+/// DP 近似の後処理: 「前後の頂点を結ぶ直線」からの距離が `epsilon` 未満の頂点を、
+/// 逸脱が小さいものから順に取り除き、頂点数が 4 になったら止める。
+///
+/// imageproc 0.27 の `approximate_polygon_dp` は `closed = true` でも開曲線と同じ処理で、
+/// 最初の分割線を `curve[0]` と `curve[last]`(閉輪郭では始点の隣の画素)で引く。
+/// そのため「始点を通るほぼ水平な線から最も遠い点」が必ず頂点として残る。
+/// 軸平行な矩形ではそれがちょうど隅になるが、紙がわずかに傾いた実写スキャンでは
+/// 辺の途中の点になり、5 頂点になって候補から落ちていた(実写のスキャンで、
+/// 余計な頂点の逸脱は数 px、ε は周長の 2%)。本来 DP が ε 未満の逸脱として
+/// 捨てるはずの頂点なので、同じ ε で取り除く。
+///
+/// 明らかに 4 頂点でない多角形(六角形など)は各頂点の逸脱が ε 以上なので減らない。
+///
+/// 決定論: 四則演算と比較だけ。`sqrt` は [`edge_len`] 経由で 1e-6 量子化される。
+/// 同じ逸脱の頂点が複数あれば添字の小さいものを先に取り除く。
+fn prune_near_collinear_vertices(pts: &mut Vec<[f64; 2]>, epsilon: f64) {
+    while pts.len() > 4 {
+        let n = pts.len();
+        let mut best: Option<(f64, usize)> = None;
+        for i in 0..n {
+            let a = pts[(i + n - 1) % n];
+            let b = pts[(i + 1) % n];
+            let base = edge_len(a, b);
+            if base <= 0.0 {
+                continue;
+            }
+            let p = pts[i];
+            let cross = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+            let dist = cross.abs() / base;
+            if dist < epsilon && best.is_none_or(|(d, _)| dist < d) {
+                best = Some((dist, i));
+            }
+        }
+        match best {
+            Some((_, i)) => {
+                pts.remove(i);
+            }
+            None => return,
+        }
+    }
 }
 
 /// DP で得た 4 隅を、4 辺の**直線当てはめの交点**として取り直す。
@@ -804,6 +847,102 @@ mod tests {
             Some(quad)
         );
         assert!(detection.output_size_hint.is_some());
+    }
+
+    /// 中心まわりに `deg` 度(画面上の時計回り)傾けた矩形。
+    fn tilted_rect(cx: f64, cy: f64, half_w: f64, half_h: f64, deg: f64) -> [[f64; 2]; 4] {
+        let (s, c) = deg.to_radians().sin_cos();
+        let rot = |x: f64, y: f64| [cx + x * c - y * s, cy + x * s + y * c];
+        [
+            rot(-half_w, -half_h),
+            rot(half_w, -half_h),
+            rot(half_w, half_h),
+            rot(-half_w, half_h),
+        ]
+    }
+
+    /// わずかに傾いた矩形(実写スキャンの紙に相当)で quad が返ること。
+    ///
+    /// imageproc 0.27 の `approximate_polygon_dp` は `closed = true` でも最初の分割線を
+    /// 「輪郭の始点と終点(閉輪郭では始点の隣)」で引くので、始点を通るほぼ水平な線から
+    /// 最も遠い点が必ず頂点として残る。軸平行な矩形ならそれは隅だが、わずかに傾くと
+    /// 辺の途中になり、5 頂点になって候補から落ちていた
+    /// (実写のスキャンで確認)。
+    #[test]
+    fn a_slightly_tilted_rectangle_is_still_detected() {
+        for deg in [0.3, 0.4, 0.5] {
+            let expected = tilted_rect(400.0, 300.0, 280.0, 210.0, deg);
+            let image = synthetic(800, 600, &expected);
+            let detection = detect_document(&image, &DocumentParams::default());
+            let quad = detection.quad.unwrap_or_else(|| {
+                panic!("a rectangle tilted by {deg} degrees must be detected ({detection:?})")
+            });
+            let error = max_corner_error(&quad, &expected);
+            assert!(
+                error <= 8.0,
+                "tilt {deg}: corner error {error:.2}px exceeds 1% of the long edge ({detection:?})"
+            );
+        }
+    }
+
+    /// 六角形(明らかに 4 頂点でない凸多角形)では quad が返らないこと。
+    ///
+    /// [`prune_near_collinear_vertices`] が「ε 未満の逸脱」しか取り除かず、
+    /// 非四角形を四角形に潰さないことを固定する退行防止テスト。
+    #[test]
+    fn a_hexagon_yields_no_quad() {
+        // 正六角形(外接円半径 250、中心 (400, 300))。各頂点の前後を結ぶ直線からの逸脱は
+        // 250 * (1 - cos 60°) = 125 px で、ε(周長 1500 の 2% = 30 px)を大きく上回る。
+        let mut img = RgbImage::from_pixel(800, 600, Rgb([24, 22, 20]));
+        let poly: Vec<Point<i32>> = (0..6)
+            .map(|i| {
+                let (s, c) = (i as f64 * 60.0).to_radians().sin_cos();
+                Point::new(
+                    (400.0 + 250.0 * c).round() as i32,
+                    (300.0 + 250.0 * s).round() as i32,
+                )
+            })
+            .collect();
+        draw_polygon_mut(&mut img, &poly, Rgb([238, 236, 232]));
+        let detection = detect_document(&DynamicImage::ImageRgb8(img), &DocumentParams::default());
+        assert!(
+            detection.quad.is_none(),
+            "a hexagon must not be collapsed into a quad ({detection:?})"
+        );
+        assert!(
+            detection.warnings[0].starts_with(REASON_NO_QUAD),
+            "{detection:?}"
+        );
+    }
+
+    /// 後処理の単体: 辺の途中に紛れ込んだ 5 番目の頂点だけが取り除かれ、
+    /// 逸脱が ε 以上の頂点は残る。
+    #[test]
+    fn pruning_removes_only_near_collinear_vertices() {
+        // 矩形の上辺の途中に 2px だけ外れた頂点を挟む(ε = 10)。
+        let mut pts = vec![
+            [0.0, 0.0],
+            [50.0, -2.0],
+            [100.0, 0.0],
+            [100.0, 60.0],
+            [0.0, 60.0],
+        ];
+        prune_near_collinear_vertices(&mut pts, 10.0);
+        assert_eq!(
+            pts,
+            vec![[0.0, 0.0], [100.0, 0.0], [100.0, 60.0], [0.0, 60.0]]
+        );
+
+        // 同じ形でも逸脱が 20px なら ε 未満ではないので 5 頂点のまま。
+        let mut pts = vec![
+            [0.0, 0.0],
+            [50.0, -20.0],
+            [100.0, 0.0],
+            [100.0, 60.0],
+            [0.0, 60.0],
+        ];
+        prune_near_collinear_vertices(&mut pts, 10.0);
+        assert_eq!(pts.len(), 5);
     }
 
     #[test]
