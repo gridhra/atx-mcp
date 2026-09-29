@@ -121,7 +121,7 @@ claude mcp add asset-transform -- ~/.local/bin/atx-mcp --workspace /path/to/asse
 
 ```sh
 claude mcp add asset-transform -- \
-  docker run -i --rm -v "$PWD:/workspace" ghcr.io/gridhra/atx-mcp:0.6.2
+  docker run -i --rm -v "$PWD:/workspace" ghcr.io/gridhra/atx-mcp:0.6.3
 ```
 
 两点须注意。**`-i` 是必需的**:服务器使用 MCP 的 stdio 传输,需要保持标准输入打开。
@@ -405,7 +405,7 @@ crate 结构:`atx-core`(配方与变换引擎)/ `atx-geometry`(倾斜检测)/
 | `crates/atx-store` | [`asset-transform-store`](https://crates.io/crates/asset-transform-store) | `atx_store` |
 | `crates/atx-mcp` | [`atx-mcp`](https://crates.io/crates/atx-mcp) | `atx_mcp`(二进制为 `atx-mcp`) |
 
-因此,若要把变换引擎当作库使用,请在依赖中写 `asset-transform-core = "0.6.2"`,
+因此,若要把变换引擎当作库使用,请在依赖中写 `asset-transform-core = "0.6.3"`,
 而在代码中仍写 `use atx_core::…`。
 
 ## 名称由来
