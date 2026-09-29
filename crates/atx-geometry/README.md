@@ -10,7 +10,7 @@ always yield the same answer. Part of the
 [atx-mcp](https://github.com/gridhra/atx-mcp) MCP server.
 
 > The crate is published as **`asset-transform-geometry`**, but its library target is
-> `atx_geometry`: depend on `asset-transform-geometry = "0.6.3"` and write
+> `atx_geometry`: depend on `asset-transform-geometry = "0.6.4"` and write
 > `use atx_geometry::…`.
 
 MIT licensed.
