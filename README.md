@@ -55,6 +55,10 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the full design.
    > "Show me this image before and after the edits, side by side."
    `compare_revisions` places before/after side by side, or returns a difference heatmap with stats like `mean_abs_diff`. Every revision keeps its lineage, so the full edit history behind any image used in an article can be traced and reproduced — byte-identical on any machine.
 
+10. **Splitting one scan into separate images**
+   > "Two mounted sheets were scanned on one page. Save them as two files, keeping a little of the green mount around each."
+   There is no split operation: the model runs one `apply_transform` per piece against the same source revision (`crop` to the left/right half, then `trim` to snap to the paper's edges with `padding` to keep some mount), and `export_asset` writes both at once. `render_preview` with no recipe and `overlay:"grid"` is how it reads the coordinates first.
+
 What atx doesn't do — generative editing, RAW development, ML-based auto-cropping, OCR itself — is out of scope; see [docs/DESIGN.md](docs/DESIGN.md) for the roadmap.
 
 ## Install

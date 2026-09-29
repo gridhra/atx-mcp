@@ -77,7 +77,7 @@ Recommended flow
 3. detect_tilt   - read-only tilt candidates with a confidence; a null angle means "do not correct".
 3b. detect_document - read-only: the dominant quadrilateral (paper, screen, whiteboard) as a ready-to-paste perspective op; null means "do not correct".
 3c. detect_text_blocks - read-only: text-like blocks in reading order, the median line height, and crop bands that make the text readable in a preview.
-4. render_preview- run a candidate recipe, get an inline JPEG (long edge 768, up to 1568 via `long_edge`) plus a file path, to check composition cheaply.
+4. render_preview- run a candidate recipe, get an inline JPEG (long edge 768, up to 1568 via `long_edge`) plus a file path, to check composition cheaply. With no recipe it shows the revision as is (overlay="grid" = 1/8 steps, to read crop coordinates).
 5. apply_transform - run the same recipe at full resolution, producing a new revision (`revision_ids` applies it to up to 64 revisions in one call).
 6. export_asset  - copy a revision out of the workspace (`revision_ids` + `dest_dir` writes up to 64 at once, named by `filename_template`; refuses to overwrite unless overwrite=true, ask the user first, and it never writes inside the workspace store).
 
@@ -90,6 +90,8 @@ Reading text in an image (documents, receipts, slides, screenshots)
 2. apply_transform with a recipe of: the detected perspective op -> {"op": "trim"} (drop margins) -> {"op": "preset", "name": "ocr_document"} - that last entry is the preset macro, which inlines the preset's own ops (grayscale, auto_levels, unsharp_mask) at that position. Do NOT binarize for a vision model - thresholding thins strokes; `threshold` / ocr_binarize are for external OCR engines such as Tesseract.
 3. detect_text_blocks on the rectified revision - if `legibility.line_height_at_1568_px` is under ~16 the whole page is too small to read at once, so paste `legibility.recommended_bands[i]` (already a crop op, in reading order) one at a time; `legibility.strategy` tells you what they are ("whole" = one preview is enough, "bands" = full-width bands, "blocks" = per-block crops for an image too wide for bands).
 4. Read it with render_preview `long_edge: 1568`. A vision model reads a downscaled image, so dropping the margins BEFORE that downscale is what buys pixels per glyph; preview a long document in bands with crop.rect.
+
+Splitting one image into several files (two stamps on one mount, a scanned spread, prints on a table): there is no split op - one recipe yields one revision. render_preview with no recipe and overlay="grid" to read coordinates, then one apply_transform per piece (crop.rect or a half, then trim to snap to the piece's edges - explain_operation trim for textured mounts), then export_asset with revision_ids.
 
 Visual verification: render_preview takes an optional `overlay` ("grid" | "thirds" | "horizon", or "mask" with a mask_revision_id); compare_revisions shows two revisions side by side or stacked inline, or layout="diff" (same dimensions) for a difference heatmap plus mean/max/changed-ratio stats."#;
 
@@ -356,7 +358,9 @@ impl AtxServer {
 
     /// Render a recipe as a small JPEG preview (long edge <= 768 by default) and return it
     /// inline plus a file path, so the composition can be checked before committing to
-    /// apply_transform. Takes either `recipe` or `preset`, exactly like apply_transform.
+    /// apply_transform. Takes either `recipe` or `preset`, exactly like apply_transform - or
+    /// NEITHER, which previews the revision as it is (use this with overlay="grid" to read
+    /// crop coordinates off an image before writing a recipe).
     /// Optional `long_edge` (256..=1568) sets the preview size: raise it to 1568 when the
     /// point of the preview is to READ text in the image; 768 is too small for that.
     /// Optional `overlay` ("grid" | "thirds" | "horizon") draws semi-transparent composition

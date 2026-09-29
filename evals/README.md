@@ -11,7 +11,7 @@ CI には組み込まない(§下記コスト注意)。
 ## ⚠️ コスト注意
 
 `evals/run.sh` を(`--dry-run` なしで)実行すると、タスクごとに実際の Claude API トークンを消費する。
-17 タスク × 数ターンの実行になるので、CI やプッシュ毎の自動実行には絶対に使わないこと。
+18 タスク × 数ターンの実行になるので、CI やプッシュ毎の自動実行には絶対に使わないこと。
 リリース候補を切る前に手動で1回まわす、という運用を想定している。
 
 ## 前提
@@ -27,7 +27,7 @@ which claude                        # Claude Code CLI が PATH にあること
 # 1. まずコマンド列挙だけ確認する(トークン消費なし)
 evals/run.sh --dry-run
 
-# 2. 全17タスクを実行する(課金される)
+# 2. 全18タスクを実行する(課金される)
 evals/run.sh
 
 # 3. 1タスクだけ実行する(デバッグ用、courseの絞り込み)
@@ -52,7 +52,10 @@ evals/run.sh t01_straighten_eyecatch
 
 `success_criteria` に書けるキー(すべて AND 条件):
 
-- `expect_revision`: `mime_type` / `width` / `height` / `aspect_ratio`("W:H"、相対誤差2%まで許容) /
+- `expect_revision`: `mime_type` / `width` / `height` /
+  `width_min` / `width_max` / `height_min` / `height_max`(寸法の範囲指定、境界を含む。
+  「元の半分より狭く、紙 1 枚より広い」のように正確な値を決め打てないが範囲で証拠になるケース用) /
+  `aspect_ratio`("W:H"、相対誤差2%まで許容) /
   `recipe_contains_ops`(op名の配列。要素は文字列(op名一致)か
   `{"op": "...", "fields": {...}, "fields_present": [...]}` の形式。`op` は省略可
   (省略時はop名を問わず走査。マスク付きトーン系 op のようにどの op が使われるか
@@ -95,7 +98,7 @@ python3 evals/score.py --selftest
 
 ## タスク一覧(evals/tasks/*.json)
 
-実運用フィードバック(docs/DESIGN.md §9)と ROADMAP の Agent UX 規律に由来する17本:
+実運用フィードバック(docs/DESIGN.md §9)と ROADMAP の Agent UX 規律に由来する18本:
 
 | id | 検証する挙動 |
 |---|---|
@@ -116,6 +119,7 @@ python3 evals/score.py --selftest
 | `t15_dark_screenshot_trim` | ダークモードのスクリーンショットの一様な余白を `trim` で落とす(縮小前に余白を捨てて 1 グリフあたりの画素数を稼ぐ。DESIGN §9.12) |
 | `t16_document_headline_crop` | 正対済みの書類から「見出しだけ」を切り出す。`detect_text_blocks`(文字らしいブロックを読み順に返す検出ツール)でブロックの矩形を取り、`crop` の `rect` にその座標を入れられるか — 座標を目分量で書くのではなく検出結果から取る振る舞いを見る(DESIGN §9.15) |
 | `t17_batch_export` | 複数 revision を1回で書き出す(`export_asset` の `revision_ids` + `dest_dir`)。1枚の写真から3か所を切り出し、3枚とも `web_optimize` で仕上げ、`{{TASK_DIR}}/export` へ `1.webp` / `2.webp` / `3.webp` としてまとめて書き出させる |
+| `t18_split_two_sheets` | 台紙の上に並んだ紙 2 枚を 1 枚ずつ別画像にする(実運用のスキャン事例)。台紙には織り目ノイズと散在する外れ値画素があり、`trim` の既定 tolerance(48)では外れ値に阻まれて余白が落ちない。左右に `crop` してから tolerance を上げた `trim`(または検出結果からの `crop.rect`)で「紙 + 台紙の縁を少し」に収め、`left.jpg` / `right.jpg` として書き出せるかを見る。判定は「`crop` を含む JPEG 派生 revision が 2 つ以上、幅 775〜999(半分 1000 未満・紙 1 枚の外接 768 より広い)、高さ 1090〜1399」+ `left.jpg` が台帳のどれかと一致 |
 
 各タスクの `input_fixture` は基本的に共通で `tests/fixtures/synthetic_scene.jpg`
 (完全合成・決定論的に再生成可能なフィクスチャ。docs/DESIGN.md §9.2 参照)。
@@ -135,6 +139,13 @@ python3 evals/score.py --selftest
 - `t16_document_headline_crop`: `evals/fixtures/document_photo_rectified.png`
   (`document_photo.jpg` と同じ合成書類を歪みなしで描いたもの。見出し帯と本文段落の
   位置が既知なので、切り出した矩形が見出しに沿っているかを人が目視で確認できる)
+- `t18_split_two_sheets`: `evals/fixtures/two_sheets_on_mount.jpg`(2000x1400)
+  (緑の台紙 `#697b55` に白い紙 2 枚(各 760x1080、左 +0.4° / 右 -0.35° に傾けてある)を
+  外周 130/160 px・間隔 220 px で並べたスキャン風合成。台紙は大半の画素が基調色から
+  Chebyshev 距離 ±20 以内だが、0.35% ほどの画素が距離 50〜80 の暗い/明るい点として散在する
+  (実写で `trim` の tolerance 48 が外れ値に阻まれた現象の再現)。生成器は「左半分を tolerance 48 で
+  trim すると落ちない(1000x1400 のまま)/ tolerance 96・padding 100 なら 968x1286 に収まる」ことを
+  自己検証する。紙の中身は夜空の矩形 + 月 + 赤い印だけで、文字は描かない)
 
 ## タスクの追加方法
 

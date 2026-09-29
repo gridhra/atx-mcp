@@ -567,18 +567,20 @@ fn recipe_and_preset_are_mutually_exclusive_and_one_is_required() {
         .collect();
     assert_eq!(valid, BUILTIN_PRESETS);
 
-    // render_preview も同じ契約。
-    let preview_neither = tools.render_preview(&RenderPreviewParams {
+    // render_preview は「両方指定」の排他だけ同じ契約。「どちらも無し」は 2026-09-25 から
+    // 「元画像をそのまま見る」として成功する(flow.rs の
+    // render_preview_without_recipe_shows_the_source_image で固定)。
+    let preview_both = tools.render_preview(&RenderPreviewParams {
         revision_id: rev,
-        recipe: None,
-        preset: None,
+        recipe: Some(serde_json::from_value(serde_json::json!({"operations": []})).unwrap()),
+        preset: Some("web_optimize".to_string()),
         overlay: None,
         mask_revision_id: None,
         long_edge: None,
     });
     assert_eq!(
-        error_payload(&preview_neither)["error"]["code"],
-        "recipe_or_preset_required"
+        error_payload(&preview_both)["error"]["code"],
+        "recipe_and_preset_conflict"
     );
 }
 

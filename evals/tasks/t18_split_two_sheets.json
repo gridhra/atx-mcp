@@ -1,0 +1,29 @@
+{
+  "id": "t18_split_two_sheets",
+  "prompt": "このスキャン画像は、緑の台紙の上に白い紙が左右に2枚並んでいる。1枚ずつ別の画像にしたい。紙のまわりの台紙の縁は少しだけ残して(紙ぴったりに切らないで)、2枚それぞれを {{TASK_DIR}}/export に left.jpg と right.jpg という名前で書き出して。",
+  "input_fixture": "evals/fixtures/two_sheets_on_mount.jpg",
+  "setup": {
+    "seed_files": [
+      {
+        "path": "export/.keep",
+        "text": "export_asset は既存のディレクトリにしか書き出さないので、このファイルで export/ を作っておく\n"
+      }
+    ]
+  },
+  "success_criteria": {
+    "expect_revision": {
+      "mime_type": "image/jpeg",
+      "recipe_contains_ops": ["crop"],
+      "width_min": 775,
+      "width_max": 999,
+      "height_min": 1090,
+      "height_max": 1399,
+      "min_matches": 2
+    },
+    "expect_export": {
+      "dest_path": "{{TASK_DIR}}/export/left.jpg",
+      "must_exist_matching_ledger": true
+    }
+  },
+  "max_turns": 16
+}

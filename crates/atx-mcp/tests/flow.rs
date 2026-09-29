@@ -662,9 +662,12 @@ fn tool_registration_matches_the_design_contract() {
     // export の一括化(手順 6)の説明を足して 5600 → 6000(実測 5936 文字)。
     // さらに v0.6 の配線(svg_overlay の render_text 契約、detect_text_blocks の
     // ツール行と文字読み手順 3)で 6000 → 6700(実測 6551 文字)。
+    // 2026-09-25: 「1 枚を複数ファイルに分割する」導線(2 行、実測 7180 文字)を足して
+    // 6700 → 7300。分割の手順の詳細(textured mount での trim の使い方)は
+    // explain_operation crop / trim の gotchas 側に置き、ここには導線だけを書いた。
     // これ以上の追加は list_operations / explain_operation 側へ。
     assert!(
-        instructions.len() < 6700,
+        instructions.len() < 7300,
         "instructions must stay within budget, got {} chars",
         instructions.len()
     );
@@ -1329,4 +1332,75 @@ fn compare_reports_hash_distance_on_every_layout_and_ssim_only_on_diff() {
     }));
     assert_eq!(stacked["perceptual_hash_distance"], distance);
     assert!(stacked.get("ssim").is_none());
+}
+
+/// render_preview は「レシピなしで見るだけ」を許す(P5、2026-09-25)。
+///
+/// 由来: 紙 2 枚のスキャンを分割するとき、格子オーバレイで座標を読むだけなのに
+/// `operations: []` が拒否され、無意味な encode を足す往復が要った。
+/// `recipe` / `preset` を両方省略しても、`operations: []` を渡しても、
+/// 元画像の縮小プレビューが返る。apply_transform 側は従来どおり空レシピを拒否する
+/// (revision を作る操作に「何もしない」レシピは無い)。
+#[test]
+fn render_preview_without_recipe_shows_the_source_image() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let tools = AtxTools::open(workspace.path()).expect("open workspace");
+    let imported = structured(&tools.import_asset(&ImportAssetParams::single(
+        fixture().to_string_lossy().into_owned(),
+    )));
+    let rev = imported["revision"]["revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (src_w, src_h) = (
+        imported["revision"]["width"].as_u64().unwrap(),
+        imported["revision"]["height"].as_u64().unwrap(),
+    );
+
+    // 1. recipe も preset も省略
+    let omitted = tools.render_preview(&RenderPreviewParams {
+        revision_id: rev.clone(),
+        recipe: None,
+        preset: None,
+        overlay: Some("grid".to_string()),
+        mask_revision_id: None,
+        long_edge: None,
+    });
+    let omitted_out = structured(&omitted);
+    assert_eq!(omitted_out["overlay"], "grid");
+    let w = omitted_out["width"].as_u64().unwrap();
+    let h = omitted_out["height"].as_u64().unwrap();
+    assert_eq!(w.max(h), PREVIEW_LONG_EDGE as u64);
+    // 元画像の比率がそのまま(何も切られていない)
+    assert!(
+        ((w as f64 / h as f64) - (src_w as f64 / src_h as f64)).abs() < 0.01,
+        "preview without recipe must keep the source aspect ratio"
+    );
+
+    // 2. operations: [] を明示
+    let empty = tools.render_preview(&RenderPreviewParams {
+        revision_id: rev.clone(),
+        recipe: Some(serde_json::from_value(serde_json::json!({"operations": []})).unwrap()),
+        preset: None,
+        overlay: None,
+        mask_revision_id: None,
+        long_edge: None,
+    });
+    let empty_out = structured(&empty);
+    assert_eq!(empty_out["width"], omitted_out["width"]);
+    assert_eq!(empty_out["height"], omitted_out["height"]);
+    assert_eq!(
+        empty_out["recipe_hash"], omitted_out["recipe_hash"],
+        "omitting the recipe and passing an empty one are the same preview"
+    );
+
+    // 3. apply_transform は従来どおり空レシピを拒否する
+    let applied = tools.apply_transform(&TransformParams {
+        revision_id: Some(rev),
+        revision_ids: None,
+        recipe: Some(serde_json::from_value(serde_json::json!({"operations": []})).unwrap()),
+        preset: None,
+    });
+    let err = error_payload(&applied);
+    assert_eq!(err["error"]["code"], "invalid_recipe");
 }
