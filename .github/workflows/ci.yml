@@ -46,3 +46,20 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # 公開してはいけない情報の機械検査(端末構成・個人アドレス・作業フォルダ)。
+
+  hygiene:
+    name: public hygiene
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: No local paths / personal addresses in tracked files
+        run: |
+          set -euo pipefail
+          if git grep -n -I -E '/Users/[a-z]|/home/[a-z]+/|@gmail\.com|~/Downloads|C:\\Users' -- . ':!Cargo.lock' ':!.github/workflows/ci.yml'; then
+            echo "::error::tracked files contain local paths or personal addresses"; exit 1
+          fi
+          echo "ok"
