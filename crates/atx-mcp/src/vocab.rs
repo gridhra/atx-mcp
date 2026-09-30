@@ -174,11 +174,11 @@ pub const OPERATIONS: &[OpDoc] = &[
         examples: &[
             r#"{"op": "crop", "aspect_ratio": "16:9", "anchor": "center"}"#,
             r#"{"op": "crop", "rect": {"x": 120, "y": 80, "width": 1600, "height": 900}, "coordinate_space": "source"}"#,
-            r#"{"op": "crop", "rect": {"x": 0, "y": 0, "width": 1979, "height": 2733}}"#,
+            r#"{"op": "crop", "rect": {"x": 0, "y": 0, "width": 2000, "height": 2800}}"#,
         ],
         warnings: &[
             "aspect_ratio and rect are mutually exclusive and one of them is required.",
-            "To SPLIT one image into several files (two stamps on one mount, a scanned spread, several prints on a table) there is no split op: run one apply_transform per piece against the same source revision, each with its own crop.rect (the left/right half is often enough) followed by trim to snap to the piece's edges, then export all of them with export_asset revision_ids. Use render_preview with no recipe and overlay=\"grid\" to read the coordinates first.",
+            "To SPLIT one image into several files (two sheets on one mount, a scanned spread, several prints on a table) there is no split op: run one apply_transform per piece against the same source revision, each with its own crop.rect (the left/right half is often enough) followed by trim to snap to the piece's edges, then export all of them with export_asset revision_ids. Use render_preview with no recipe and overlay=\"grid\" to read the coordinates first.",
             "coordinate_space=\"source\" is only valid together with rect. After a rotate/perspective, the four mapped corners are replaced by their AXIS-ALIGNED BOUNDING BOX, so the crop is slightly larger than the tilted quad you drew.",
             "A source-space rect is rounded half-away-from-zero and clamped to the current image; clamping is reported in warnings, and an empty intersection is a structured error.",
         ],
