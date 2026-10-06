@@ -49,7 +49,7 @@ irm https://raw.githubusercontent.com/gridhra/atx-mcp/main/scripts/install.ps1 |
 ### Docker
 
 ```sh
-docker run -i --rm -v "$PWD:/workspace" ghcr.io/gridhra/atx-mcp:0.6.5
+docker run -i --rm -v "$PWD:/workspace" ghcr.io/gridhra/atx-mcp:0.6.6
 ```
 
 Paths you pass to `import_asset` must be paths *inside the container*
@@ -81,7 +81,7 @@ The transform engine is published separately and does not depend on MCP:
 | [`asset-transform-store`](https://crates.io/crates/asset-transform-store) | `crates/atx-store` | immutable, content-addressed asset store |
 
 Each crate's library target keeps its short name, so depend on
-`asset-transform-core = "0.6.5"` and write `use atx_core::…`.
+`asset-transform-core = "0.6.6"` and write `use atx_core::…`.
 
 ## Links
 
