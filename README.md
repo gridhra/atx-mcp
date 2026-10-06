@@ -128,7 +128,7 @@ linked binary and nothing else (`linux/amd64` and `linux/arm64`).
 
 ```sh
 claude mcp add asset-transform -- \
-  docker run -i --rm -v "$PWD:/workspace" ghcr.io/gridhra/atx-mcp:0.6.4
+  docker run -i --rm -v "$PWD:/workspace" ghcr.io/gridhra/atx-mcp:0.6.5
 ```
 
 Two things to keep in mind. **`-i` is required**: the server speaks the MCP
@@ -444,7 +444,7 @@ The three libraries are published on crates.io under longer names, because
 | `crates/atx-mcp` | [`atx-mcp`](https://crates.io/crates/atx-mcp) | `atx_mcp` (binary `atx-mcp`) |
 
 So to use the transform engine as a library, depend on
-`asset-transform-core = "0.6.4"` and write `use atx_core::…`.
+`asset-transform-core = "0.6.5"` and write `use atx_core::…`.
 
 ## Name
 

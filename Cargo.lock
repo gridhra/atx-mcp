@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "asset-transform-core"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "asset-transform-geometry",
  "fast_image_resize",
@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "asset-transform-geometry"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "image",
  "imageproc",
@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "asset-transform-store"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "asset-transform-core",
  "hex",
@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "atx-mcp"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "asset-transform-core",

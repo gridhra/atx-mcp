@@ -5,7 +5,7 @@ the [atx-mcp](https://github.com/gridhra/atx-mcp) MCP server, published
 separately so it can be used as a plain Rust library.
 
 > The crate is published as **`asset-transform-core`**, but its library target is
-> `atx_core`: depend on `asset-transform-core = "0.6.4"` and write `use atx_core::…`.
+> `atx_core`: depend on `asset-transform-core = "0.6.5"` and write `use atx_core::…`.
 > (`atx-core` on crates.io is an unrelated project.)
 
 ## What it does
@@ -39,7 +39,7 @@ No model, no network, no hallucinated detail.
 
 ```toml
 [dependencies]
-asset-transform-core = "0.6.4"   # library name is `atx_core`
+asset-transform-core = "0.6.5"   # library name is `atx_core`
 serde_json = "1"                 # recipes are plain JSON
 ```
 

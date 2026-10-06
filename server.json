@@ -3,7 +3,7 @@
   "name": "io.github.gridhra/atx-mcp",
   "title": "atx-mcp",
   "description": "Deterministic, non-generative image transform MCP server: reproducible recipes, immutable originals.",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "websiteUrl": "https://github.com/gridhra/atx-mcp",
   "repository": {
     "url": "https://github.com/gridhra/atx-mcp",
@@ -15,7 +15,7 @@
       "registryType": "cargo",
       "registryBaseUrl": "https://crates.io",
       "identifier": "atx-mcp",
-      "version": "0.6.4",
+      "version": "0.6.5",
       "transport": {
         "type": "stdio"
       },
@@ -33,7 +33,7 @@
     },
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/gridhra/atx-mcp:0.6.4",
+      "identifier": "ghcr.io/gridhra/atx-mcp:0.6.5",
       "runtimeHint": "docker",
       "transport": {
         "type": "stdio"
@@ -60,7 +60,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "atx-mcp",
-      "version": "0.6.4",
+      "version": "0.6.5",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
