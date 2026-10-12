@@ -85,7 +85,7 @@ jobs:
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools musl-dev
 
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
@@ -121,7 +121,7 @@ jobs:
         run: Compress-Archive -Path "staging/$env:ARCHIVE_NAME" -DestinationPath "$env:ARCHIVE_NAME.zip"
 
       - name: Upload release archive
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: archive-${{ matrix.target }}
           path: |
@@ -131,7 +131,7 @@ jobs:
 
       # Raw binary, consumed by the npm packaging job.
       - name: Upload raw binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: npmbin-${{ matrix.npm_platform }}
           path: staging/${{ env.ARCHIVE_NAME }}/atx-mcp*
@@ -175,7 +175,7 @@ jobs:
           fi
 
       - if: steps.existing.outputs.published != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: archive-*
           path: artifacts
@@ -303,7 +303,7 @@ jobs:
       - name: Install nasm
         run: sudo apt-get update && sudo apt-get install -y nasm
 
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: stable
 
@@ -397,7 +397,7 @@ jobs:
       # イメージの中身は build ジョブが作った**静的リンクの musl バイナリ**そのもの。
       # ここではコンパイルしないので QEMU も Rust ツールチェインも要らない。
       - if: steps.existing.outputs.published != 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: npmbin-linux-*
           path: npmbins
@@ -454,7 +454,7 @@ jobs:
           ref: refs/tags/${{ needs.release.outputs.tag }}
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
@@ -466,7 +466,7 @@ jobs:
       - name: Update npm for trusted publishing
         run: npm install -g npm@11.19.1 && npm --version
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: npmbin-*
           path: npmbins
