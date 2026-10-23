@@ -372,14 +372,16 @@ impl AssetStore {
         self.root.join(&revision.rel_path)
     }
 
-    /// 全 revision を列挙(created_at 昇順、同値は台帳出現順)。asset_id でのフィルタ可。
+    /// 全 revision を列挙(台帳の出現順 = 記録された順)。asset_id でのフィルタ可。
+    ///
+    /// 以前は `created_at` の文字列で並べ替えていたが、RFC3339 の小数秒は末尾の 0 が
+    /// 省かれる(`...03Z` と `...03.1Z`)ため文字列順が時刻順と食い違うことがあった。
+    /// 台帳は追記型で `created_at` は追記時に採番されるので、出現順がそのまま時刻順になる。
     pub fn list_revisions(&self, asset_id: Option<&str>) -> Result<Vec<AssetRevision>> {
         let mut revisions = self.scan_ledger()?;
         if let Some(asset_id) = asset_id {
             revisions.retain(|r| r.asset_id == asset_id);
         }
-        // Vec::sort_by is stable, so equal created_at values keep ledger order.
-        revisions.sort_by(|a, b| a.created_at.cmp(&b.created_at));
         Ok(revisions)
     }
 
