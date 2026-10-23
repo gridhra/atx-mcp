@@ -296,3 +296,85 @@ fn put_preview_rejects_non_ascii_keys() {
     // 内部生成形式(hex + スラッグ)は引き続き通る。
     assert!(store.put_preview("0de5081e-grid", "jpg", b"x").is_ok());
 }
+
+/// 同じバイト列を複数スレッドから同時に import しても、台帳には 1 行しか載らないこと
+/// (「同一 sha256 → 既存 revision」という冪等性が並行呼び出しでも保たれる)。
+///
+/// 由来: MCP サーバは要求ごとに別タスクで並行実行するため、排他が無いと
+/// 「走査 → 不在なら追記」の間に別の呼び出しが割り込み、重複 revision ができていた。
+#[test]
+fn concurrent_imports_of_the_same_bytes_yield_one_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AssetStore::open(dir.path()).unwrap();
+    let bytes = b"the same bytes imported from many threads at once";
+
+    const THREADS: usize = 16;
+    let barrier = std::sync::Barrier::new(THREADS);
+    let ids: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    store
+                        .import_bytes(bytes, "image/png", 4, 4, BTreeMap::new())
+                        .unwrap()
+                        .revision_id
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let distinct: std::collections::BTreeSet<&String> = ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        1,
+        "every thread must get the same revision: {ids:?}"
+    );
+    assert_eq!(store.list_revisions(None).unwrap().len(), 1);
+}
+
+/// 同じ (source, recipe_hash) の派生を複数スレッドから同時に記録しても、
+/// 派生 revision は 1 件だけになること。
+#[test]
+fn concurrent_derivations_of_the_same_recipe_yield_one_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AssetStore::open(dir.path()).unwrap();
+    let source = store
+        .import_bytes(b"source bytes", "image/png", 4, 4, BTreeMap::new())
+        .unwrap();
+    let recipe = minimal_recipe();
+
+    const THREADS: usize = 16;
+    let barrier = std::sync::Barrier::new(THREADS);
+    let ids: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    store
+                        .record_derivation(
+                            &source.revision_id,
+                            &recipe,
+                            "hash_same",
+                            b"derived bytes",
+                            "image/png",
+                            4,
+                            4,
+                        )
+                        .unwrap()
+                        .revision_id
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let distinct: std::collections::BTreeSet<&String> = ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        1,
+        "every thread must get the same derived revision: {ids:?}"
+    );
+    assert_eq!(store.list_revisions(None).unwrap().len(), 2);
+}

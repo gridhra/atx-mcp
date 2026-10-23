@@ -19,11 +19,17 @@
 //!   プロセス内可変状態(キャッシュ・インデックス)を持たないことで複数プロセスからの
 //!   同時オープンや再起動後の一貫性を単純に保つ。台帳への追記は open(append) + 1行書き込み
 //!   + flush で行う(OS のファイル append はプロセス間である程度アトミック)。
+//! - 台帳を変える操作(`import_bytes` / `record_derivation`)は、「走査して無ければ追記する」
+//!   手順をプロセス内の `Mutex` で直列化する。MCP サーバは要求ごとに別タスクで並行実行する
+//!   ため、排他が無いと同じバイト列の同時 import が重複 revision を作っていた
+//!   (2026-10-22 のレビューで 16 本同時の import から 15 件の revision ができることを実測)。
+//!   別プロセスとの排他は行わない(冪等性が破れても objects/ は内容アドレスなので壊れない)。
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use atx_core::recipe::TransformRecipe;
 use serde::{Deserialize, Serialize};
@@ -71,6 +77,9 @@ pub struct AssetRevision {
 /// ワークスペースディレクトリに紐づくストアハンドル。
 pub struct AssetStore {
     root: PathBuf,
+    /// 台帳を変える操作(走査 → 不在なら追記)をプロセス内で直列化する。
+    /// 読み出しだけの操作はロックを取らない。
+    write_lock: Mutex<()>,
 }
 
 /// MIME からストア内オブジェクトの拡張子を決める。
@@ -127,7 +136,18 @@ impl AssetStore {
                 .open(&ledger_path)?;
         }
         let root = root.canonicalize()?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            write_lock: Mutex::new(()),
+        })
+    }
+
+    /// 台帳を変える操作のための排他。別スレッドが panic したままでも
+    /// (poisoned)台帳自体は壊れていないので、そのまま使い続ける。
+    fn lock_for_write(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn root(&self) -> &Path {
@@ -211,7 +231,9 @@ impl AssetStore {
         let sha256 = sha256_hex(bytes);
 
         // 冪等性: 同一 sha256 かつ import 起点(source_revision_id == None)の revision が
-        // あればそれを返す。
+        // あればそれを返す。走査から追記までを `write_lock` で直列化する
+        // (並行する同一バイト列の import が重複 revision を作らないため)。
+        let _guard = self.lock_for_write();
         let existing = self.scan_ledger()?;
         if let Some(found) = existing
             .iter()
@@ -254,6 +276,8 @@ impl AssetStore {
         width: u32,
         height: u32,
     ) -> Result<AssetRevision> {
+        // 走査から追記までを直列化する(`import_bytes` と同じ理由)。
+        let _guard = self.lock_for_write();
         let existing = self.scan_ledger()?;
 
         // 冪等性: 同一 (source_revision_id, recipe_hash) の派生 revision があればそれを返す。
