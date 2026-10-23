@@ -997,7 +997,7 @@ fn error_info(result: &CallToolResult) -> BatchError {
 /// `did_you_mean` を添える。
 fn deserialize_recipe(recipe: &RecipeJson) -> Result<TransformRecipe, CallToolResult> {
     let value = &recipe.0;
-    match serde_json::from_value::<TransformRecipe>(value.clone()) {
+    match TransformRecipe::deserialize(value) {
         Ok(recipe) => Ok(recipe),
         Err(err) => {
             let (location, message, did_you_mean) = locate_recipe_error(value, &err);
