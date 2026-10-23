@@ -178,7 +178,18 @@ pub(crate) const EXTERNAL_IMAGE_WARNING: &str =
     "svg contains image elements that reference external files; external references are \
      never loaded (embed the image in the SVG, or import it and composite it with layers)";
 
-/// 決定論のためのフォント無し・外部参照無し usvg オプション。
+/// 1 回の解析(import 時の検証 1 回、または `svg_overlay` 1 回)で読み込む**入れ子 SVG**
+/// (`<image href="data:image/svg+xml,...">`)の上限。
+///
+/// usvg は `<image>` のインスタンスごとに入れ子 SVG を解析し直し(キャッシュしない)、
+/// `<use>` で複製された分も別々に数える。usvg の要素数上限(100 万)は木 1 本ごとにしか
+/// 効かないので、数 KB の SVG で「解析回数 × 要素数」のメモリを確保させられた
+/// (2026-10-22 のレビューで、1000 × 1000 の入れ子が 1.2 GB になることを実測)。
+/// 透かし・ロゴの用途で入れ子 SVG が 16 を超えることは考えにくい。
+pub(crate) const MAX_NESTED_SVG_IMAGES: usize = 16;
+
+/// 決定論のためのフォント無し・外部参照無し usvg オプションと、入れ子 SVG の
+/// 読み込み回数を数えるカウンタ。
 ///
 /// `Options::default()` のフォント DB は**空**(`system-fonts` を付けていないので
 /// システムフォントを読む経路がそもそもビルドに入っていない)。空 DB では
@@ -198,10 +209,196 @@ pub(crate) const EXTERNAL_IMAGE_WARNING: &str =
 /// 入れ子の SVG は同じ `Options`(= この文字列リゾルバ)で解析されるため、
 /// data: の中から外部ファイルを参照し直す抜け道も無い。なお PNG / JPEG 等のラスタは
 /// `raster-images` 機能を外しているので、data: でも描画はされない(従来どおり)。
-fn options() -> usvg::Options<'static> {
+///
+/// # 入れ子 SVG の読み込み回数(2026-10-22 のレビューで閉じた経路)
+///
+/// `resolve_data` を包み、SVG(宣言された MIME が既知のラスタでないもの)の解決回数が
+/// [`MAX_NESTED_SVG_IMAGES`] を超えたら `None`(= その `<image>` は描かない)を返す。
+/// 入れ子の SVG は同じ `resolve_data` で解析される(usvg の `Tree::from_data_nested` が
+/// 親の `Options` のリゾルバへ委譲する)ため、カウンタは全段の合計になる。ラスタ
+/// (PNG / JPEG 等)は `raster-images` 機能を外しているので描かれず、解析コストも無い。
+/// 呼び出し側は解析後にカウンタを見て、超過を import では拒否、描画では警告にする。
+fn options_counted() -> (
+    usvg::Options<'static>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     let mut opt = usvg::Options::default();
     opt.image_href_resolver.resolve_string = Box::new(|_, _| None);
-    opt
+    let default_data = usvg::ImageHrefResolver::default_data_resolver();
+    let nested = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&nested);
+    opt.image_href_resolver.resolve_data = Box::new(move |mime, data, opts| {
+        let is_known_raster = matches!(
+            mime,
+            "image/jpg" | "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+        );
+        if !is_known_raster && counter.fetch_add(1, Ordering::Relaxed) >= MAX_NESTED_SVG_IMAGES {
+            return None;
+        }
+        default_data(mime, data, opts)
+    });
+    (opt, nested)
+}
+
+/// 入れ子 SVG の読み込みが上限を超えたときの件数(超えていなければ 0)。
+fn nested_overflow(counter: &std::sync::atomic::AtomicUsize) -> usize {
+    counter
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .saturating_sub(MAX_NESTED_SVG_IMAGES)
+}
+
+// ---------------------------------------------------------------------------
+// 描画時に resvg が確保するバッファの構造的な上限(2026-10-22 のレビュー)
+//
+// `MAX_RASTER_PIXELS` が縛るのは土台(目標寸法の Pixmap)だけで、resvg 内部の確保は
+// 縛られない。resvg 0.48 は opacity<1 / mask / clip-path / filter / blend を持つグループ
+// (分離グループ)ごとに内容 bbox(filter では土台の 5 × 5 倍まで)の RGBA8 の層を確保し、
+// 祖先の層を保持したまま子を描く(入れ子 n 段なら n 枚が同時に生きる)。filter は primitive
+// ごとの結果を全部保持し、feTurbulence は numOctaves に比例した時間がかかる(デバッグ
+// ビルドでは 31 以上で resvg 内部が加算あふれで panic する)。feMorphology は半径² に比例する。
+// pattern のタイルは「pattern の矩形 × 変換の倍率」で決まり、枠では切り詰められない。
+//
+// 確保量を正確に見積もる代わりに、構造の粗い上限を描画前に掛ける。受理か拒否かは SVG の
+// バイト列と目標寸法だけで決まるので、決定論にもレシピ hash にも影響しない。
+// ---------------------------------------------------------------------------
+
+/// 分離グループ(と mask / clip-path / pattern の内容)の入れ子の深さの上限。
+pub(crate) const MAX_ISOLATED_GROUP_DEPTH: usize = 8;
+/// 1 つの filter が持てる primitive の数の上限(結果を全部保持するため)。
+pub(crate) const MAX_FILTER_PRIMITIVES: usize = 32;
+/// feTurbulence の numOctaves の上限(時間に比例。視覚的には 10 程度で飽和する)。
+pub(crate) const MAX_TURBULENCE_OCTAVES: u32 = 24;
+/// feMorphology の半径(px、各軸)の上限(画素数 × 半径² に比例)。
+pub(crate) const MAX_MORPHOLOGY_RADIUS: f32 = 256.0;
+
+/// usvg の木を歩き、描画時の確保が構造的な上限に収まることを確かめる。
+///
+/// `scale_x` / `scale_y` は固有サイズから目標寸法への倍率(pattern のタイル寸法に効く)。
+/// import 時の検証では 1.0、描画時は実際の倍率で呼ぶ。失敗は英語の理由文字列。
+fn check_render_budget(
+    tree: &usvg::Tree,
+    scale_x: f64,
+    scale_y: f64,
+) -> std::result::Result<(), String> {
+    let mut first_error = None;
+    walk_render_budget(tree.root(), 0, scale_x * scale_y, &mut first_error);
+    match first_error {
+        Some(reason) => Err(reason),
+        None => Ok(()),
+    }
+}
+
+fn walk_render_budget(
+    group: &usvg::Group,
+    depth: usize,
+    area_scale: f64,
+    err: &mut Option<String>,
+) {
+    if err.is_some() {
+        return;
+    }
+    let depth = if group.should_isolate() {
+        depth + 1
+    } else {
+        depth
+    };
+    if depth > MAX_ISOLATED_GROUP_DEPTH {
+        *err = Some(format!(
+            "isolated groups (opacity, mask, clip-path, filter or blend mode) are nested more \
+             than {MAX_ISOLATED_GROUP_DEPTH} deep; the rasterizer allocates a full layer per \
+             level, so flatten the artwork"
+        ));
+        return;
+    }
+    for filter in group.filters() {
+        let primitives = filter.primitives();
+        if primitives.len() > MAX_FILTER_PRIMITIVES {
+            *err = Some(format!(
+                "a filter has {} primitives, over the limit of {MAX_FILTER_PRIMITIVES} (every \
+                 primitive result is kept in memory while the filter runs)",
+                primitives.len()
+            ));
+            return;
+        }
+        for primitive in primitives {
+            match primitive.kind() {
+                usvg::filter::Kind::Turbulence(t) if t.num_octaves() > MAX_TURBULENCE_OCTAVES => {
+                    *err = Some(format!(
+                        "feTurbulence numOctaves={} is over the limit of {MAX_TURBULENCE_OCTAVES}",
+                        t.num_octaves()
+                    ));
+                    return;
+                }
+                usvg::filter::Kind::Morphology(m)
+                    if m.radius_x().get() > MAX_MORPHOLOGY_RADIUS
+                        || m.radius_y().get() > MAX_MORPHOLOGY_RADIUS =>
+                {
+                    *err = Some(format!(
+                        "feMorphology radius {}x{} is over the limit of {MAX_MORPHOLOGY_RADIUS} px",
+                        m.radius_x().get(),
+                        m.radius_y().get()
+                    ));
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+    for child in group.children() {
+        if err.is_some() {
+            return;
+        }
+        match child {
+            usvg::Node::Group(g) => walk_render_budget(g, depth, area_scale, err),
+            usvg::Node::Path(path) => {
+                let paints = [
+                    path.fill().map(|f| f.paint()),
+                    path.stroke().map(|s| s.paint()),
+                ];
+                for paint in paints.into_iter().flatten() {
+                    if let usvg::Paint::Pattern(pattern) = paint {
+                        // resvg のタイルは「pattern の矩形 × (パスの絶対変換 ∘ pattern の変換)の倍率」。
+                        let t = path.abs_transform().pre_concat(pattern.transform());
+                        let sx = f64::from((t.sx * t.sx + t.ky * t.ky).sqrt());
+                        let sy = f64::from((t.kx * t.kx + t.sy * t.sy).sqrt());
+                        let rect = pattern.rect();
+                        let tile = f64::from(rect.width())
+                            * f64::from(rect.height())
+                            * sx
+                            * sy
+                            * area_scale;
+                        if !tile.is_finite() || tile > MAX_RASTER_PIXELS as f64 {
+                            *err = Some(format!(
+                                "a pattern tile would be about {tile:.0} pixels, over the \
+                                 {MAX_RASTER_PIXELS} pixel limit"
+                            ));
+                            return;
+                        }
+                    }
+                }
+            }
+            usvg::Node::Image(image) => {
+                // 入れ子 SVG は resvg が自分の寸法の Pixmap を別に確保して描く(1 層ぶん深い)。
+                // `Node::subroots` も同じ根を渡してくるので、ここで歩いたら下では歩かない。
+                if let usvg::ImageKind::SVG(nested) = image.kind() {
+                    walk_render_budget(nested.root(), depth + 1, area_scale, err);
+                }
+                continue;
+            }
+            usvg::Node::Text(text) => {
+                // テキストは平坦化したグループとして同じ層に描かれる。`Node::subroots` が
+                // 渡すのもこの平坦化グループなので、ここで歩いたら下では歩かない。
+                walk_render_budget(text.flattened(), depth, area_scale, err);
+                continue;
+            }
+        }
+        // グループの clip-path / mask / feImage と、パスの pattern の内容は、
+        // それぞれ別の層に描かれる。
+        child.subroots(|subroot| walk_render_budget(subroot, depth + 1, area_scale, err));
+    }
 }
 
 /// `render_text: true` のときに使うフォント群。
@@ -257,8 +454,7 @@ fn bundled_db() -> &'static (usvg::fontdb::Database, String) {
 /// **同梱書体のファミリ名**に固定する。これにより SVG が
 /// `font-family="Nonexistent"` や `font-family="sans-serif"` と書いていても、
 /// 解決先は常に「DB の中にある書体」になり、ホスト環境は結果に入らない。
-fn text_options(fonts: &TextFonts) -> usvg::Options<'static> {
-    let mut opt = options();
+fn text_options(mut opt: usvg::Options<'static>, fonts: &TextFonts) -> usvg::Options<'static> {
     let (bundled, bundled_family) = bundled_db();
     let db = opt.fontdb_mut();
     // 同梱書体入りの DB を clone して、渡された font アセットを**指定順**に足す。
@@ -480,8 +676,19 @@ pub fn validate_asset(bytes: &[u8]) -> std::result::Result<Option<(u32, u32)>, S
             root.tag_name().name()
         ));
     }
-    let tree = usvg::Tree::from_xmltree(&doc, &options())
+    let (opt, nested) = options_counted();
+    let tree = usvg::Tree::from_xmltree(&doc, &opt)
         .map_err(|e| format!("the file is not a renderable SVG: {e}"))?;
+    let overflow = nested_overflow(&nested);
+    if overflow > 0 {
+        return Err(format!(
+            "the SVG nests more than {MAX_NESTED_SVG_IMAGES} SVG images (every <use> instance of a \
+             data: SVG <image> counts; {overflow} over the limit); flatten the artwork or \
+             replace the nested images with paths"
+        ));
+    }
+    check_render_budget(&tree, 1.0, 1.0)
+        .map_err(|reason| format!("the SVG is too expensive to rasterize safely: {reason}"))?;
     if !has_intrinsic_size(&root) {
         return Ok(None);
     }
@@ -540,9 +747,10 @@ pub(crate) fn rasterize(
     let has_text_element = doc
         .descendants()
         .any(|n| n.is_element() && n.has_tag_name("text"));
+    let (opt, nested) = options_counted();
     let opt = match text {
-        Some(fonts) if has_text_element => text_options(fonts),
-        _ => options(),
+        Some(fonts) if has_text_element => text_options(opt, fonts),
+        _ => opt,
     };
     let mut warnings = Vec::new();
     match text {
@@ -566,6 +774,14 @@ pub(crate) fn rasterize(
     }
     let tree = usvg::Tree::from_xmltree(&doc, &opt)
         .map_err(|e| format!("the referenced asset is not a renderable SVG: {e}"))?;
+    let overflow = nested_overflow(&nested);
+    if overflow > 0 {
+        warnings.push(format!(
+            "svg_overlay: {overflow} nested SVG <image> instances beyond the limit of \
+             {MAX_NESTED_SVG_IMAGES} were not drawn (every <use> instance of a data: SVG \
+             <image> counts)"
+        ));
+    }
 
     // 目標寸法。固有サイズが無い SVG は usvg の既定 100x100 に落ちるので、
     // width/height の両方で寸法が確定しているときだけ受け入れる。
@@ -608,6 +824,8 @@ pub(crate) fn rasterize(
     if has_external_image(&doc) {
         warnings.push(EXTERNAL_IMAGE_WARNING.to_string());
     }
+    check_render_budget(&tree, f64::from(tw) / iw, f64::from(th) / ih)
+        .map_err(|reason| format!("the SVG is too expensive to rasterize safely: {reason}"))?;
 
     let mut pixmap = resvg::tiny_skia::Pixmap::new(tw, th)
         .ok_or_else(|| format!("could not allocate a {tw}x{th} raster for the SVG"))?;
