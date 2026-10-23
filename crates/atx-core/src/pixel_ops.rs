@@ -671,22 +671,27 @@ pub(crate) fn resize_lanczos3(img: &LinearImage, dst_w: u32, dst_h: u32) -> OpRe
         }
     });
 
-    // --- パス2: 垂直 (ih -> dst_h) ---
+    // --- パス2: 垂直 (ih -> dst_h)(ループ交換)---
+    //
+    // 出力行 oy ごとに、その行の寄与(`vy[oy]`)のタップ k を昇順に回し、入力行 sy 全体を
+    // weight 倍して出力行へ足し込む(メモリアクセスが行連続になる)。各画素・各チャンネルの
+    // 累算は「0.0(初期化済み)から k 昇順に左結合、乗算と加算は分離」のまま変わらないので、
+    // 出力は画素ごとにタップを回す従来の実装(`tests::resize_lanczos3_reference`)と
+    // ビット単位で一致する(proptest `resize_matches_reference_bit_for_bit` で固定)。
     let vy = build_contributions(ih, dst_h);
-    let mut out_data = vec![[0f32; 4]; dst_w as usize * dst_h as usize];
-    parallel::fill_rows(&mut out_data, dst_w as usize, dst_h as usize, |oy, row| {
+    let row_len = dst_w as usize;
+    let mut out_data = vec![[0f32; 4]; row_len * dst_h as usize];
+    parallel::fill_rows(&mut out_data, row_len, dst_h as usize, |oy, row| {
         let c = &vy[oy];
-        for (ox, slot) in row.iter_mut().enumerate() {
-            let mut acc = [0f32; 4];
-            for (k, &weight) in c.weights.iter().enumerate() {
-                let sy = (c.start + k as i64).clamp(0, ih as i64 - 1) as usize;
-                let px = horiz[sy * dst_w as usize + ox];
+        for (k, &weight) in c.weights.iter().enumerate() {
+            let sy = (c.start + k as i64).clamp(0, ih as i64 - 1) as usize;
+            let src = &horiz[sy * row_len..(sy + 1) * row_len];
+            for (acc, px) in row.iter_mut().zip(src) {
                 for ch in 0..4 {
                     let term = px[ch] * weight;
                     acc[ch] += term;
                 }
             }
-            *slot = acc;
         }
     });
 
@@ -806,6 +811,97 @@ fn unsharp_3x3(img: &LinearImage, amount: f32) -> LinearImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ループ交換前の `resize_lanczos3`(垂直パスを画素ごとにタップで回す)。
+    /// 現行実装との**ビット一致**を固定するための参照実装で、変更しない。
+    fn resize_lanczos3_reference(img: &LinearImage, dst_w: u32, dst_h: u32) -> LinearImage {
+        let (iw, ih) = img.dimensions();
+        if (iw, ih) == (dst_w, dst_h) {
+            return img.clone();
+        }
+        let premul = img.premultiplied();
+
+        let hx = build_contributions(iw, dst_w);
+        let mut horiz = vec![[0f32; 4]; dst_w as usize * ih as usize];
+        for y in 0..ih as usize {
+            for ox in 0..dst_w as usize {
+                let c = &hx[ox];
+                let mut acc = [0f32; 4];
+                for (k, &weight) in c.weights.iter().enumerate() {
+                    let sx = (c.start + k as i64).clamp(0, iw as i64 - 1) as u32;
+                    let px = premul.data[y * iw as usize + sx as usize];
+                    for ch in 0..4 {
+                        let term = px[ch] * weight;
+                        acc[ch] += term;
+                    }
+                }
+                horiz[y * dst_w as usize + ox] = acc;
+            }
+        }
+
+        let vy = build_contributions(ih, dst_h);
+        let mut out_data = vec![[0f32; 4]; dst_w as usize * dst_h as usize];
+        for oy in 0..dst_h as usize {
+            let c = &vy[oy];
+            for ox in 0..dst_w as usize {
+                let mut acc = [0f32; 4];
+                for (k, &weight) in c.weights.iter().enumerate() {
+                    let sy = (c.start + k as i64).clamp(0, ih as i64 - 1) as usize;
+                    let px = horiz[sy * dst_w as usize + ox];
+                    for ch in 0..4 {
+                        let term = px[ch] * weight;
+                        acc[ch] += term;
+                    }
+                }
+                out_data[oy * dst_w as usize + ox] = acc;
+            }
+        }
+
+        let mut out = LinearImage {
+            width: dst_w,
+            height: dst_h,
+            data: out_data,
+        };
+        out.unpremultiply();
+        out
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(96))]
+
+        /// 垂直パスのループ交換は画素間の実行順序しか変えないので、
+        /// 参照実装と f32 のビット表現まで一致する(拡大・縮小・同寸の全組み合わせ)。
+        #[test]
+        fn resize_matches_reference_bit_for_bit(
+            iw in 1u32..=24,
+            ih in 1u32..=24,
+            dst_w in 1u32..=24,
+            dst_h in 1u32..=24,
+            values in proptest::collection::vec(0.0f32..=1.0, 24 * 24 * 4),
+        ) {
+            let data: Vec<[f32; 4]> = values[..(iw * ih * 4) as usize]
+                .chunks_exact(4)
+                .map(|c| [c[0], c[1], c[2], c[3]])
+                .collect();
+            let img = LinearImage { width: iw, height: ih, data };
+            let fast = resize_lanczos3(&img, dst_w, dst_h).unwrap();
+            let reference = resize_lanczos3_reference(&img, dst_w, dst_h);
+            proptest::prop_assert_eq!(fast.dimensions(), reference.dimensions());
+            for (i, (pa, pb)) in fast.data.iter().zip(&reference.data).enumerate() {
+                for ch in 0..4 {
+                    proptest::prop_assert_eq!(
+                        pa[ch].to_bits(),
+                        pb[ch].to_bits(),
+                        "pixel {} channel {} differs: {} vs {}",
+                        i,
+                        ch,
+                        pa[ch],
+                        pb[ch]
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn lanczos3_is_one_at_zero_and_zero_at_integers() {
