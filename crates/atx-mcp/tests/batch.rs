@@ -965,3 +965,50 @@ fn the_single_and_batch_export_forms_are_mutually_exclusive() {
     assert_eq!(batch_with_path["error"]["code"], "export_params_mismatch");
     assert_eq!(std::fs::read_dir(out_dir.path()).unwrap().count(), 0);
 }
+
+/// 大文字小文字を区別しないファイルシステムが既定の OS(macOS / Windows)では、
+/// 大文字小文字だけが違うファイル名を衝突として扱い、何も書かないこと。
+/// Linux は区別するので、従来どおり 2 件とも書ける(このテストは走らない)。
+///
+/// 由来: 2026-10-22 のレビュー。APFS(macOS 既定)や NTFS は大文字小文字を区別しないので、
+/// `IMG_1.jpg` と `img_1.jpg` は同じファイルになる。衝突検査が大文字小文字を区別していたため、
+/// overwrite=true では「2 件書いた」と報告しながら 1 件が黙って失われ、overwrite=false では
+/// 1 件目を書いた後で 2 件目が dest_exists になっていた(「書く前に衝突を検出する」設計に反する)。
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn filenames_that_differ_only_by_case_collide() {
+    let (workspace, tools) = tools();
+    // 同じディレクトリには両方を置けない(大文字小文字を区別しないボリューム)ので、別々に置く。
+    let bytes = std::fs::read(fixture()).unwrap();
+    let mut revisions = Vec::new();
+    for (sub, name, tail) in [("upper", "IMG_1.jpg", 1), ("lower", "img_1.jpg", 2)] {
+        let dir = workspace.path().join(sub);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let mut distinct = bytes.clone();
+        distinct.extend(std::iter::repeat_n(0u8, tail));
+        std::fs::write(&path, distinct).unwrap();
+        let imported =
+            structured(&tools.import_asset(&ImportAssetParams::single(path.to_string_lossy())));
+        revisions.push(
+            imported["revision"]["revision_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    let out_dir = tempfile::tempdir().unwrap();
+    let payload = error_payload(
+        &tools.export_asset(
+            &ExportAssetParams::batch(revisions, out_dir.path().to_string_lossy())
+                .with_filename_template("{stem}.{ext}")
+                .with_overwrite(),
+        ),
+    );
+    assert_eq!(payload["error"]["code"], "filename_collision", "{payload}");
+    assert_eq!(
+        std::fs::read_dir(out_dir.path()).unwrap().count(),
+        0,
+        "nothing may be written when names collide"
+    );
+}

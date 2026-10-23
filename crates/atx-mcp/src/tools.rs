@@ -3547,21 +3547,25 @@ impl AtxTools {
             };
             planned.push((revision_id.clone(), name));
         }
-        let mut seen: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for (revision_id, name) in &planned {
-            seen.entry(name.as_str()).or_default().push(revision_id);
-        }
-        let duplicates: Vec<(&&str, &Vec<&str>)> =
-            seen.iter().filter(|(_, ids)| ids.len() > 1).collect();
+        // 衝突は、このホストの既定ファイルシステムが大文字小文字を区別しないなら
+        // (APFS / NTFS)小文字化して判定する。区別して数えると `IMG_1.jpg` と `img_1.jpg` が
+        // 同じファイルになり、「2 件書いた」と報告しながら 1 件が黙って失われていた
+        // (2026-10-22 のレビューで実測)。
+        let duplicates = filename_collisions(&planned, FILE_NAMES_FOLD_CASE);
         if !duplicates.is_empty() {
             let listed: Vec<String> = duplicates
                 .iter()
                 .map(|(name, ids)| format!("{name} ({})", ids.join(", ")))
                 .collect();
+            let how = if FILE_NAMES_FOLD_CASE {
+                " (compared ignoring case, as this host's file system does)"
+            } else {
+                ""
+            };
             return tool_error(
                 "filename_collision",
                 format!(
-                    "filename_template {template:?} maps more than one revision to the same file name: {}",
+                    "filename_template {template:?} maps more than one revision to the same file name{how}: {}",
                     listed.join("; ")
                 ),
                 serde_json::json!({
@@ -4334,13 +4338,36 @@ fn validate_filename_template(template: &str) -> Result<(), CallToolResult> {
 }
 
 /// 展開後のファイル名の検査(`{stem}` 等の値が区切りを持ち込まないこと)。
+///
+/// `{stem}` は取り込み元のファイル名に由来する(= 利用者の環境から来る文字列)ので、
+/// パス区切りと `..` に加えて、制御文字(改行は応答テキストに偽の行を作れる)を OS を
+/// 問わず拒否する。Windows で動いているときはさらに、`:`(ドライブ指定 `D:name` は
+/// `dest_dir.join` で dest_dir を置き換え、`name:stream` は NTFS の代替データストリームへ
+/// 書く)、予約デバイス名(CON / NUL / COM1 …)、末尾の `.` と空白(Windows が黙って削る)も
+/// 拒否する。Unix ではこれらは普通の文字で、取り込み元の名前がそのまま使えていたので、
+/// 規則を Windows に限って既存の挙動を狭めない。
 fn check_file_name(name: &str, template: &str) -> Result<(), CallToolResult> {
+    check_file_name_for_host(name, template, cfg!(windows))
+}
+
+/// [`check_file_name`] の本体。`windows` でホストの規則を切り替える(テストで両方を通す)。
+fn check_file_name_for_host(
+    name: &str,
+    template: &str,
+    windows: bool,
+) -> Result<(), CallToolResult> {
     let bad = name.trim().is_empty()
         || name.contains('/')
         || name.contains('\\')
         || name.contains('\0')
         || name.contains("..")
-        || name == ".";
+        || name == "."
+        || name.chars().any(char::is_control)
+        || (windows
+            && (name.contains(':')
+                || name.ends_with('.')
+                || name.ends_with(' ')
+                || is_windows_reserved_name(name)));
     if !bad {
         return Ok(());
     }
@@ -4354,9 +4381,43 @@ fn check_file_name(name: &str, template: &str) -> Result<(), CallToolResult> {
             "expanded": name,
             "default": DEFAULT_FILENAME_TEMPLATE,
             "valid_placeholders": FILENAME_PLACEHOLDERS,
-            "recovery": "the expanded name must be a single file name (no path separators, no \"..\"); use {revision_id} or {index} instead of {stem} if the source file name is unusual",
+            "recovery": "the expanded name must be a single file name (no path separators, no \"..\", no control characters; on Windows also no \":\", no trailing \".\" or space, and not a device name such as CON or NUL); use {revision_id} or {index} instead of {stem} if the source file name is unusual",
         }),
     ))
+}
+
+/// Windows の予約デバイス名(拡張子を付けても予約される: `CON.png` は `CON`)。
+fn is_windows_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0')
+}
+
+/// このホストの既定ファイルシステムが大文字小文字を区別しないか(macOS の APFS、Windows の NTFS)。
+/// Linux の ext4 等は区別するので、`IMG_1.jpg` と `img_1.jpg` は別のファイルとして書ける(従来どおり)。
+const FILE_NAMES_FOLD_CASE: bool = cfg!(any(target_os = "macos", windows));
+
+/// 展開後のファイル名の衝突(同じ名前に写る revision が 2 件以上)。`fold_case` なら
+/// 大文字小文字を無視して比べる。返り値は(最初に現れた綴り, revision_id 群)。
+fn filename_collisions(planned: &[(String, String)], fold_case: bool) -> Vec<(&str, Vec<&str>)> {
+    let mut seen: BTreeMap<String, (&str, Vec<&str>)> = BTreeMap::new();
+    for (revision_id, name) in planned {
+        let key = if fold_case {
+            name.to_lowercase()
+        } else {
+            name.clone()
+        };
+        seen.entry(key)
+            .or_insert_with(|| (name.as_str(), Vec::new()))
+            .1
+            .push(revision_id);
+    }
+    seen.into_values()
+        .filter(|(_, ids)| ids.len() > 1)
+        .collect()
 }
 
 /// ファイル名テンプレートを1件分に展開する。
@@ -5176,6 +5237,92 @@ mod tests {
     fn absolutize_folds_dot_segments() {
         let p = absolutize("/tmp/a/./b/../c").unwrap();
         assert_eq!(p, PathBuf::from("/tmp/a/c"));
+    }
+
+    /// 展開後のファイル名の規則(2026-10-22 のレビュー)。制御文字は OS を問わず拒否し、
+    /// Windows 由来の規則(`:`・予約デバイス名・末尾の `.` と空白)は Windows でだけ効く。
+    #[test]
+    fn expanded_file_names_are_checked_for_the_host() {
+        for ok in [
+            "rev_1.png",
+            "01-scan.jpg",
+            "日本語.webp",
+            "a b.png",
+            "x.tar.gz",
+        ] {
+            assert!(
+                check_file_name_for_host(ok, "{stem}.{ext}", false).is_ok(),
+                "{ok:?}"
+            );
+            assert!(
+                check_file_name_for_host(ok, "{stem}.{ext}", true).is_ok(),
+                "{ok:?}"
+            );
+        }
+        // どの OS でも拒否: 制御文字(応答テキストに偽の行を作る)。
+        for bad in ["line\nbreak.png", "tab\there.png", "nul\0byte.png"] {
+            for windows in [false, true] {
+                let err = check_file_name_for_host(bad, "{stem}.{ext}", windows)
+                    .expect_err("must be refused");
+                assert_eq!(error_code(&err), "invalid_filename_template", "{bad:?}");
+            }
+        }
+        // Windows でだけ拒否。Unix では普通の文字なので従来どおり通す。
+        for windows_only in [
+            "D:evil.png",     // ドライブ指定: `dest_dir.join` が dest_dir を捨てる
+            "stream.png:ads", // NTFS 代替データストリーム
+            "CON.png",        // 予約デバイス名
+            "nul",
+            "COM1.jpg",
+            "LPT9",
+            "trailing.", // Windows が黙って削る
+            "trailing ",
+        ] {
+            let err = check_file_name_for_host(windows_only, "{stem}.{ext}", true)
+                .expect_err("must be refused on Windows");
+            assert_eq!(
+                error_code(&err),
+                "invalid_filename_template",
+                "{windows_only:?}"
+            );
+            assert!(
+                check_file_name_for_host(windows_only, "{stem}.{ext}", false).is_ok(),
+                "{windows_only:?} is an ordinary name on Unix"
+            );
+        }
+        // 数字が無い / 0 の COM・LPT は予約名ではない。
+        for ok in ["COM.png", "COM0.png", "LPT.txt", "CONSOLE.png"] {
+            assert!(
+                check_file_name_for_host(ok, "{stem}.{ext}", true).is_ok(),
+                "{ok:?}"
+            );
+        }
+        // 公開の入口はこのホストの規則を使う。
+        assert!(check_file_name("rev_1.png", "{stem}.{ext}").is_ok());
+        assert!(check_file_name("a\nb.png", "{stem}.{ext}").is_err());
+    }
+
+    /// 展開後のファイル名の衝突は、大文字小文字を区別しないファイルシステム(macOS / Windows)
+    /// でだけ小文字化して比べる。Linux では `IMG_1.jpg` と `img_1.jpg` は別のファイル(従来どおり)。
+    #[test]
+    fn filename_collisions_fold_case_only_where_the_file_system_does() {
+        let planned = vec![
+            ("rev_a".to_string(), "IMG_1.jpg".to_string()),
+            ("rev_b".to_string(), "img_1.jpg".to_string()),
+            ("rev_c".to_string(), "other.jpg".to_string()),
+            ("rev_d".to_string(), "other.jpg".to_string()),
+        ];
+        let folded = filename_collisions(&planned, true);
+        assert_eq!(
+            folded,
+            vec![
+                ("IMG_1.jpg", vec!["rev_a", "rev_b"]),
+                ("other.jpg", vec!["rev_c", "rev_d"]),
+            ]
+        );
+        let exact = filename_collisions(&planned, false);
+        assert_eq!(exact, vec![("other.jpg", vec!["rev_c", "rev_d"])]);
+        assert!(filename_collisions(&planned[..1], true).is_empty());
     }
 
     /// 未知キーを何千個も詰めた op でも、原因フィールドの探索が二乗時間で
