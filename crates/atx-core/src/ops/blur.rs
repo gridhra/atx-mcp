@@ -117,21 +117,25 @@ pub fn gaussian_blur(img: &LinearImage, sigma: f64) -> LinearImage {
         }
     });
 
-    // --- パス2: 垂直方向 ---
+    // --- パス2: 垂直方向(ループ交換)---
+    //
+    // 「画素ごとにタップを回す」順ではなく「タップ k ごとに入力行 sy 全体を weight 倍して
+    // 出力行へ足し込む」順で回す(メモリアクセスが行連続になる)。各画素・各チャンネルの
+    // 累算は「0.0(初期化済み)から k 昇順に左結合、乗算と加算は分離」のまま変わらないので、
+    // 出力は従来の実装(`tests::gaussian_blur_reference`)とビット単位で一致する
+    // (proptest `gaussian_blur_matches_reference_bit_for_bit` で固定)。
     let mut out_data = vec![[0f32; 4]; wu * hu];
     parallel::fill_rows(&mut out_data, wu, hu, |y, row| {
-        for (x, slot) in row.iter_mut().enumerate() {
-            let mut acc = [0f32; 4];
-            for (k, &weight) in weights.iter().enumerate() {
-                let dy = k as i64 - radius as i64;
-                let sy = (y as i64 + dy).clamp(0, h as i64 - 1) as usize;
-                let px = horiz[sy * wu + x];
+        for (k, &weight) in weights.iter().enumerate() {
+            let dy = k as i64 - radius as i64;
+            let sy = (y as i64 + dy).clamp(0, h as i64 - 1) as usize;
+            let src = &horiz[sy * wu..(sy + 1) * wu];
+            for (acc, px) in row.iter_mut().zip(src) {
                 for c in 0..4 {
                     let term = px[c] * weight;
                     acc[c] += term;
                 }
             }
-            *slot = acc;
         }
     });
 
@@ -148,9 +152,15 @@ pub fn gaussian_blur(img: &LinearImage, sigma: f64) -> LinearImage {
 /// 端はクランプ。
 ///
 /// v1 は u8 の 256 バケツヒストグラムで求めていたが、v2 の画素は f32 なので
-/// **`f32::total_cmp` による全順序ソート**へ置き換えた(NaN が来ても順序が定まる。
+/// **`f32::total_cmp` による全順序**で中央値を取る(NaN が来ても順序が定まる。
 /// 実際には NaN は生成されないが、比較の全順序性は決定論の前提)。
 /// 順序統計量なので加重平均は発生せず、プリマルチプライは行わない。
+///
+/// 中央値は窓を全ソートせず `select_nth_unstable_by`(k 番目の選択)で取る。
+/// `total_cmp` は全順序で、比較上等しい f32 はビット表現も同一(-0.0 と +0.0 は
+/// 別の値として順序づけられる)なので、rank k の要素はどの選択アルゴリズムでも
+/// 同じビットになる = 全ソート版(`tests::median_reference`)とビット単位で一致する
+/// (proptest `median_matches_reference_bit_for_bit` で固定)。
 pub fn median(img: &LinearImage, radius: u32) -> LinearImage {
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
@@ -176,7 +186,7 @@ pub fn median(img: &LinearImage, radius: u32) -> LinearImage {
             for (c, out_c) in px.iter_mut().enumerate() {
                 channel.clear();
                 channel.extend(window.iter().map(|p| p[c]));
-                channel.sort_by(|a, b| a.total_cmp(b));
+                channel.select_nth_unstable_by(median_rank, |a, b| a.total_cmp(b));
                 *out_c = channel[median_rank];
             }
             *slot = px;
@@ -218,6 +228,173 @@ pub fn unsharp_mask(img: &LinearImage, amount: f64, radius: f64, threshold: u8) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ループ交換前の `gaussian_blur`(垂直パスを画素ごとにタップで回す)。
+    /// 現行実装との**ビット一致**を固定するための参照実装で、変更しない。
+    fn gaussian_blur_reference(img: &LinearImage, sigma: f64) -> LinearImage {
+        let (w, h) = img.dimensions();
+        if w == 0 || h == 0 {
+            return img.clone();
+        }
+        let (radius, weights) = gaussian_kernel(sigma);
+        let premul = img.premultiplied();
+        let (wu, hu) = (w as usize, h as usize);
+
+        let mut horiz = vec![[0f32; 4]; wu * hu];
+        for y in 0..hu {
+            for x in 0..wu {
+                let mut acc = [0f32; 4];
+                for (k, &weight) in weights.iter().enumerate() {
+                    let dx = k as i64 - radius as i64;
+                    let sx = (x as i64 + dx).clamp(0, w as i64 - 1) as usize;
+                    let px = premul.data[y * wu + sx];
+                    for c in 0..4 {
+                        let term = px[c] * weight;
+                        acc[c] += term;
+                    }
+                }
+                horiz[y * wu + x] = acc;
+            }
+        }
+
+        let mut out_data = vec![[0f32; 4]; wu * hu];
+        for y in 0..hu {
+            for x in 0..wu {
+                let mut acc = [0f32; 4];
+                for (k, &weight) in weights.iter().enumerate() {
+                    let dy = k as i64 - radius as i64;
+                    let sy = (y as i64 + dy).clamp(0, h as i64 - 1) as usize;
+                    let px = horiz[sy * wu + x];
+                    for c in 0..4 {
+                        let term = px[c] * weight;
+                        acc[c] += term;
+                    }
+                }
+                out_data[y * wu + x] = acc;
+            }
+        }
+
+        let mut out = LinearImage {
+            width: w,
+            height: h,
+            data: out_data,
+        };
+        out.unpremultiply();
+        out
+    }
+
+    /// 全ソート版の `median`。現行実装(k 番目の選択)との**ビット一致**を固定する
+    /// 参照実装で、変更しない。
+    fn median_reference(img: &LinearImage, radius: u32) -> LinearImage {
+        let (w, h) = img.dimensions();
+        if w == 0 || h == 0 {
+            return img.clone();
+        }
+        let r = radius as i64;
+        let window_len = (2 * radius + 1) as usize * (2 * radius + 1) as usize;
+        let median_rank = window_len / 2;
+        let (wu, hu) = (w as usize, h as usize);
+
+        let mut out_data = vec![[0f32; 4]; wu * hu];
+        let mut window: Vec<[f32; 4]> = Vec::with_capacity(window_len);
+        let mut channel: Vec<f32> = Vec::with_capacity(window_len);
+        for y in 0..hu {
+            for x in 0..wu {
+                window.clear();
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        window.push(img.get_clamped(x as i64 + dx, y as i64 + dy));
+                    }
+                }
+                let mut px = [0f32; 4];
+                for (c, out_c) in px.iter_mut().enumerate() {
+                    channel.clear();
+                    channel.extend(window.iter().map(|p| p[c]));
+                    channel.sort_by(|a, b| a.total_cmp(b));
+                    *out_c = channel[median_rank];
+                }
+                out_data[y * wu + x] = px;
+            }
+        }
+        LinearImage {
+            width: w,
+            height: h,
+            data: out_data,
+        }
+    }
+
+    fn image_from(values: &[f32], w: u32, h: u32) -> LinearImage {
+        let n = (w * h) as usize;
+        let data: Vec<[f32; 4]> = values[..n * 4]
+            .chunks_exact(4)
+            .map(|c| [c[0], c[1], c[2], c[3]])
+            .collect();
+        LinearImage {
+            width: w,
+            height: h,
+            data,
+        }
+    }
+
+    fn assert_bit_identical(
+        a: &LinearImage,
+        b: &LinearImage,
+    ) -> std::result::Result<(), proptest::test_runner::TestCaseError> {
+        proptest::prop_assert_eq!(a.dimensions(), b.dimensions());
+        for (i, (pa, pb)) in a.data.iter().zip(&b.data).enumerate() {
+            for c in 0..4 {
+                proptest::prop_assert_eq!(
+                    pa[c].to_bits(),
+                    pb[c].to_bits(),
+                    "pixel {} channel {} differs: {} vs {}",
+                    i,
+                    c,
+                    pa[c],
+                    pb[c]
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// ±0.0 と任意の 0..1 値を混ぜた f32(median の選択アルゴリズムが
+    /// 「比較上等しい = ビット同一」に頼っていることを ±0.0 で突く)。
+    fn unit_or_signed_zero() -> impl proptest::strategy::Strategy<Value = f32> {
+        proptest::prop_oneof![
+            2 => proptest::prelude::Just(0.0f32),
+            2 => proptest::prelude::Just(-0.0f32),
+            6 => 0.0f32..=1.0,
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// 垂直パスのループ交換は画素間の実行順序しか変えないので、
+        /// 参照実装と f32 のビット表現まで一致する。
+        #[test]
+        fn gaussian_blur_matches_reference_bit_for_bit(
+            w in 1u32..=32,
+            h in 1u32..=32,
+            sigma in 0.1f64..=100.0,
+            values in proptest::collection::vec(0.0f32..=1.0, 32 * 32 * 4),
+        ) {
+            let img = image_from(&values, w, h);
+            assert_bit_identical(&gaussian_blur(&img, sigma), &gaussian_blur_reference(&img, sigma))?;
+        }
+
+        /// k 番目の選択と全ソートは、全順序 `total_cmp` の下で同じビットの要素を返す。
+        #[test]
+        fn median_matches_reference_bit_for_bit(
+            w in 1u32..=12,
+            h in 1u32..=12,
+            radius in 1u32..=16,
+            values in proptest::collection::vec(unit_or_signed_zero(), 12 * 12 * 4),
+        ) {
+            let img = image_from(&values, w, h);
+            assert_bit_identical(&median(&img, radius), &median_reference(&img, radius))?;
+        }
+    }
 
     #[test]
     fn gaussian_weights_sum_to_one() {
