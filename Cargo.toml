@@ -29,7 +29,6 @@ atx-store = { package = "asset-transform-store", path = "crates/atx-store", vers
 
 image = "0.25.10"
 imageproc = "0.27"
-fast_image_resize = "6.1"
 kamadak-exif = "0.6"
 jpeg-encoder = "0.7"
 webp = "0.3"
