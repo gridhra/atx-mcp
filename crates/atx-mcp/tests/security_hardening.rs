@@ -271,3 +271,57 @@ fn plain_export_and_overwrite_still_work_without_leftovers() {
     let entries: Vec<_> = std::fs::read_dir(out.path()).unwrap().collect();
     assert_eq!(entries.len(), 1, "no temporary files may be left behind");
 }
+
+/// macOS の firmlink 別名(`/System/Volumes/Data/<パス>` は `<パス>` と同じ実体を指すが、
+/// `canonicalize` は別名のまま返す)で書き出し先を指しても、ワークスペース内への
+/// 書き込みとして拒否されること。
+///
+/// 由来: 2026-10-22 のレビューで、別名を使った overwrite=true の export が objects/ の
+/// 原本と台帳(assets.jsonl)を書き換えられることを実測した。ワークスペース内判定が
+/// 正規化後の**文字列**の前方一致だけで行われていたため。
+#[cfg(target_os = "macos")]
+#[test]
+fn a_firmlink_alias_of_the_workspace_is_refused() {
+    let (_ws, tools) = tools();
+    let scene = structured(&import(
+        &tools,
+        &fixture("tests/fixtures/synthetic_scene.jpg"),
+    ));
+    let badge = structured(&import(&tools, &fixture("tests/fixtures/badge.svg")));
+    let scene_rev = tools.store().get_revision(&revision_id(&scene)).unwrap();
+    let object = tools.store().abs_path(&scene_rev);
+    let original = std::fs::read(&object).unwrap();
+    let ledger = tools.store().root().join("assets.jsonl");
+    let ledger_before = std::fs::read(&ledger).unwrap();
+
+    let alias =
+        |real: &Path| PathBuf::from("/System/Volumes/Data").join(real.strip_prefix("/").unwrap());
+    if !alias(tools.store().root()).exists() {
+        eprintln!("skipping: this volume has no /System/Volumes/Data firmlink alias");
+        return;
+    }
+
+    let attempts = [
+        (alias(&object), true),
+        (alias(&ledger), true),
+        (alias(&object).with_file_name("planted.svg"), false),
+    ];
+    for (dest, overwrite) in attempts {
+        let mut params = ExportAssetParams::single(revision_id(&badge), dest.to_string_lossy());
+        params.overwrite = overwrite;
+        let payload = error_payload(&tools.export_asset(&params));
+        assert_eq!(
+            payload["error"]["code"],
+            "dest_inside_workspace",
+            "{}: {payload}",
+            dest.display()
+        );
+        assert!(!dest.with_file_name("planted.svg").exists());
+    }
+    assert!(
+        std::fs::read(&object).unwrap() == original,
+        "the stored object must stay byte-identical"
+    );
+    assert!(std::fs::read(&ledger).unwrap() == ledger_before);
+    assert!(tools.store().list_revisions(None).is_ok());
+}

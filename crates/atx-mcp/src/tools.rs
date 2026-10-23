@@ -3665,10 +3665,17 @@ impl AtxTools {
     /// 比較は**両側を canonicalize してから**行う: macOS の /tmp は
     /// /private/tmp へのシンボリックリンクなので、文字列比較だけでは
     /// シンボリックリンク経由のパスが素通りしてしまう。
+    ///
+    /// 文字列の前方一致に加えて、**実体(dev/inode)での判定**も行う。macOS の firmlink
+    /// (`/System/Volumes/Data/<パス>` は `<パス>` と同じディレクトリだが、`canonicalize` は
+    /// 別名のまま返す)のように、同じ場所を別の綴りで指す経路は文字列比較では見抜けない
+    /// (2026-10-22 のレビューで、別名経由の overwrite=true が objects/ の原本と台帳を
+    /// 書き換えられることを実測した)。
     fn check_dest_inside_workspace(&self, dest: &Path, field: &str) -> Result<(), CallToolResult> {
         let ws_root = real_prefix(self.store.root());
         let dest_real = real_prefix(dest);
-        if !dest_real.starts_with(&ws_root) {
+        if !dest_real.starts_with(&ws_root) && !is_inside_by_identity(&dest_real, self.store.root())
+        {
             return Ok(());
         }
         Err(tool_error(
@@ -4788,6 +4795,36 @@ fn real_prefix(path: &Path) -> PathBuf {
             return path.to_path_buf();
         }
     }
+}
+
+/// 書き出し先(`real_prefix` 済み)の実在する祖先のどれかが、ワークスペース root と
+/// **同じ実体**(同じ dev/inode)であるか。
+///
+/// `real_prefix` の文字列比較だけでは、同じディレクトリを別の綴りで指す経路
+/// (macOS の firmlink `/System/Volumes/Data/<パス>`。`canonicalize` は別名のまま返す)を
+/// 見抜けない。祖先を順に stat して root と実体を比べれば、綴りに依らず判定できる。
+/// 存在しない成分(これから作るファイル名)は stat に失敗するので読み飛ばす。
+#[cfg(unix)]
+fn is_inside_by_identity(dest_real: &Path, root: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(root_meta) = std::fs::metadata(root) else {
+        return false;
+    };
+    let root_id = (root_meta.dev(), root_meta.ino());
+    dest_real.ancestors().any(|ancestor| {
+        std::fs::metadata(ancestor)
+            .map(|m| (m.dev(), m.ino()) == root_id)
+            .unwrap_or(false)
+    })
+}
+
+/// Windows には安定した inode 相当の API が無いので、大文字小文字を無視した前方一致で
+/// 補う(NTFS は大文字小文字を区別しない)。
+#[cfg(not(unix))]
+fn is_inside_by_identity(dest_real: &Path, root: &Path) -> bool {
+    let lower = |p: &Path| p.to_string_lossy().to_lowercase();
+    let root_real = real_prefix(root);
+    Path::new(&lower(dest_real)).starts_with(Path::new(&lower(&root_real)))
 }
 
 /// export の書き込み本体。**既存のリンクを辿らない**書き方に限定する
