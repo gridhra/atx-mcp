@@ -1404,3 +1404,83 @@ fn render_preview_without_recipe_shows_the_source_image() {
     let err = error_payload(&applied);
     assert_eq!(err["error"]["code"], "invalid_recipe");
 }
+
+/// 既存 JPEG バイト列の SOI 直後に Orientation のみの EXIF APP1 を注入する
+/// (atx-core の tests/engine.rs と同じ組み立て。フィクスチャは EXIF を持たないため)。
+fn insert_exif_orientation(jpeg: &[u8], orientation: u16) -> Vec<u8> {
+    let mut tiff: Vec<u8> = Vec::new();
+    tiff.extend_from_slice(b"MM\x00\x2a");
+    tiff.extend_from_slice(&8u32.to_be_bytes());
+    tiff.extend_from_slice(&1u16.to_be_bytes());
+    tiff.extend_from_slice(&0x0112u16.to_be_bytes());
+    tiff.extend_from_slice(&3u16.to_be_bytes());
+    tiff.extend_from_slice(&1u32.to_be_bytes());
+    tiff.extend_from_slice(&orientation.to_be_bytes());
+    tiff.extend_from_slice(&[0, 0]);
+    tiff.extend_from_slice(&0u32.to_be_bytes());
+    let mut payload = b"Exif\x00\x00".to_vec();
+    payload.extend_from_slice(&tiff);
+    let mut out = jpeg[0..2].to_vec();
+    out.extend_from_slice(&[0xFF, 0xE1]);
+    out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+    out.extend_from_slice(&payload);
+    out.extend_from_slice(&jpeg[2..]);
+    out
+}
+
+/// compare_revisions は、他の読み取り系ツールと同じく EXIF Orientation を正規化した
+/// 画素で比較すること。
+///
+/// 由来: 2026-10-22 のレビュー。compare だけが向きを焼かずにデコードしていたため、
+/// Orientation=6 の原本と「それを encode しただけの派生」(台帳上の寸法は同じ)を
+/// diff で比べると dimension_mismatch になっていた。
+#[test]
+fn compare_revisions_normalizes_exif_orientation_like_every_other_tool() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let tools = AtxTools::open(workspace.path()).expect("open workspace");
+    let oriented = insert_exif_orientation(&std::fs::read(fixture()).unwrap(), 6);
+    let path = workspace.path().join("oriented.jpg");
+    std::fs::write(&path, oriented).unwrap();
+    let original =
+        structured(&tools.import_asset(&ImportAssetParams::single(path.to_string_lossy())));
+    let rev_a = original["revision"]["revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (w, h) = (
+        original["revision"]["width"].as_u64().unwrap(),
+        original["revision"]["height"].as_u64().unwrap(),
+    );
+    assert!(
+        w < h,
+        "orientation 6 swaps the fixture's landscape dimensions"
+    );
+
+    let recipe: atx_core::TransformRecipe = serde_json::from_value(
+        serde_json::json!({"operations": [{"op": "encode", "format": "png"}]}),
+    )
+    .unwrap();
+    let derived = structured(&tools.apply_transform(&TransformParams {
+        revision_id: Some(rev_a.clone()),
+        revision_ids: None,
+        recipe: Some(recipe.into()),
+        preset: None,
+    }));
+    let rev_b = derived["revision"]["revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(derived["revision"]["width"].as_u64().unwrap(), w);
+    assert_eq!(derived["revision"]["height"].as_u64().unwrap(), h);
+
+    let diff = structured(&tools.compare_revisions(&CompareRevisionsParams {
+        revision_id_a: rev_a,
+        revision_id_b: rev_b,
+        layout: CompareLayout::Diff,
+    }));
+    // 向きが揃っていれば再エンコードだけの差なので、知覚ハッシュ距離は小さい。
+    assert!(
+        diff["perceptual_hash_distance"].as_u64().unwrap() <= 5,
+        "{diff}"
+    );
+}

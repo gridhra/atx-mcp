@@ -3066,16 +3066,20 @@ impl AtxTools {
         let bytes_a = tri!(self.store.read_bytes(&params.revision_id_a), store_error);
         let bytes_b = tri!(self.store.read_bytes(&params.revision_id_b), store_error);
 
-        let img_a = tri!(
-            image::load_from_memory(&bytes_a)
-                .map_err(|e| AtxError::Decode(format!("revision {}: {e}", rev_a.revision_id))),
-            atx_error
-        );
-        let img_b = tri!(
-            image::load_from_memory(&bytes_b)
-                .map_err(|e| AtxError::Decode(format!("revision {}: {e}", rev_b.revision_id))),
-            atx_error
-        );
+        // 他の読み取り系ツール(detect_* / generate_mask)と同じ経路でデコードする:
+        // limits 検査つきで、EXIF Orientation を画素へ焼き込む。以前は向きを焼かずに
+        // 読んでいたため、Orientation=6 の原本と「それを encode しただけの派生」
+        // (台帳上の寸法は同じ)が layout="diff" で dimension_mismatch になっていた。
+        let decode_side = |bytes: &[u8], rev: &AssetRevision| {
+            atx_core::decode_oriented(bytes, &self.limits).map_err(|e| match e {
+                AtxError::Decode(m) => {
+                    AtxError::Decode(format!("revision {}: {m}", rev.revision_id))
+                }
+                other => other,
+            })
+        };
+        let img_a = tri!(decode_side(&bytes_a, &rev_a), atx_error);
+        let img_b = tri!(decode_side(&bytes_b, &rev_b), atx_error);
 
         // 知覚ハッシュ距離は全 layout で返す(「同じ絵か」は並べ方と無関係な問い)。
         // 縮小前の画素で計算する: dHash は自前で 9x8 に潰すので、
