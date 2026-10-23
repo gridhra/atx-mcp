@@ -1015,6 +1015,13 @@ fn validate_layers(layers: &[Layer]) -> crate::Result<()> {
                 .into(),
         ));
     }
+    if layers.len() > MAX_LAYERS {
+        return Err(InvalidRecipe(format!(
+            "layers has {} entries, over the limit of {MAX_LAYERS}; composite in stages \
+             (apply a recipe, then use its revision as a layer source)",
+            layers.len()
+        )));
+    }
 
     for (i, layer) in layers.iter().enumerate() {
         // ソース参照。
@@ -1106,12 +1113,29 @@ fn prefix_layer(i: usize, e: crate::AtxError) -> crate::AtxError {
     }
 }
 
+/// 1 本のパイプライン(トップレベル、または 1 レイヤー)に書ける op 数の上限。
+///
+/// 1 op の重さは各 op の上限で抑えられているが、時間は op 数に比例して伸び、
+/// マスク付き op はマスクの重み平面を `apply_recipe` の終わりまでキャッシュする
+/// (100MP なら 1 面 400MB)。実用のレシピは十数 op、プリセットは最大 4 op。
+pub const MAX_OPERATIONS_PER_PIPELINE: usize = 128;
+
+/// レイヤー数の上限。各レイヤーはソースを全解像度でデコードして合成する。
+pub const MAX_LAYERS: usize = 32;
+
 /// op 列の静的検証(トップレベルの `operations` とレイヤーの `ops` で共有)。
 fn validate_operations(operations: &[Operation]) -> crate::Result<()> {
     use crate::AtxError::InvalidRecipe;
 
     if operations.is_empty() {
         return Ok(());
+    }
+    if operations.len() > MAX_OPERATIONS_PER_PIPELINE {
+        return Err(InvalidRecipe(format!(
+            "operations has {} entries, over the limit of {MAX_OPERATIONS_PER_PIPELINE} per \
+             pipeline; split the work into several apply_transform calls",
+            operations.len()
+        )));
     }
     let last_index = operations.len() - 1;
 
