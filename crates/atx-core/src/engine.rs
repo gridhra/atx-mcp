@@ -1312,6 +1312,14 @@ fn check_byte_limit(bytes: &[u8], limits: &Limits) -> Result<()> {
 }
 
 fn check_pixel_limit(width: u32, height: u32, limits: &Limits) -> Result<()> {
+    // 幅または高さが 0 の画像は、一部のデコーダ(PNM 等)がヘッダどおりに受理するが、
+    // 画素を持たないので変換の対象にならない。op に流すと幾何変換(rotate の warp 等)が
+    // 空バッファで panic する(2026-10-22 のレビューで実測)ので、入口で弾く。
+    if width == 0 || height == 0 {
+        return Err(AtxError::Decode(format!(
+            "image has a zero dimension ({width}x{height}); nothing to transform"
+        )));
+    }
     let pixels = width as u64 * height as u64;
     if pixels > limits.max_pixels {
         return Err(AtxError::LimitExceeded(format!(

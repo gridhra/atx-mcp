@@ -64,6 +64,7 @@ pub enum AtxError {
 pub type Result<T> = std::result::Result<T, AtxError>;
 
 /// 入力ガード上限。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// 最大画素数(幅×高さ)。デフォルト 100MP。
     pub max_pixels: u64,
