@@ -24,10 +24,15 @@
 //!   ため、排他が無いと同じバイト列の同時 import が重複 revision を作っていた
 //!   (2026-10-22 のレビューで 16 本同時の import から 15 件の revision ができることを実測)。
 //!   別プロセスとの排他は行わない(冪等性が破れても objects/ は内容アドレスなので壊れない)。
+//! - 台帳の末尾に「書きかけの行」(クラッシュや容量不足で途中で切れた JSON)が残ることがある。
+//!   読み出しでは **JSON が途中で切れている行(serde_json の EOF 分類)だけ**を読み飛ばし、
+//!   それ以外の壊れ方(構文エラー・型違い)は従来どおり `LedgerCorrupted` にする。
+//!   追記では、ファイルが改行で終わっていなければ先に改行を書いてから行を足し、
+//!   書きかけの断片に新しい行が連結されないようにする。
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -173,22 +178,53 @@ impl AssetStore {
             if line.trim().is_empty() {
                 continue;
             }
-            let revision: AssetRevision = serde_json::from_str(&line)
-                .map_err(|e| StoreError::LedgerCorrupted(format!("line {}: {}", idx + 1, e)))?;
-            out.push(revision);
+            match serde_json::from_str::<AssetRevision>(&line) {
+                Ok(revision) => out.push(revision),
+                // JSON が途中で切れている行 = 書きかけのまま残った追記(クラッシュ・容量不足)。
+                // 完全な JSON の真の接頭辞は必ず EOF 分類になり、構文エラーや型違いとは
+                // 区別できる。読み飛ばして残りの台帳を生かす(モジュールドキュメント参照)。
+                Err(e) if e.classify() == serde_json::error::Category::Eof => continue,
+                Err(e) => {
+                    return Err(StoreError::LedgerCorrupted(format!(
+                        "line {}: {}",
+                        idx + 1,
+                        e
+                    )))
+                }
+            }
         }
         Ok(out)
     }
 
     /// 台帳に1行追記する(open append + write + flush)。
+    ///
+    /// ファイルが改行で終わっていなければ(= 末尾に書きかけの行がある)、先に改行を
+    /// 書いて断片を自分の行に隔離してから追記する。こうしないと新しい行が断片に連結され、
+    /// 完全な revision まで読めなくなる。
     fn append_ledger(&self, revision: &AssetRevision) -> Result<()> {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
+            .read(true)
             .open(self.ledger_path())?;
-        let mut line =
-            serde_json::to_string(revision).expect("AssetRevision serialization never fails");
+        let len = file.metadata()?.len();
+        let needs_separator = if len == 0 {
+            false
+        } else {
+            file.seek(SeekFrom::Start(len - 1))?;
+            let mut last = [0u8; 1];
+            file.read_exact(&mut last)?;
+            last[0] != b'\n'
+        };
+        let mut line = String::new();
+        if needs_separator {
+            line.push('\n');
+        }
+        line.push_str(
+            &serde_json::to_string(revision).expect("AssetRevision serialization never fails"),
+        );
         line.push('\n');
+        // append モードなので、上の seek に関わらず末尾へ書かれる。
         file.write_all(line.as_bytes())?;
         file.flush()?;
         Ok(())

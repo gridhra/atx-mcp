@@ -378,3 +378,69 @@ fn concurrent_derivations_of_the_same_recipe_yield_one_revision() {
     );
     assert_eq!(store.list_revisions(None).unwrap().len(), 2);
 }
+
+/// 台帳の末尾に「書きかけの行」(クラッシュや容量不足で途中で切れた JSON、改行なし)が
+/// 残っていても、読み出しはその行を飛ばして成功し、次の追記は新しい行から始まること。
+///
+/// 以前は 1 行でも解析できないと台帳を読む全操作が恒久的に失敗し、さらに次の追記が
+/// 書きかけの行に連結されて、ファイル途中の破損として固定されていた。
+#[test]
+fn a_torn_trailing_line_is_skipped_and_the_next_append_starts_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AssetStore::open(dir.path()).unwrap();
+    let first = store
+        .import_bytes(b"first", "image/png", 1, 1, BTreeMap::new())
+        .unwrap();
+
+    let ledger_path = dir.path().join("assets.jsonl");
+    let mut existing = std::fs::read_to_string(&ledger_path).unwrap();
+    let full_line = existing.lines().next().unwrap().to_string();
+    // 完全な 1 行の前半だけを、改行なしで足す(= 途中で切れた書き込み)。
+    existing.push_str(&full_line[..full_line.len() / 2]);
+    std::fs::write(&ledger_path, existing).unwrap();
+
+    let listed = store.list_revisions(None).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].revision_id, first.revision_id);
+
+    let second = store
+        .import_bytes(b"second", "image/png", 1, 1, BTreeMap::new())
+        .unwrap();
+    let listed = store.list_revisions(None).unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].revision_id, first.revision_id);
+    assert_eq!(listed[1].revision_id, second.revision_id);
+    assert_eq!(
+        store.get_revision(&first.revision_id).unwrap().revision_id,
+        first.revision_id
+    );
+
+    // 書きかけの断片は自分の行に隔離され、新しい行は改行の後から始まっている。
+    let text = std::fs::read_to_string(&ledger_path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3, "valid, torn fragment, valid: {text}");
+    assert!(serde_json::from_str::<serde_json::Value>(lines[2]).is_ok());
+}
+
+/// 途中の行が壊れている(改行で終わる、構文として不正な行)場合は従来どおり
+/// 台帳破損として報告すること。書きかけの行の読み飛ばしは、JSON が途中で切れている
+/// (EOF)場合に限る。
+#[test]
+fn a_syntactically_broken_line_in_the_middle_is_still_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AssetStore::open(dir.path()).unwrap();
+    store
+        .import_bytes(b"first", "image/png", 1, 1, BTreeMap::new())
+        .unwrap();
+    let ledger_path = dir.path().join("assets.jsonl");
+    let mut existing = std::fs::read_to_string(&ledger_path).unwrap();
+    existing.push_str("{\"asset_id\": 12, \"revision_id\": true}\n");
+    std::fs::write(&ledger_path, existing).unwrap();
+    store
+        .import_bytes(b"second", "image/png", 1, 1, BTreeMap::new())
+        .ok();
+    assert!(matches!(
+        store.list_revisions(None),
+        Err(StoreError::LedgerCorrupted(_))
+    ));
+}
