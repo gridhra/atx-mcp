@@ -89,7 +89,16 @@ fn parse_triple(fields: &[&str], line: usize, what: &str) -> Result<[f64; 3]> {
         if !v.is_finite() {
             return Err(err(line, format!("{what}: {f:?} is not finite")));
         }
-        out[i] = quantize(v);
+        // 量子化(`v * 1e6`)で桁あふれすると ±inf になり、検証も適用も通ったうえで
+        // 全画素が NaN → 黒になる(2026-10-22 のレビュー)。量子化後の値で有限性を見る。
+        let q = quantize(v);
+        if !q.is_finite() {
+            return Err(err(
+                line,
+                format!("{what}: {f:?} is too large to represent on the 1e-6 grid"),
+            ));
+        }
+        out[i] = q;
     }
     Ok(out)
 }
