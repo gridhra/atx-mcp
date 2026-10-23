@@ -154,6 +154,10 @@ MCP クライアントの設定ファイルに直接書く場合:
 
 `--workspace`(env: `ATX_WORKSPACE`)はアセットストアのディレクトリ。存在しなければ作成される。
 
+`--max-concurrent-tools`(env: `ATX_MAX_CONCURRENT_TOOLS`)は、画素を扱うツール(import / inspect /
+detect_* / apply / preview / compare / mask)の同時実行数の上限。既定は CPU 数。メモリの少ない環境では下げる。
+ツールの実処理は専用スレッドで動くので、画像の処理中も stdio の応答(ping・キャンセル・語彙参照ツール)は止まらない。
+
 ## ツール(13)
 
 | ツール | 役割 |

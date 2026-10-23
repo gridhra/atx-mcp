@@ -939,7 +939,7 @@ fn ok_result_with<T: Serialize>(
 ///
 /// content[0] は人間可読メッセージ、content[1] は `{"error": {...}}` の JSON テキスト。
 /// outputSchema に適合しないので `structured_content` には載せない。
-fn tool_error(
+pub(crate) fn tool_error(
     code: &str,
     message: impl Into<String>,
     details: serde_json::Value,

@@ -164,6 +164,13 @@ Or add it directly to your MCP client config:
 `--workspace` (env: `ATX_WORKSPACE`) is the directory used as the asset store.
 It is created automatically if it doesn't exist.
 
+`--max-concurrent-tools` (env: `ATX_MAX_CONCURRENT_TOOLS`) caps how many
+pixel-processing tool calls (import / inspect / detect_* / apply / preview /
+compare / mask) run at the same time; the default is the CPU count. Lower it on
+memory-constrained hosts. Tool work runs on dedicated threads, so the stdio
+transport (ping, cancellation, the vocabulary tools) stays responsive while
+images are being processed.
+
 ## Tools (13)
 
 | Tool | Role |

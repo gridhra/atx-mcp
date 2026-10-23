@@ -153,6 +153,10 @@ claude mcp add --scope user asset-transform -- npx -y atx-mcp --workspace /path/
 
 `--workspace`(env: `ATX_WORKSPACE`)是用作资产存储的目录。若不存在会自动创建。
 
+`--max-concurrent-tools`(env: `ATX_MAX_CONCURRENT_TOOLS`)限制同时运行的像素处理类工具调用数
+(import / inspect / detect_* / apply / preview / compare / mask),默认为 CPU 核数。内存紧张的环境可调低。
+工具的实际处理在专用线程上运行,因此处理图片期间 stdio 传输(ping、取消、词汇查询工具)仍保持响应。
+
 ## 工具(13 个)
 
 | 工具 | 作用 |

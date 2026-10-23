@@ -96,18 +96,98 @@ Splitting one image into several files (two sheets on one mount, a scanned sprea
 Visual verification: render_preview takes an optional `overlay` ("grid" | "thirds" | "horizon", or "mask" with a mask_revision_id); compare_revisions shows two revisions side by side or stacked inline, or layout="diff" (same dimensions) for a difference heatmap plus mean/max/changed-ratio stats."#;
 
 /// MCP サーバ本体。ワークスペース1つに対応する。
+///
+/// # 同期処理の逃がし方
+///
+/// rmcp は要求ごとに別の tokio タスクを起こす(rmcp 3.3 `service.rs` の `spawn_service_task`)。
+/// ツールの実処理([`AtxTools`])は同期で、画像 1 枚に数秒かかるので、async 関数の中で
+/// 直接呼ぶとその間 tokio のワーカースレッドが塞がる。ワーカー数は既定で CPU 数なので、
+/// 同時要求がそれを超えると(CPU 1 個のコンテナでは 1 件で)stdin の読み取り・ping・
+/// キャンセル通知・軽いツールまで止まる(2026-10-22 のレビューで、ワーカー数より 2 本多い
+/// apply_transform の同時実行中に ping が 9 秒待たされることを実測)。
+///
+/// そこで実処理は `tokio::task::spawn_blocking` の専用スレッドへ逃がし、画素を扱う
+/// ツールは `Semaphore` で同時実行数を抑える(既定 = CPU 数。各ツールは内部で CPU 数の
+/// スレッドに並列化するので、それ以上同時に走らせてもスループットは増えずメモリだけ増える)。
+/// 語彙参照(list_operations / explain_operation)は数マイクロ秒なのでそのまま実行する。
 #[derive(Clone)]
 pub struct AtxServer {
     tools: Arc<AtxTools>,
+    /// 画素を扱うツールの同時実行数の上限。
+    heavy: Arc<tokio::sync::Semaphore>,
     tool_router: ToolRouter<Self>,
+}
+
+/// ツールの実処理の重さ。`AtxServer::run` がどう逃がすかを決める。
+#[derive(Clone, Copy)]
+enum Cost {
+    /// 画素のデコード・変換を伴う: permit を取ってから専用スレッドで実行する。
+    Heavy,
+    /// ファイル I/O と台帳の走査だけ: 専用スレッドで実行する(permit は取らない)。
+    Blocking,
 }
 
 #[tool_router(router = tool_router)]
 impl AtxServer {
+    /// 既定の同時実行数(CPU 数)で作る。
     pub fn new(tools: Arc<AtxTools>) -> Self {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        Self::with_max_concurrent(tools, cores)
+    }
+
+    /// 画素を扱うツールの同時実行数を指定して作る(0 は 1 として扱う)。
+    pub fn with_max_concurrent(tools: Arc<AtxTools>, max_concurrent: usize) -> Self {
         Self {
             tools,
+            heavy: Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1))),
             tool_router: Self::tool_router(),
+        }
+    }
+
+    /// 同期の実処理を専用スレッドで実行し、結果を返す。
+    ///
+    /// 実処理が panic しても応答を返す(以前は応答が送られず、クライアントは自分の
+    /// タイムアウトまで待っていた)。
+    async fn run<F>(&self, cost: Cost, f: F) -> CallToolResult
+    where
+        F: FnOnce(&AtxTools) -> CallToolResult + Send + 'static,
+    {
+        let permit = match cost {
+            // acquire_owned が Err になるのは close() の後だけで、close() は呼ばない。
+            // 万一そうなっても要求を落とさず続行する(.ok())。
+            Cost::Heavy => Arc::clone(&self.heavy).acquire_owned().await.ok(),
+            Cost::Blocking => None,
+        };
+        let tools = Arc::clone(&self.tools);
+        let joined = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f(&tools)
+        })
+        .await;
+        match joined {
+            Ok(result) => result,
+            Err(e) => {
+                let reason = if e.is_panic() {
+                    match e.into_panic().downcast::<String>() {
+                        Ok(message) => *message,
+                        Err(payload) => payload
+                            .downcast::<&str>()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|_| "unknown panic payload".to_string()),
+                    }
+                } else {
+                    "the worker task was cancelled".to_string()
+                };
+                crate::tools::tool_error(
+                    "internal_error",
+                    format!("the tool failed unexpectedly: {reason}"),
+                    serde_json::json!({
+                        "recovery": "report this as a bug with the exact arguments and a description of the input; the workspace itself is not affected (originals are never modified)",
+                    }),
+                )
+            }
         }
     }
 
@@ -138,7 +218,8 @@ impl AtxServer {
         &self,
         Parameters(params): Parameters<ImportAssetParams>,
     ) -> CallToolResult {
-        self.tools.import_asset(&params)
+        self.run(Cost::Heavy, move |tools| tools.import_asset(&params))
+            .await
     }
 
     /// Inspect a revision: dimensions, MIME type, byte size, alpha/ICC presence,
@@ -164,7 +245,8 @@ impl AtxServer {
         &self,
         Parameters(params): Parameters<InspectImageParams>,
     ) -> CallToolResult {
-        self.tools.inspect_image(&params)
+        self.run(Cost::Heavy, move |tools| tools.inspect_image(&params))
+            .await
     }
 
     /// Detect the tilt (roll) of a revision: Canny + Hough dominant lines for coarse
@@ -189,7 +271,8 @@ impl AtxServer {
         &self,
         Parameters(params): Parameters<DetectTiltParams>,
     ) -> CallToolResult {
-        self.tools.detect_tilt(&params)
+        self.run(Cost::Heavy, move |tools| tools.detect_tilt(&params))
+            .await
     }
 
     /// Detect the dominant quadrilateral (a sheet of paper, a screen, a whiteboard, a sign)
@@ -216,7 +299,8 @@ impl AtxServer {
         &self,
         Parameters(params): Parameters<DetectDocumentParams>,
     ) -> CallToolResult {
-        self.tools.detect_document(&params)
+        self.run(Cost::Heavy, move |tools| tools.detect_document(&params))
+            .await
     }
 
     /// Find the text-like blocks (headline, paragraphs, table, caption) of a revision with
@@ -249,7 +333,8 @@ impl AtxServer {
         &self,
         Parameters(params): Parameters<DetectTextBlocksParams>,
     ) -> CallToolResult {
-        self.tools.detect_text_blocks(&params)
+        self.run(Cost::Heavy, move |tools| tools.detect_text_blocks(&params))
+            .await
     }
 
     /// Compact catalog of the recipe vocabulary: every operation with a one-line
@@ -324,7 +409,8 @@ impl AtxServer {
         &self,
         Parameters(params): Parameters<GenerateMaskParams>,
     ) -> CallToolResult {
-        self.tools.generate_mask(&params)
+        self.run(Cost::Heavy, move |tools| tools.generate_mask(&params))
+            .await
     }
 
     /// Apply a transform recipe at full resolution and issue a new revision.
@@ -353,7 +439,8 @@ impl AtxServer {
         &self,
         Parameters(params): Parameters<TransformParams>,
     ) -> CallToolResult {
-        self.tools.apply_transform(&params)
+        self.run(Cost::Heavy, move |tools| tools.apply_transform(&params))
+            .await
     }
 
     /// Render a recipe as a small JPEG preview (long edge <= 768 by default) and return it
@@ -386,7 +473,8 @@ impl AtxServer {
         &self,
         Parameters(params): Parameters<RenderPreviewParams>,
     ) -> CallToolResult {
-        self.tools.render_preview(&params)
+        self.run(Cost::Heavy, move |tools| tools.render_preview(&params))
+            .await
     }
 
     /// Scale two revisions to a long edge of 640px each and compose them on one canvas
@@ -413,7 +501,8 @@ impl AtxServer {
         &self,
         Parameters(params): Parameters<CompareRevisionsParams>,
     ) -> CallToolResult {
-        self.tools.compare_revisions(&params)
+        self.run(Cost::Heavy, move |tools| tools.compare_revisions(&params))
+            .await
     }
 
     /// List revisions in the workspace ledger (lineage, recipe hash, dimensions, sizes).
@@ -432,7 +521,8 @@ impl AtxServer {
         &self,
         Parameters(params): Parameters<ListAssetsParams>,
     ) -> CallToolResult {
-        self.tools.list_assets(&params)
+        self.run(Cost::Blocking, move |tools| tools.list_assets(&params))
+            .await
     }
 
     /// Copy revisions' bytes out of the workspace. Pass either `revision_id` + `dest_path`
@@ -460,7 +550,8 @@ impl AtxServer {
         &self,
         Parameters(params): Parameters<ExportAssetParams>,
     ) -> CallToolResult {
-        self.tools.export_asset(&params)
+        self.run(Cost::Blocking, move |tools| tools.export_asset(&params))
+            .await
     }
 }
 

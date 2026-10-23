@@ -63,7 +63,9 @@ thiserror = "2"
 anyhow = "1"
 ulid = "3"
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+# `sync`(Semaphore)と `rt`(spawn_blocking)は atx-mcp の server.rs が直接使う。
+# rmcp 経由で推移的に有効になるが、依存の feature 変更で消えないよう明示する。
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rmcp = { version = "3.1", features = ["server", "macros", "transport-io"] }
