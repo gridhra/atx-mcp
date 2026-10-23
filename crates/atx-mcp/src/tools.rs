@@ -1380,12 +1380,16 @@ struct StoreAssets<'a>(&'a AssetStore);
 
 impl atx_core::AssetResolver for StoreAssets<'_> {
     fn read_revision(&self, revision_id: &str) -> atx_core::Result<Vec<u8>> {
+        // LUT / SVG / フォント / マスク / レイヤーのソースのどれでもここを通るので、
+        // 文言は種別に依らない形にする(以前は .cube 前提の案内になっていた)。
         self.0.read_bytes(revision_id).map_err(|e| match e {
             StoreError::RevisionNotFound(id) => AtxError::InvalidRecipe(format!(
                 "referenced asset {id:?} was not found in this workspace; \
-                 import the .cube file with import_asset first and use the revision_id it \
-                 returns, or call list_assets to see the available revision_ids"
+                 import the file (image, mask, .cube LUT, SVG or font) with import_asset first \
+                 and use the revision_id it returns, or call list_assets to see the available \
+                 revision_ids"
             )),
+            StoreError::Io(io) => AtxError::Io(io),
             other => AtxError::InvalidRecipe(format!(
                 "referenced asset {revision_id:?} could not be read: {other}"
             )),
