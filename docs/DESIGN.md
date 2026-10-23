@@ -1991,3 +1991,155 @@ LLM や拡散モデルによる生成は 2 と 3 で外れ、`heal` と本節の
 - 紙の縦横比の推定は入れない(1 枚の写真からは当てにならない。外部の基準を `output_size` で渡す方が確実、と判断)。
 - `fill: "extend"` の帯に紙らしい画素が足りない(図柄で覆われている等)ときの挙動: `pad_color` に**戻して警告**する案が有力だが未確定。
 - 紙の縁の厚みの影(1〜2 px の灰色線)は補完部に再現しない(仕上がりへの影響は小さい)。
+
+### 9.19 コードレビュー(効率・セキュリティ・設計)への対応(2026-10-22)
+
+読み取り専用のレビュー 5 本(MCP 層とストアのセキュリティ / コアのセキュリティとメモリ / コアの計算効率 /
+幾何検出の効率と頑健性 / アーキテクチャ)を並行して行い、指摘を「失敗するテストで再現 → 修正 → 通過」の順で直した。
+レシピ canonical hash・MCP ツール数(13)・既存のゴールデンテスト(出力バイト列のピン留め)はいずれも変えていない。
+依存関係の監査(cargo audit / cargo deny)は修正前後とも脆弱性 0 件。workspace 内に `unsafe` は無い。
+
+#### (1) export の書き出し先の内外判定を、ワークスペースの**別名**にも効くようにした
+
+**出来事**: macOS では `/System/Volumes/Data/<パス>` が `<パス>` と同じディレクトリを指す(firmlink)が、
+`canonicalize` は別名のまま返す。ワークスペース内判定は正規化後の**文字列**の前方一致だけだったので、
+別名で objects/ の原本や台帳(assets.jsonl)を指した `export_asset`(overwrite=true)が通り、原本が別の revision の
+バイト列に置き換わり、台帳が壊れた(実測)。
+
+**原因**: `check_dest_inside_workspace` が `real_prefix`(実在する祖先の canonicalize)の文字列比較だけで判定していた。
+
+**修正**: 文字列比較に加えて、書き出し先の実在する祖先を順に stat し、ワークスペース root と**同じ実体**
+(同じ dev/inode)なら内側とみなす(`is_inside_by_identity`、Unix)。Windows は大文字小文字を無視した前方一致で補う
+(安定した inode 相当の API が無い)。
+
+**テスト**: `tests/security_hardening.rs` の `a_firmlink_alias_of_the_workspace_is_refused`(macOS のみ。CI の
+macos-14 で走る)。別名で原本・台帳・新規ファイルの 3 通りを試し、すべて `dest_inside_workspace`、原本と台帳が不変。
+修正前は 3 通りとも書けて失敗することを確認した。
+
+#### (2) 同期の実処理が tokio のワーカーを塞ぎ、同時要求で ping・キャンセル・軽いツールまで止まった
+
+**出来事**: rmcp は要求ごとに別タスクを起こす(rmcp 3.3 `service.rs` の `spawn_service_task` = `tokio::spawn`)。
+server.rs の全ツールは `async fn` の中で同期の実処理(画像 1 枚に数秒)を直接呼んでいたので、同時要求がワーカー数
+(既定 = CPU 数)に達すると stdin の読み取りが止まる。ワーカー数より 2 本多い apply_transform の同時実行中、ping と
+list_operations が 9 秒待たされた。CPU 1 個のコンテナでは 1 件で止まる。panic した要求には応答が返らなかった。
+
+**修正**: `AtxServer::run` を設け、実処理を `tokio::task::spawn_blocking` の専用スレッドで実行する。
+画素を扱うツール(import / inspect / detect_* / generate_mask / apply / preview / compare)は `Semaphore` で
+同時実行数を抑える(既定 = CPU 数。各ツールは内部で CPU 数のスレッドに並列化するので、それ以上同時に走らせても
+スループットは増えずメモリだけ増える)。list_assets / export は専用スレッドのみ、語彙参照 2 ツールはそのまま実行。
+panic は `internal_error` の構造化エラーとして返す。CLI に `--max-concurrent-tools`(env `ATX_MAX_CONCURRENT_TOOLS`)を
+足した(README 3 言語)。`AtxTools` は同期のままで、統合テストの書き方は変わらない。
+
+**テスト**: 新規 `tests/server_concurrency.rs`。ワーカー 1 本の runtime で重い render_preview の最中に
+list_operations を呼び、1 秒以内に返ることを確かめる。修正前は重い方が終わるまで(デバッグビルドで 128 秒)待たされて失敗した。
+
+#### (3) ストアの書き込みに排他が無く、並行呼び出しで冪等性が破れた。台帳末尾の書きかけ行で全停止した
+
+**出来事**: `import_bytes` / `record_derivation` は「台帳を走査 → 無ければ追記」を排他なしで行っていたので、
+同じバイト列を 16 本同時に import すると 15 件の revision ができた(objects/ は内容アドレスなのでバイト列は壊れない)。
+また台帳の最終行がクラッシュや容量不足で途中で切れると、以後の全ツールが `ledger corrupted` で失敗し続け、
+次の追記がその断片に連結されてファイル途中の破損として固定されていた。
+
+**修正**(atx-store): 2 つの書き込み操作をプロセス内の `Mutex` で直列化する(別プロセスとの排他は行わない。
+冪等性が破れても objects/ は壊れないため)。読み出しは JSON が途中で切れている行(serde_json の EOF 分類。
+完全な JSON の真の接頭辞は必ずこの分類になる)だけを読み飛ばし、構文エラーや型違いは従来どおり致命的にする。
+追記はファイルが改行で終わっていなければ先に改行を書く。あわせて `list_revisions` を台帳の出現順にした
+(`created_at` の文字列順は RFC3339 の小数秒の省略で時刻順とずれることがあった)。
+
+**テスト**: `concurrent_imports_of_the_same_bytes_yield_one_revision`、
+`concurrent_derivations_of_the_same_recipe_yield_one_revision`、
+`a_torn_trailing_line_is_skipped_and_the_next_append_starts_fresh`、
+`a_syntactically_broken_line_in_the_middle_is_still_an_error`(修正前は前 3 つが失敗)。
+
+#### (4) 一括 export のファイル名: 大文字小文字だけ違う名前の衝突と、可搬でない名前
+
+**出来事**: APFS / NTFS は大文字小文字を区別しないので `IMG_1.jpg` と `img_1.jpg` は同じファイルになるが、
+衝突検査は区別していた。overwrite=true では「2 件書いた」と報告しながら 1 件が黙って失われ、overwrite=false では
+1 件目を書いた後で 2 件目が `dest_exists` になった。また `{stem}`(取り込み元のファイル名)に改行が入ると応答テキストに
+偽の行を作れ、Windows では `D:name`(`dest_dir.join` が dest_dir を捨てる)、`name:stream`(NTFS 代替データストリーム)、
+`CON.png`(予約デバイス名)、末尾の `.` や空白が問題になる(Windows は未検証、コードと std の文書から)。
+
+**修正**: 衝突の判定は、既定のファイルシステムが大文字小文字を区別しない OS(macOS / Windows)では小文字化して行う。
+Linux は従来どおり区別する(ext4 等では別のファイルとして書けるので、既存の挙動を狭めない)。展開後のファイル名は、
+制御文字を OS を問わず拒否し、Windows で動いているときはさらに `:`・予約デバイス名・末尾の `.` と空白も拒否する
+(Unix ではこれらは普通の文字で、取り込み元の名前がそのまま使えていた)。
+**挙動の変化**: macOS / Windows では大文字小文字だけ違う 2 件が `filename_collision` になる(`{revision_id}` か
+`{index}` で回避できる)。Linux と、Unix 上の `:` を含む名前は変わらない。
+セルフレビュー(2026-10-23)で「OS を問わず拒否」から改めた: Unix で `:` や末尾の `.` を含む名前を拒否しても
+安全上の利益が無く、以前は書けていた名前が書けなくなるだけだった。
+
+**テスト**: `tests/batch.rs` の `filenames_that_differ_only_by_case_collide`(macOS / Windows でのみ走る)、tools.rs の
+`expanded_file_names_are_checked_for_the_host`(両方の規則を直接通す)と `filename_collisions_fold_case_only_where_the_file_system_does`。
+
+#### (5) 小さな修正
+
+- `field_suffix`(壊れた op の原因フィールドの特定)はキーごとに deserialize し直すので二乗時間だった。未知キー 8000 個の
+  op で 6 秒以上ワーカーを塞いだ。キー数が 32 を超えたら特定を諦める(`locating_a_bad_field_gives_up_on_absurdly_wide_operations`)。
+- `compare_revisions` だけが EXIF Orientation を焼かずにデコードしていたので、Orientation=6 の原本と encode だけの派生が
+  `dimension_mismatch` になった。他の読み取り系と同じ `decode_oriented`(limits 検査つき)にした
+  (`compare_revisions_normalizes_exif_orientation_like_every_other_tool`)。**挙動の変化**: 向きを持つ入力の比較画像は正立で描かれる。
+- WebP は 1 辺 16383px まで(libwebp の上限)。超えると `webp` クレートが panic した(画素数上限の内側でも 16384x2 で起きる)。
+  エンコード前に検査して `Encode` エラーにする(`tests/codec_limits.rs`)。
+- 幅または高さが 0 の画像を PNM デコーダがヘッダどおりに受理し、画素数検査(0 <= 上限)を通って rotate の warp が panic した。
+  寸法検査で 0 を `Decode` エラーにする(`tests/zero_dimensions.rs`)。
+- 幾何検出の Hough で `w*w + h*h` を u32 で計算していた(長辺 65536 以上で桁あふれ。MCP 経由では縮小後なので到達しない)。u64 にした。
+- SVG の `<image href="data:image/svg+xml,...">`(入れ子 SVG)は、usvg が `<image>` のインスタンスごとに解析し直し
+  (キャッシュしない)、`<use>` で複製された分も別々に数える。要素数の上限(100 万)は木 1 本ごとにしか効かないので、
+  数 KB の SVG で「解析回数 × 要素数」のメモリを確保させられ、import 時の検証(`validate_svg_asset`)でも発火した
+  (1000 × 1000 の入れ子で 1.2 GB を実測)。`resolve_data` を包んで 1 回の解析あたりの読み込み回数を数え、
+  上限 16(`MAX_NESTED_SVG_IMAGES`)を超えた分は読み込まない。import では超過を `invalid_asset` として拒否し、
+  描画では描かずに警告する(`tests/svg_nesting_limits.rs`。既存の入れ子 1 段のテストはそのまま通る)。
+  **挙動の変化**: 入れ子 SVG を 17 以上含む SVG は取り込めなくなる(取り込み済みのものは上限まで描かれる)。
+- resvg が描画時に確保するバッファは `MAX_RASTER_PIXELS`(土台 = 目標寸法の Pixmap)では縛られない。opacity<1 / mask /
+  clip-path / filter を持つグループ(分離グループ)ごとに内容 bbox(filter では土台の 5 × 5 = 25 倍まで)の RGBA8 の層を
+  確保し、祖先の層を保持したまま子を描く(土台 128×128 で層 1 枚 1.6MB = 25 倍、入れ子 4 段で 6.9MB を実測)。filter は
+  primitive ごとの結果を全部保持し、feTurbulence は numOctaves に比例した時間がかかる(デバッグビルドでは 31 以上で resvg
+  内部の加算あふれで panic)。pattern のタイルは「矩形 × 変換の倍率」で枠に切り詰められない(土台 64×64 で 64MB を実測)。
+  描画前(と import の検証)に usvg の木を歩き、分離グループの入れ子 8 段・filter の primitive 32 個・numOctaves 24・
+  feMorphology 半径 256px・pattern のタイル 100MP を上限として構造化エラーにする(`check_render_budget`、
+  `tests/svg_nesting_limits.rs`)。正確な確保量の見積もり(bbox を累積変換で写して合計する)は別件。
+  **挙動の変化**: これらを超える SVG は取り込めず、取り込み済みでも svg_overlay がエラーになる。透かし・ロゴの用途で
+  超えることは考えにくいが、実アセットでの頻度は確かめていない。
+- WebP の `Encoder::encode` は内部で `encode_simple(..).unwrap()` を呼ぶので、寸法以外の libwebp の失敗(メモリ不足等)も
+  panic になる。`encode_simple` を直接呼び、失敗を `Encode` エラーにした(成功時の出力バイト列は同一)。
+- レシピの op 数(パイプラインあたり 128、`MAX_OPERATIONS_PER_PIPELINE`)とレイヤー数(32、`MAX_LAYERS`)に上限を
+  足した(`tests/recipe_limits.rs`)。1 op の重さは各 op の上限で抑えられているが、時間は op 数に比例して伸び、
+  マスク付き op はマスクの重み平面を `apply_recipe` の終わりまでキャッシュする(100MP なら 1 面 400MB)。
+  プリセットは最大 4 op、実用のレシピは十数 op。
+- .cube の DOMAIN_MIN / DOMAIN_MAX は有限性の検査の後で 1e-6 グリッドへ量子化する(`v * 1e6`)ため、絶対値が約 1.8e302 を
+  超えると ±inf になり、検証も適用も成功したうえで全画素が NaN → 黒になった。量子化後の値で有限性を検査する
+  (`tests/lut_limits.rs`。データ行にも同じ検査が掛かる)。
+- プレビューのキャッシュキーに `ENGINE_VERSION` を入れた(エンジンを上げた後に古い previews/ の中身とインライン画像が食い違わないように)。
+- 参照アセットが無いときのエラー文が .cube 前提だった(マスク・SVG・フォント・レイヤーでも同じ経路)。種別に依らない文にした。
+
+#### (6) 計算効率(出力バイト列は不変。参照実装との `f32::to_bits` 一致を proptest で固定)
+
+| 箇所 | 変更 | 20MP での目安(負荷のある環境、修正前 → 後) |
+|---|---|---|
+| マスクのフェザ(`ops/mask.rs`) | 直列 + 列方向に飛ぶ垂直パスを、行分割の並列化 + ループ交換に | feather_px=20: 29 s → 0.6 s、100: 57 s → 2.0 s |
+| median(`ops/blur.rs`) | 窓ごとの全ソートを `select_nth_unstable_by(total_cmp)` に(全順序なので rank k のビットは同じ) | r=3: 14 s → 3.2 s |
+| ガウスの垂直パス(`ops/blur.rs`)、Lanczos の垂直パス(`pixel_ops.rs`) | ループ交換(各画素の累算順序は 0 → k 昇順のまま) | σ=20: 3.2 s → 1.0 s、resize 1600: 0.33 s → 0.16 s |
+| 依存 | `fast_image_resize` はソースで未使用だった(v2 で自前の Lanczos に置き換え済み)。除去(Cargo.lock から 3 クレート減) | — |
+
+ループ交換とは、「画素ごとにタップを回す」順を「タップごとに入力行全体を足し込む」順に入れ替えることで、
+各画素の f32 累算は 0 から始めて k 昇順の左結合のまま変わらない(変わるのは画素間の実行順とメモリアクセスだけ)。
+
+#### レビューで見つかったが直していないこと(判断待ち・別件)
+
+- **SVG の確保量の正確な見積もり**: (5) で入れた構造の上限(分離グループの入れ子 8 段など)は粗い。土台が大きい
+  (`MAX_RASTER_PIXELS` = 100MP まで)と、分離グループ 1 段でも最大 25 倍 = 10GB を要求しうる。usvg の木を歩いて
+  各層の bbox を累積変換で写し、経路ごとの合計の最大を予算(例: 土台の 16 倍以下かつ 4 億画素以下)と比べる見積もりが
+  次の段階。予算の値は実アセット(Inkscape 等の書き出しは opacity 付きグループを多用する)で測ってから決める。
+- **ラスタ形式の絞り込み**: `image` クレートの既定 feature で BMP / TIFF / GIF / QOI / EXR なども取り込める(SECURITY.md が挙げる
+  主面は JPEG / PNG / WebP / AVIF / SVG)。絞れば攻撃面と依存が減るが、既存ワークスペースの TIFF 等が使えなくなる。
+- **tools.rs(5,100 行)の分割とエラーコードの列挙型化**: 外向きの形式を変えずにできるが差分が大きい。順序は「エラー型 → 移動だけのコミット」が安全。
+- **台帳の走査回数**: import 1 回で 3 走査、apply で 4 走査。5,000 行で 1 走査 6 ms、20,000 行で 27 ms(release)。
+  「数千 revision なら十分」の判断は成立。必要になれば API 追加(1 呼び出し 1 走査)か、stat 検証つきの増分キャッシュ。
+- **detect_tilt の投影点の上限**: 閾値ビンの同点が上限(4 万点)を素通りし、2px 周期の縞では 26 倍の点数になって
+  max_abs_angle=45 で 17 秒かかる。厳密な上限を入れると病的な周期パターンで結果が変わりうるので、実写での同点の量を測ってから決める。
+- **挙動が変わる効率化**: 大きな σ のガウスを O(1)/px(箱フィルタ 3 段や IIR)にする(σ=100 の 17 秒 → 1 秒未満の見込み)。
+  `ENGINE_VERSION` を上げる破壊的変更になる。
+- **回転のピークメモリ**(20MP で +4.9 枚分 ≈ 2.2 GB)と、画素独立な op が毎回画像全体を複製していること(op ごとに +1 枚分)。
+  in-place 化とプリマルチプライの融合で減らせるが、op 関数の形を変える広い変更。
+- **検出器の縮小前処理**が全解像度のグレースケール複製と 4 チャンネル f32 の中間バッファを作る(100MP で +224〜288 MiB)。
+  単一チャンネルの分離型 Triangle で +18 MiB にできる試作があるが、`image` クレートの内部の和の順序に依存する。
