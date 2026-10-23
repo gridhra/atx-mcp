@@ -196,15 +196,32 @@ fn encode_png16(img: &Rgba16Image, has_alpha: bool) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// libwebp が受け付ける 1 辺の上限(`WEBP_MAX_DIMENSION` = 2^14 - 1)。
+const WEBP_MAX_DIMENSION: u32 = 16_383;
+
 /// WebP(libwebp、lossy 固定)。純 Rust の lossy エンコーダが存在しないため FFI を使う。
+///
+/// 1 辺が 16383px を超えると libwebp はエンコードに失敗し、`webp` クレートはその失敗を
+/// panic にする(2026-10-22 のレビューで実測)。寸法は画素数上限(100MP)の内側でも
+/// 超えられる(例: 16384x2)ので、呼ぶ前に検査してエラーで返す。
 fn encode_webp(img: &RgbaImage, quality: u8, has_alpha: bool) -> Result<Vec<u8>> {
     let (w, h) = img.dimensions();
+    if w > WEBP_MAX_DIMENSION || h > WEBP_MAX_DIMENSION {
+        return Err(AtxError::Encode(format!(
+            "webp does not support dimensions larger than {WEBP_MAX_DIMENSION} ({w}x{h}); \
+             resize first or encode as png/jpeg/avif"
+        )));
+    }
+    // `Encoder::encode` は内部で `encode_simple(false, quality).unwrap()` を呼ぶので、
+    // libwebp の失敗(寸法以外にもメモリ不足など)が panic になる。同じ呼び出しを
+    // 直接行い、失敗はエラーとして返す(成功時の出力バイト列は同一)。
     let memory = if has_alpha {
-        webp::Encoder::from_rgba(img.as_raw(), w, h).encode(quality as f32)
+        webp::Encoder::from_rgba(img.as_raw(), w, h).encode_simple(false, quality as f32)
     } else {
         let rgb = flatten_to_rgb(img);
-        webp::Encoder::from_rgb(rgb.as_raw(), w, h).encode(quality as f32)
-    };
+        webp::Encoder::from_rgb(rgb.as_raw(), w, h).encode_simple(false, quality as f32)
+    }
+    .map_err(|e| AtxError::Encode(format!("webp: {e:?}")))?;
     Ok(memory.to_vec())
 }
 
