@@ -121,7 +121,7 @@ pub fn detect_lines_fine(
         })
         .collect();
 
-    let rmax = (((w * w + h * h) as f64).sqrt() / 2.0).ceil() as i32 + 2;
+    let rmax = rho_half_range(w, h);
     let r_bins = (2 * rmax + 1) as usize;
 
     let mut acc_h = vec![0u32; n_angles * r_bins];
@@ -243,4 +243,28 @@ fn refine_angle(
     }
     let delta = (0.5 * (l - r) / denom).clamp(-0.5, 0.5);
     phis[ai] + delta * ANGLE_STEP_DEG
+}
+
+/// ρ(原点からの距離)の片側範囲: 対角線の半分を切り上げ、余裕 2 を足したもの。
+///
+/// `w * w + h * h` を u32 で計算すると、長辺が 65536 以上(`working_long_edge` を
+/// 大きく指定した呼び出し)で桁あふれする(デバッグでは panic、リリースでは黙って
+/// 誤った範囲になる)ので u64 で計算する。あふれない入力では値は同じ。
+fn rho_half_range(w: u32, h: u32) -> i32 {
+    let diag_sq = u64::from(w) * u64::from(w) + u64::from(h) * u64::from(h);
+    ((diag_sq as f64).sqrt() / 2.0).ceil() as i32 + 2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rho_half_range;
+
+    #[test]
+    fn rho_range_does_not_overflow_for_very_wide_images() {
+        // 65536^2 は u32 に収まらない。正しい値は ceil(sqrt(65536^2 + 16^2) / 2) + 2。
+        assert_eq!(rho_half_range(65_536, 16), 32_771);
+        // 普通の寸法では従来の式と同じ。
+        assert_eq!(rho_half_range(1024, 768), 642);
+        assert_eq!(rho_half_range(3, 4), 5);
+    }
 }
