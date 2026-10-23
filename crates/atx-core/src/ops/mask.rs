@@ -224,37 +224,52 @@ fn bilinear_resize(src: &[f32], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<f32> 
 ///
 /// カーネルは `ops::blur` と同じ「f64 生成 → 1e-6 量子化 → 量子化後の合計で正規化」で、
 /// blur.rs の公開挙動には一切触れずに係数生成だけを共有している。
+///
+/// # 決定論(`ops/mod.rs` の規約)
+///
+/// 画素ごとの f32 累算は「0 から始めて、タップ k の昇順に左結合、乗算と加算は分離」で
+/// 固定されている。この関数は行単位でスレッド分割し、垂直パスは「画素ごとにタップを回す」
+/// 順を「タップごとに行全体へ足し込む」順に入れ替えてある(メモリアクセスが行連続になる)。
+/// どちらも**画素間の実行順序**を変えるだけで、1 画素内の累算順序は不変なので、
+/// 出力は従来の二重ループ(`tests::feather_reference`)とビット単位で一致する
+/// (proptest `feather_matches_reference_bit_for_bit` で固定)。
 fn feather(plane: &[f32], width: u32, height: u32, sigma: f64) -> Vec<f32> {
     let (radius, weights) = crate::ops::blur::gaussian_kernel(sigma);
     let (w, h) = (width as usize, height as usize);
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
 
+    // --- パス1: 水平方向(行分割で並列。画素ごとの累算順序は k 昇順のまま)---
     let mut horiz = vec![0f32; w * h];
-    for y in 0..h {
-        for x in 0..w {
+    crate::parallel::fill_rows(&mut horiz, w, h, |y, row| {
+        let src = &plane[y * w..(y + 1) * w];
+        for (x, slot) in row.iter_mut().enumerate() {
             let mut acc = 0f32;
             for (k, &weight) in weights.iter().enumerate() {
                 let dx = k as i64 - radius as i64;
                 let sx = (x as i64 + dx).clamp(0, width as i64 - 1) as usize;
-                let term = plane[y * w + sx] * weight;
+                let term = src[sx] * weight;
                 acc += term;
             }
-            horiz[y * w + x] = acc;
+            *slot = acc;
         }
-    }
+    });
 
+    // --- パス2: 垂直方向(ループ交換: 出力行 y ごとにタップ k を昇順に回し、
+    //     入力行 sy 全体を weight 倍して足し込む。行は 0.0 で初期化済み)---
     let mut out = vec![0f32; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let mut acc = 0f32;
-            for (k, &weight) in weights.iter().enumerate() {
-                let dy = k as i64 - radius as i64;
-                let sy = (y as i64 + dy).clamp(0, height as i64 - 1) as usize;
-                let term = horiz[sy * w + x] * weight;
-                acc += term;
+    crate::parallel::fill_rows(&mut out, w, h, |y, row| {
+        for (k, &weight) in weights.iter().enumerate() {
+            let dy = k as i64 - radius as i64;
+            let sy = (y as i64 + dy).clamp(0, height as i64 - 1) as usize;
+            let src = &horiz[sy * w..(sy + 1) * w];
+            for (acc, &v) in row.iter_mut().zip(src) {
+                let term = v * weight;
+                *acc += term;
             }
-            out[y * w + x] = acc;
         }
-    }
+    });
     out
 }
 
@@ -292,6 +307,64 @@ pub fn blend(before: &LinearImage, after: &LinearImage, weights: &[f32]) -> Line
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 並列化・ループ交換前の `feather`(画素ごとにタップを回す二重ループ)。
+    /// 現行実装との**ビット一致**を固定するための参照実装で、変更しない。
+    fn feather_reference(plane: &[f32], width: u32, height: u32, sigma: f64) -> Vec<f32> {
+        let (radius, weights) = crate::ops::blur::gaussian_kernel(sigma);
+        let (w, h) = (width as usize, height as usize);
+
+        let mut horiz = vec![0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = 0f32;
+                for (k, &weight) in weights.iter().enumerate() {
+                    let dx = k as i64 - radius as i64;
+                    let sx = (x as i64 + dx).clamp(0, width as i64 - 1) as usize;
+                    let term = plane[y * w + sx] * weight;
+                    acc += term;
+                }
+                horiz[y * w + x] = acc;
+            }
+        }
+
+        let mut out = vec![0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = 0f32;
+                for (k, &weight) in weights.iter().enumerate() {
+                    let dy = k as i64 - radius as i64;
+                    let sy = (y as i64 + dy).clamp(0, height as i64 - 1) as usize;
+                    let term = horiz[sy * w + x] * weight;
+                    acc += term;
+                }
+                out[y * w + x] = acc;
+            }
+        }
+        out
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// 並列化とループ交換は画素間の実行順序しか変えないので、
+        /// 参照実装(二重ループ)と f32 のビット表現まで一致する。
+        #[test]
+        fn feather_matches_reference_bit_for_bit(
+            w in 1u32..=48,
+            h in 1u32..=48,
+            sigma in 0.1f64..=200.0,
+            values in proptest::collection::vec(0.0f32..=1.0, 48 * 48),
+        ) {
+            let plane = &values[..(w * h) as usize];
+            let fast = feather(plane, w, h, sigma);
+            let reference = feather_reference(plane, w, h, sigma);
+            proptest::prop_assert_eq!(fast.len(), reference.len());
+            for (i, (a, b)) in fast.iter().zip(&reference).enumerate() {
+                proptest::prop_assert_eq!(a.to_bits(), b.to_bits(), "pixel {} differs: {} vs {}", i, a, b);
+            }
+        }
+    }
 
     #[test]
     fn blend_endpoints_are_exact() {
