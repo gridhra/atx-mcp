@@ -1073,6 +1073,10 @@ fn locate_recipe_error(
     }
 }
 
+/// `field_suffix` が原因フィールドを探しに行く op のキー数の上限。
+/// 最もフィールドの多い op(svg_overlay、clone)でも 10 前後。
+const FIELD_PROBE_LIMIT: usize = 32;
+
 /// 配列の中で最初に `Operation` として読めない要素の (index, serde メッセージ)。
 fn first_bad_operation(ops: &[serde_json::Value]) -> Option<(usize, String)> {
     ops.iter().enumerate().find_map(|(i, op)| {
@@ -1092,6 +1096,13 @@ fn field_suffix(op: &serde_json::Value) -> String {
     let Some(object) = op.as_object() else {
         return String::new();
     };
+    // キーごとに op を複製して deserialize し直すので、キー数の二乗の時間がかかる。
+    // 本物の op は高々十数フィールドなので、それを大きく超える入力(未知キーを
+    // 何千個も詰めた op)では原因フィールドの特定を諦める(2026-10-22 のレビューで
+    // 8000 キーの op が 6 秒以上ワーカーを塞ぐことを実測)。
+    if object.len() > FIELD_PROBE_LIMIT {
+        return String::new();
+    }
     for key in object.keys().filter(|k| k.as_str() != "op") {
         let mut probe = object.clone();
         probe.remove(key);
@@ -5119,5 +5130,31 @@ mod tests {
     fn absolutize_folds_dot_segments() {
         let p = absolutize("/tmp/a/./b/../c").unwrap();
         assert_eq!(p, PathBuf::from("/tmp/a/c"));
+    }
+
+    /// 未知キーを何千個も詰めた op でも、原因フィールドの探索が二乗時間で
+    /// ワーカーを塞がないこと(2026-10-22 のレビューで 8000 キーが 6 秒以上かかることを実測)。
+    #[test]
+    fn locating_a_bad_field_gives_up_on_absurdly_wide_operations() {
+        let mut op = serde_json::Map::new();
+        op.insert("op".into(), serde_json::Value::from("rotate"));
+        op.insert(
+            "angle_degrees".into(),
+            serde_json::Value::from("not a number"),
+        );
+        for i in 0..20_000 {
+            op.insert(format!("junk_{i}"), serde_json::Value::from(i));
+        }
+        let started = std::time::Instant::now();
+        let suffix = field_suffix(&serde_json::Value::Object(op));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(suffix, "");
+        // 普通の幅の op では従来どおり原因フィールドを名指しする。
+        let narrow = serde_json::json!({"op": "rotate", "angle_degrees": "x"});
+        assert_eq!(field_suffix(&narrow), ".angle_degrees");
     }
 }
