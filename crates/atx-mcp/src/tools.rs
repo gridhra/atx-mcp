@@ -4467,6 +4467,11 @@ fn preview_key(
     long_edge: u32,
 ) -> String {
     let mut hasher = Sha256::new();
+    // エンジンの挙動バージョンもキーに入れる。previews/ は掃除可能なキャッシュだが、
+    // エンジンを上げた後に古いファイルが「同じキー」で残っていると、ファイルの中身と
+    // 今回計算したインライン画像が食い違う。
+    hasher.update(ENGINE_VERSION.as_bytes());
+    hasher.update([0u8]);
     hasher.update(source_revision_id.as_bytes());
     hasher.update([0u8]);
     hasher.update(recipe_hash.as_bytes());
