@@ -880,9 +880,7 @@ mod tests {
             values in proptest::collection::vec(0.0f32..=1.0, 24 * 24 * 4),
         ) {
             let data: Vec<[f32; 4]> = values[..(iw * ih * 4) as usize]
-                .chunks_exact(4)
-                .map(|c| [c[0], c[1], c[2], c[3]])
-                .collect();
+                .as_chunks::<4>().0.to_vec();
             let img = LinearImage { width: iw, height: ih, data };
             let fast = resize_lanczos3(&img, dst_w, dst_h).unwrap();
             let reference = resize_lanczos3_reference(&img, dst_w, dst_h);

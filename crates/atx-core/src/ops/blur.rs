@@ -325,10 +325,7 @@ mod tests {
 
     fn image_from(values: &[f32], w: u32, h: u32) -> LinearImage {
         let n = (w * h) as usize;
-        let data: Vec<[f32; 4]> = values[..n * 4]
-            .chunks_exact(4)
-            .map(|c| [c[0], c[1], c[2], c[3]])
-            .collect();
+        let data: Vec<[f32; 4]> = values[..n * 4].as_chunks::<4>().0.to_vec();
         LinearImage {
             width: w,
             height: h,
