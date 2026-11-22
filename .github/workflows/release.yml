@@ -27,10 +27,10 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             npm_platform: darwin-arm64
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-15
             npm_platform: darwin-x64
             need_nasm: true
           - target: x86_64-unknown-linux-musl

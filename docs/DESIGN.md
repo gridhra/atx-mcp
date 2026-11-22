@@ -371,7 +371,7 @@ ROADMAP の Phase B。**プロジェクト唯一の破壊的リリース**で、
 17. **決定論の規約は `tests/f32_spike.rs` の契約をそのまま全面適用**:
     超越関数は LUT 構築時のみ / `mul_add`(FMA)禁止 / 総和は走査順の左結合。
     行分割の並列化(`std::thread::scope`)は画素間の実行順序しか変えないので出力に影響しない。
-    クロスプラットフォーム一致は CI(macos-14 arm64 + ubuntu-24.04 x86_64)の
+    クロスプラットフォーム一致は CI(macos-15 arm64 + ubuntu-24.04 x86_64)の
     ゴールデンが最終判定。
 18. **16bit I/O**: PNG16 の入出力に対応。`Operation::Encode` に
     `bit_depth: Option<u8>`(8 / 16、16 は png のみ)を追加した。
