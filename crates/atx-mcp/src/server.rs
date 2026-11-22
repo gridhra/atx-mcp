@@ -10,7 +10,7 @@ use std::sync::Arc;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::schema_for_output;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Implementation, JsonObject, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Implementation, JsonObject, ServerCapabilities, ServerConfig};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 
 use crate::mask::GenerateMaskParams;
@@ -557,8 +557,8 @@ impl AtxServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for AtxServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(
                 Implementation::new("asset-transform-mcp", env!("CARGO_PKG_VERSION"))
                     .with_title("Asset Transform MCP"),
