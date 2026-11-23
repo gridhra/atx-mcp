@@ -45,7 +45,7 @@ ravif = "0.13"
 #     インストール済みフォントを読みに行くため、同じレシピが環境によって
 #     別のバイト列を出す。決定論(バイト同一の再現性)と正面から矛盾する。
 #   - `svgz` / `raster-images`(付けない): 純 Rust・依存最小・外部参照ゼロを保つ。
-resvg = { version = "0.48.1", default-features = false, features = ["text"] }
+resvg = { version = "0.50.0", default-features = false, features = ["text"] }
 # フォント(font アセット)の検証とグリフ被覆の事前確認。usvg の整形器
 # (harfrust)が内部で使っているのと**同じ**パーサなので、依存を増やさずに
 # 「usvg が読めるか」を import 時に先取りできる。ttf-parser ではなく skrifa を
